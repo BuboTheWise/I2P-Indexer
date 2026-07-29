@@ -1,0 +1,12 @@
+[
+  {
+    "name": "I2P-Stat",
+    "status": 502,
+    "body_start": "<!DOCTYPE html>\r\n<html>\r\n<head>\r\n<title>Website Unknown</title>\r\n<link rel=\"shortcut icon\" href=\"http://proxy.i2p/themes/console/images/favicon.ico\">\r\n<link blocking=\"render\" href=\"http://proxy.i2p/themes/console/default/proxy.css?2.13.1\" rel=\"stylesheet\" type=\"text/css\">\r\n</head>\r\n<body>\r\n<div clas"
+  },
+  {
+    "name": "I2P-Projekt",
+    "status": 302,
+    "body_start": "<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n<center><h1>302 Found</h1></center>\r\n<hr><center>nginx/1.24.0 (Ubuntu)</center>\r\n</body>\r\n</html>\r\n"
+  }
+]

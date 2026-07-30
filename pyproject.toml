@@ -1,17 +1,7 @@
 [project]
-name = "i2p-indexer"
+name = "i2p-addressbook"
 version = "0.1.0"
-authors = [
-    {name = "stefan"}
-]
-description = "Client-side I2P eepsite indexer: addressbook parsing and proxy-aware discovery over an existing I2P daemon."
 requires-python = ">=3.11"
 
-[project.optional-dependencies]
-dev = [
-    "pytest",
-]
-
 [tool.pytest.ini_options]
-minversion = "7.0"
 testpaths = ["tests"]

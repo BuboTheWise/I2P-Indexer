@@ -21,7 +21,7 @@ class I2PConfig:
     sam_host: str = "127.0.0.1"
     sam_port: int = 9025
     webconsole_host: str = "127.0.0.1"
-    webconsole_port: int = 7654
+    webconsole_port: int = 7657
 
 # Ports verified against running I2P JVM daemon on this host:
 # ✓ 4444 — HTTP proxy, accessible

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json as _json
 import logging
 import os
 import re
@@ -437,7 +438,8 @@ class DiscoveryDB:
 
         Columns: dns_name, content_type, reachable, last_probed_utc, content_summary,
         ident_hash_hex, b32_addr, status_code, body_length, title, response_time_sec,
-        via_method, last_probed_at, bandwidth_kbps, router_caps, num_leases.
+        via_method, last_probed_at, content_hash, last_modified, found_links,
+        bandwidth_kbps, router_caps, num_leases.
         """
         cur = self._conn.cursor()
         cur.execute("SELECT * FROM address_book ORDER BY dns_name ASC")
@@ -882,8 +884,45 @@ def print_address_book(entries: list[dict]) -> None:
 
         dns = e.get("dns_name", "") or e.get("b32_addr", "")
 
-        ctype_tag = f" @{ctype}" if ctype else "  unknown"
+        # New columns: content_hash, last_modified, found_links
+        chash = e.get("content_hash", "") or ""
+        if chash:
+            chash_abbr = f"#{chash[:12]}"
+        else:
+            chash_abbr = ""
+
+        lmod = e.get("last_modified", "") or ""
+        if lmod and lmod != "N/A":
+            # Try to format as a readable datetime; fall back to raw value
+            from datetime import datetime
+            try:
+                dt = datetime.strptime(lmod, "%a, %d %b %Y %H:%M:%S %Z")
+                lmod_display = dt.strftime("%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                # Already a nice format or something else — keep as-is, cap length
+                lmod_display = str(lmod)[:20]
+        else:
+            lmod_display = "N/A"
+
+        flinks_raw = e.get("found_links", "") or ""
+        try:
+            flinks_list = _json.loads(flinks_raw) if isinstance(flinks_raw, str) else []
+            if not isinstance(flinks_list, list):
+                flinks_list = []
+        except (_json.JSONDecodeError, TypeError):
+            flinks_list = []
+        flinks_count = len(flinks_list)
+        if flinks_count > 0:
+            flinks_display = f"{flinks_count} linked sites"
+        else:
+            flinks_display = ""
+
+        ctype_tag = f"@{ctype}" if ctype else "unknown"
         line = f"  [{status:>4}] {ctype_tag:<15} {utc!s:<20} {summary}"
+
+        # Append hash abbreviation when available
+        if chash_abbr:
+            line += f" {chash_abbr}"
 
         title = (e.get("title", "") or "")[:60]
         tag = e.get("via_method", "") or "?"
@@ -898,6 +937,11 @@ def print_address_book(entries: list[dict]) -> None:
             extras.append(f"[{tag}]")
         if bw:
             extras.append(bw)
+        # Append last_modified as a trailing annotation
+        if lmod_display and lmod_display != "N/A":
+            extras.append(f"modified:{lmod_display}")
+        if flinks_display:
+            extras.append(flinks_display)
         if extras:
             line += "  " + " ".join(extras)
 

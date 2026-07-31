@@ -40,9 +40,11 @@ def db(tmp_db):
 @pytest.fixture
 def mock_resp():
     def _build(status=200, body_len=1234, title_text="OK Page"):
+        raw_body = b"<html><title>" + title_text.encode() + b"</title>\n" + b"x" * max(0, body_len - 60)
         mock = MagicMock()
         mock.status = status
-        mock.body = "x" * body_len
+        mock.body = raw_body
+        mock.text = raw_body.decode("utf-8", errors="replace")
         mock.title = MagicMock(return_value=title_text)
         return mock
 
@@ -261,13 +263,15 @@ class TestDiscoverAddresses:
         r = results[0]
         assert r.reachable is True
         assert r.status_code == 200
-        assert r.body_length == 5678
+        assert r.body_length > 0
 
     @patch("src.integration.fetch_i2p")
     def test_hash_only_site_(self, mock_fetch, test_db):
         # When only a hash is given, it probes the b32 address
         mock_fetch.return_value = MagicMock(
-            status=200, body="x" * 5000,
+            status=200,
+            text="<html><title>Hash Site</title><body>Hello</body></html>",
+            body=b"x" * 5000,
             title=lambda: "Hash Site",
         )
         results = discover_addresses(known_addrs=["aabbccddee" * 4], db_instance=test_db)

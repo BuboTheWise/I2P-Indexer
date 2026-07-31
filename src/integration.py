@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,58 @@ from src.i2p_proxy import ProxyBackend, fetch_i2p
 from src.models import DestinationEntry
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _truncate(text: str, max_len: int) -> str:
+    """Cut text to a safe length for SQLite storage."""
+    return text[:max_len] if len(text) > max_len else text
+
+
+def _classify_content(title: str, body_text: str) -> tuple[str, str]:
+    """Heuristic content classification from title + stripped HTML.
+
+    Returns (content_type_bucket, content_summary).
+    This is intentionally a local, offline heuristic — no LLM required at probe time.
+    Later passes can re-classify with an LLM if desired.
+    """
+    lower_title = title.lower()
+    lower_body = body_text[:16384].lower()  # first 16KB is enough for heuristics
+
+    # ── Bucket detection ──────────────────────────────────────────────
+    type_keywords: list[tuple[str, list[str]]] = [
+        ("forum", ["forum", "board", "thread", "post", "topic"]),
+        ("wiki", ["wiki", "knowledge base", "mediawiki"]),
+        ("blog", ["blog", "diary", "journal", "entries"]),
+        ("file archive", ["mirror", "files", "download", "archive", "repository"]),
+        ("marketplace", ["market", "store", "shop", "buy", "sell"]),
+        ("news site", ["news", "headlines", "updates", "press"]),
+        ("mail server", ["mail", "email", "postfix", "smtp"]),
+        ("chat room", ["chat", "irc", "messaging"]),
+        ("search engine", ["search", "find", "index", "discover"]),
+    ]
+
+    content_type = ""
+    for bucket, keywords in type_keywords:
+        if any(kw in lower_title or kw in lower_body for kw in keywords):
+            content_type = bucket
+            break
+
+    # ── Summary generation ────────────────────────────────────────────
+    plain = _TAG_RE.sub(" ", body_text)
+    words = " ".join(plain.split()).strip()[:200]
+    if content_type:
+        summary = f"{content_type.title()} — «{title}»"
+    else:
+        summary = f"Unidentified site — «{title}»"
+
+    return content_type, summary
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +97,8 @@ class DiscoveryResult:
     via_method: str = ""  # "b32" | "dns" | "b32+dns" | ""
     probe_mode: str = ""   # which type of URL was used ("b32" or "dns")
     error: str = ""
+    content_type: str = ""     # short bucket label (e.g. "forum", "news site")
+    content_summary: str = ""  # sentence-length description of page content
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +164,8 @@ class DiscoveryDB:
                 title           TEXT    DEFAULT '',
                 response_time   REAL    DEFAULT 0.0,
                 via_method      TEXT    DEFAULT '',
+                content_type    TEXT    DEFAULT '',  -- short bucket label (e.g. 'forum')
+                content_summary TEXT    DEFAULT '',  -- sentence-length page description
                 error_msg       TEXT    DEFAULT '',
                 probed_at       REAL    DEFAULT (strftime('%s','now'))
             );
@@ -188,6 +245,8 @@ class DiscoveryDB:
         response_time: float = 0.0,
         i2p_dns_name: str = "",
         via_method: str = "",
+        content_type: str = "",
+        content_summary: str = "",
         error_msg: str = "",
     ) -> int:
         """Record one probe attempt. Returns the new row id."""
@@ -196,10 +255,12 @@ class DiscoveryDB:
         cur.execute(
             """INSERT INTO discoveries
                (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, reachable,
-                status_code, body_length, title, response_time, via_method, error_msg, probed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status_code, body_length, title, response_time, via_method,
+                content_type, content_summary, error_msg, probed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, int(reachable),
-             status_code, body_length, title, response_time, via_method, error_msg, now),
+             status_code, body_length, title, response_time, via_method,
+             content_type, _truncate(content_summary, 4096), error_msg, now),
         )
         self._conn.commit()
         row_id = cur.lastrowid
@@ -309,6 +370,8 @@ def probe_destination(
                 title=res_b32.title,
                 response_time=res_b32.response_time_sec,
                 via_method="b32",
+                content_type=res_b32.content_type,
+                content_summary=res_b32.content_summary,
                 error_msg=res_b32.error,
             )
 
@@ -334,6 +397,8 @@ def probe_destination(
                 title=res_dns.title,
                 response_time=res_dns.response_time_sec,
                 via_method="dns",
+                content_type=res_dns.content_type,
+                content_summary=res_dns.content_summary,
                 error_msg=res_dns.error,
             )
 
@@ -383,25 +448,30 @@ def _do_probe(
         elapsed = round(time.monotonic() - start, 2)
         body_text = resp.text if hasattr(resp, "text") else resp.body.decode("utf-8", errors="replace")
 
+        # Extract title and classify content
+        title_text = ""
+        try:
+            title_m = resp.title()
+            if title_m:
+                title_text = title_m.strip()
+        except Exception:
+            pass
+
+        c_type, c_summary = _classify_content(title_text, body_text)
+
         result = DiscoveryResult(
-            b32_addr=url.split("/")  [2] if "/" in url else "",
+            b32_addr=url.split("/")[2] if "/" in url else "",
             ident_hash_hex=ident_hash_hex,
             reachable=200 <= resp.status < 500,
             status_code=resp.status,
             body_length=len(resp.body),
-            title="",
+            title=title_text,
             response_time_sec=elapsed,
             via_method=probe_mode,
             probe_mode=probe_mode,
+            content_type=c_type,
+            content_summary=c_summary,
         )
-
-        # Try to extract title
-        try:
-            title_m = resp.title()
-            if title_m:
-                result.title = title_m.strip()
-        except Exception:
-            pass
 
         logger.info(
             "  [%s] %s  status=%d  body=%dB  %.1fs%s",
@@ -537,13 +607,16 @@ def print_report(results: list[DiscoveryResult]) -> None:
     for r in results:
         status = "OK" if r.reachable else "DOWN"
         tag = f"[{r.via_method}]" if r.via_method else "[?]"
+        ctype = f"  {r.content_type}" if r.content_type else ""
         line = (
             f"  [{status}] {tag:>7}  {r.b32_addr[:40]:<40}"
             f"  status={r.status_code:<5d}  body={r.body_length:<8d}"
-            f"  time={r.response_time_sec:.1f}s"
+            f"  time={r.response_time_sec:.1f}s{ctype}"
         )
         if r.title:
-            line += f"  \"{r.title[:50]}\""
+            line += f'  "{r.title[:50]}"'
+        if r.content_summary and r.content_summary != f'Unidentified site — "{r.title}"':
+            print(f"    summary: {r.content_summary[:120]}")
         if r.error:
             line += f"  err={r.error[:40]}"
         print(line)

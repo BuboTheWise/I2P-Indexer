@@ -54,6 +54,10 @@ The I2P Indexer is a **client-side discovery engine**. Its purpose is to systema
 5. **Persistence**: Results are written to three SQLite tables (`discoveries`, `routers`, `leasesets`) keyed by `ident_hash_hex`.
 6. **Report generation**: `print_report()` renders a terminal summary; raw data remains queryable via SQL.
 
+### Consolidated view (`address_book`)
+
+For auditing, the `address_book` SQL view collapses all probe history into one row per "human identity." DNS name is primary (preferred for readability); b32 address is fallback when no DNS exists. Joined with `routers`/`leasesets` metadata. Access via `get_address_book()`  → `list[dict]`, or `print_address_book(entries)` for terminal output.
+
 ### Content classification pipeline
 
 ```
@@ -79,6 +83,7 @@ Classification is intentionally **offline and heuristic-only**. No LLM or networ
 | No Selenium/Playwright | I2P eepsites don't require JavaScript rendering for basic reachability checks. Pure HTTP is sufficient and dramatically faster/cheaper. |
 | Keyword-based classification first | Keeps probe runtime predictable; avoids adding an LLM dependency to every fetch cycle. Post-hoc re-classification can batch-process the DB. |
 | Separate `routers` / `leasesets` tables | Addressbook data (from `.rtr`/`.ls64` files) describes network topology, not endpoint behavior. Disjoint concerns warrant disjoint stores. |
+| DNS-first dedup in `address_book` view | Humans think in DNS names, not hashes. A site probed via two DNS names appears as two rows (separate entry points); b32-only probes fall back to the b32 address. Pivot to hash-based dedup if alias tracking proves unnecessary. |
 
 ## Configuration
 

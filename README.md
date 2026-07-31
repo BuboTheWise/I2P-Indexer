@@ -64,23 +64,28 @@ Output:
   [DOWN]   [b32]  7flwhni4icu67drmltr5dhkd5shf6ehj.b32.i2p  status=0      body=0         time=0.6s
 ```
 
-### Programmatic API
+### Inspect results
 
 ```python
-from src.integration import DiscoveryDB, probe_destination
+from src.integration import get_address_book, print_address_book
 
-db = DiscoveryDB("indexer.db")
-
-result = probe_destination(
-    b32_addr="abcdefghijklmnop...b32.i2p",
-    ident_hash_hex="F95763B51C40A9EF8E2C5CE3D19D43EC8E5F10E9",
-    i2p_dns_name=None,
-    db=db,
-)
-
-if result.reachable:
-    print(f"[{result.content_type}] {result.title} — {result.body_length} bytes in {result.response_time_sec}s")
+entries = get_address_book()          # one row per identity from the DB
+print_address_book(entries)           # human-readable table
 ```
+
+Output:
+```
+========================================================================
+  I2P Address Book  —  3 destination(s), 2 reachable, 1 unreachable
+========================================================================
+  [OK]      [dns]  i2p-projekt.i2p                                   200    21063B    5.4s  @forum "I2P - The Invisible Internet..."
+  [OK]     [b32]  abcdefghijklmnop...b32.i2p                         200     4096B    8.2s  @blog  "My I2P Blog"
+  [DOWN]        dns  su3-directory.i2p                                 0        0B    0.6s
+
+========================================================================
+```
+
+Each row is the most recent probe for that identity (DNS name preferred, b32 address fallback). The view joins with `routers` and `leasesets` metadata automatically.
 
 ### Custom target list
 

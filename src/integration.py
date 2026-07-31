@@ -1,0 +1,597 @@
+"""Integration layer — probe .i2p destinations via HTTP proxy, record full addressbook data in SQLite.
+
+Core design:
+- Primary identity is always ident_hash_hex (40-char SHA-1).
+- We try BOTH http://HASH.b32.i2p (direct key, no DNS resolution) AND http://NAME.i2p (SU3 hostname),
+  recording which worked and which failed.
+- All probe results go into a persistent SQLite DB so they survive across runs.
+"""
+from __future__ import annotations
+
+import base64
+import logging
+import os
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from src.addressbook import AddressBookCatalog, _hex_to_b32_addr
+from src.config import I2PConfig
+from src.i2p_proxy import ProxyBackend, fetch_i2p
+from src.models import DestinationEntry
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DiscoveryResult:
+    """Result of probing a single destination."""
+
+    b32_addr: str
+    ident_hash_hex: str
+    reachable: bool = False
+    status_code: int = 0
+    body_length: int = 0
+    title: str = ""
+    response_time_sec: float = 0.0
+    via_method: str = ""  # "b32" | "dns" | "b32+dns" | ""
+    probe_mode: str = ""   # which type of URL was used ("b32" or "dns")
+    error: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Persistent discovery database
+# ---------------------------------------------------------------------------
+
+DEFAULT_DB_PATH = os.path.join(os.getcwd(), "indexer.db")
+
+
+class DiscoveryDB:
+    """SQLite store for probe results and full addressbook records."""
+
+    def __init__(self, db_path: str = DEFAULT_DB_PATH) -> None:
+        self._path = db_path
+        self._conn = sqlite3.connect(db_path)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._init_db()
+
+    # ── schema ────────────────────────────────────────────────────────
+
+    def _init_db(self) -> None:
+        cur = self._conn.cursor()
+        cur.executescript(
+            """
+            -- Source routers (from addressbook parsing, webconsole scrape, etc.)
+            CREATE TABLE IF NOT EXISTS routers (
+                ident_hash_hex   TEXT PRIMARY KEY,
+                key_type         INTEGER DEFAULT 0,
+                version          INTEGER DEFAULT 0,
+                bandwidth_kbps   INTEGER DEFAULT 0,
+                options_mask     INTEGER DEFAULT 0,
+                caps             TEXT    DEFAULT '',
+                published        INTEGER DEFAULT 0,
+                file_size        INTEGER DEFAULT 0,
+                i2p_dns_name     TEXT    DEFAULT '',
+                source           TEXT    DEFAULT 'unknown',
+                updated_at       REAL    DEFAULT (strftime('%s','now'))
+            );
+
+            -- Source lease sets
+            CREATE TABLE IF NOT EXISTS leasesets (
+                ident_hash_hex   TEXT PRIMARY KEY,
+                store_type       INTEGER DEFAULT 0,
+                num_leases       INTEGER DEFAULT 0,
+                options_mask     INTEGER DEFAULT 0,
+                leases_v1_count  INTEGER DEFAULT 0,
+                file_size        INTEGER DEFAULT 0,
+                i2p_dns_name     TEXT    DEFAULT '',
+                source           TEXT    DEFAULT 'unknown',
+                updated_at       REAL    DEFAULT (strftime('%s','now'))
+            );
+
+            -- Probe/discovery results — one row per attempt per address type
+            CREATE TABLE IF NOT EXISTS discoveries (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ident_hash_hex  TEXT    NOT NULL,
+                b32_addr        TEXT    NOT NULL,
+                i2p_dns_name    TEXT    DEFAULT '',
+                probe_mode      TEXT    NOT NULL,   -- 'b32' | 'dns'
+                reachable       INTEGER NOT NULL,
+                status_code     INTEGER DEFAULT 0,
+                body_length     INTEGER DEFAULT 0,
+                title           TEXT    DEFAULT '',
+                response_time   REAL    DEFAULT 0.0,
+                via_method      TEXT    DEFAULT '',
+                error_msg       TEXT    DEFAULT '',
+                probed_at       REAL    DEFAULT (strftime('%s','now'))
+            );
+
+            -- Index for fast lookups by hash and DNS name
+            CREATE INDEX IF NOT EXISTS idx_disc_hash ON discoveries(ident_hash_hex);
+            CREATE INDEX IF NOT EXISTS idx_disc_dns  ON discoveries(i2p_dns_name);
+            """
+        )
+        self._conn.commit()
+
+    # ── upsert helpers ────────────────────────────────────────────────
+
+    def record_router(
+        self,
+        ident_hash_hex: str,
+        key_type: int = 0,
+        version: int = 0,
+        bandwidth_kbps: int = 0,
+        caps: str = "",
+        published: bool = False,
+        file_size: int = 0,
+        i2p_dns_name: str = "",
+        source: str = "probe",
+    ) -> None:
+        cur = self._conn.cursor()
+        now = datetime.now(timezone.utc).timestamp()
+        cur.execute(
+            """INSERT INTO routers (ident_hash_hex, key_type, version, bandwidth_kbps,
+                                   options_mask, caps, published, file_size, i2p_dns_name, source, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(ident_hash_hex) DO UPDATE SET
+                   key_type=excluded.key_type,
+                   version=excluded.version,
+                   bandwidth_kbps=excluded.bandwidth_kbps,
+                   options_mask=excluded.options_mask,
+                   caps=excluded.caps,
+                   published=excluded.published,
+                   file_size=excluded.file_size,
+                   i2p_dns_name=COALESCE(NULLIF(excluded.i2p_dns_name, ''), i2p_dns_name),
+                   updated_at=excluded.updated_at""",
+            (ident_hash_hex, key_type, version, bandwidth_kbps, 0,
+             caps, int(published), file_size, i2p_dns_name, source, now),
+        )
+
+    def record_lease_set(
+        self,
+        ident_hash_hex: str,
+        store_type: int = 0,
+        num_leases: int = 0,
+        i2p_dns_name: str = "",
+        source: str = "probe",
+    ) -> None:
+        cur = self._conn.cursor()
+        now = datetime.now(timezone.utc).timestamp()
+        cur.execute(
+            """INSERT INTO leasesets (ident_hash_hex, store_type, num_leases,
+                                     i2p_dns_name, source, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(ident_hash_hex) DO UPDATE SET
+                   store_type=excluded.store_type,
+                   num_leases=excluded.num_leases,
+                   i2p_dns_name=COALESCE(NULLIF(excluded.i2p_dns_name, ''), i2p_dns_name),
+                   updated_at=excluded.updated_at""",
+            (ident_hash_hex, store_type, num_leases, i2p_dns_name, source, now),
+        )
+
+    def record_discovery(
+        self,
+        ident_hash_hex: str,
+        b32_addr: str,
+        probe_mode: str,       # "b32" or "dns"
+        reachable: bool,
+        status_code: int = 0,
+        body_length: int = 0,
+        title: str = "",
+        response_time: float = 0.0,
+        i2p_dns_name: str = "",
+        via_method: str = "",
+        error_msg: str = "",
+    ) -> int:
+        """Record one probe attempt. Returns the new row id."""
+        cur = self._conn.cursor()
+        now = datetime.now(timezone.utc).timestamp()
+        cur.execute(
+            """INSERT INTO discoveries
+               (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, reachable,
+                status_code, body_length, title, response_time, via_method, error_msg, probed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, int(reachable),
+             status_code, body_length, title, response_time, via_method, error_msg, now),
+        )
+        self._conn.commit()
+        row_id = cur.lastrowid
+        return int(row_id) if row_id is not None else 0
+
+    # ── queries ───────────────────────────────────────────────────────
+
+    def get_latest_probes_by_hash(self, hash_hex: str) -> list[dict]:
+        """Get the most recent probe results for a given ident hash."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """SELECT ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, reachable,
+                      status_code, body_length, title, response_time, via_method,
+                      error_msg, datetime(probed_at, 'unixepoch') as probed_at_ts
+               FROM discoveries
+               WHERE ident_hash_hex = ?
+               ORDER BY probed_at DESC
+               LIMIT 10""",
+            (hash_hex,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_latest_probes_by_dns_name(self, dns_name: str) -> list[dict]:
+        """Find probes that match a DNS name (either as primary or resolved)."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """SELECT ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, reachable,
+                      status_code, body_length, title, response_time, via_method,
+                      error_msg, datetime(probed_at, 'unixepoch') as probed_at_ts
+               FROM discoveries
+               WHERE i2p_dns_name = ?
+               ORDER BY probed_at DESC
+               LIMIT 10""",
+            (dns_name,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_all_hashes(self) -> list[str]:
+        """Get unique ident hashes discovered so far."""
+        cur = self._conn.cursor()
+        cur.execute("SELECT DISTINCT ident_hash_hex FROM discoveries")
+        return [r[0] for r in cur.fetchall()]
+
+    def summary(self) -> dict:
+        """Quick stats about the database."""
+        cur = self._conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM routers")
+        n_routers = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM leasesets")
+        n_ls = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM discoveries")
+        n_disc = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(DISTINCT ident_hash_hex) FROM discoveries")
+        n_unique = cur.fetchone()[0]
+        cur.execute("SELECT SUM(reachable) FROM discoveries WHERE reachable=1")
+        n_reachable = (cur.fetchone()[0] or 0)
+        return {
+            "routers": n_routers,
+            "leasesets": n_ls,
+            "total_probes": n_disc,
+            "unique_destinations": n_unique,
+            "reachable_count": n_reachable,
+        }
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Probe logic — try b32 key AND dns name
+# ---------------------------------------------------------------------------
+
+def probe_destination(
+    ident_hash_hex: str,
+    i2p_dns_name: str = "",
+    db: DiscoveryDB | None = None,
+) -> DiscoveryResult:
+    """Probe a single destination by BOTH its b32 key address and .i2p DNS name.
+
+    Returns the best result (most data from fastest successful probe).
+    If a DB is provided, records both attempts.
+    """
+    b32_addr = _hex_to_b32_addr(ident_hash_hex) if len(ident_hash_hex) == 40 else ""
+    results: list[DiscoveryResult] = []
+
+    # ── Attempt 1: Hit the b32 key directly (no DNS resolution needed)
+    if b32_addr:
+        logger.info("Probing http://%s/  (b32 key)", b32_addr)
+        res_b32 = _do_probe(
+            url=f"http://{b32_addr}/",
+            ident_hash_hex=ident_hash_hex,
+            i2p_dns_name=i2p_dns_name,
+            probe_mode="b32",
+        )
+        results.append(res_b32)
+        if db:
+            db.record_discovery(
+                ident_hash_hex=ident_hash_hex,
+                b32_addr=b32_addr,
+                i2p_dns_name=i2p_dns_name,
+                probe_mode="b32",
+                reachable=res_b32.reachable,
+                status_code=res_b32.status_code,
+                body_length=res_b32.body_length,
+                title=res_b32.title,
+                response_time=res_b32.response_time_sec,
+                via_method="b32",
+                error_msg=res_b32.error,
+            )
+
+    # ── Attempt 2: Try .i2p DNS name if available (may provide more info)
+    if i2p_dns_name and not i2p_dns_name.endswith(".b32.i2p"):
+        logger.info("Probing http://%s/  (.i2p DNS)", i2p_dns_name)
+        res_dns = _do_probe(
+            url=f"http://{i2p_dns_name}/",
+            ident_hash_hex=ident_hash_hex,
+            i2p_dns_name=i2p_dns_name,
+            probe_mode="dns",
+        )
+        results.append(res_dns)
+        if db:
+            db.record_discovery(
+                ident_hash_hex=ident_hash_hex,
+                b32_addr=b32_addr,
+                i2p_dns_name=i2p_dns_name,
+                probe_mode="dns",
+                reachable=res_dns.reachable,
+                status_code=res_dns.status_code,
+                body_length=res_dns.body_length,
+                title=res_dns.title,
+                response_time=res_dns.response_time_sec,
+                via_method="dns",
+                error_msg=res_dns.error,
+            )
+
+    # ── Determine best result and merge info
+    if not results:
+        return DiscoveryResult(
+            b32_addr="",
+            ident_hash_hex=ident_hash_hex,
+            reachable=False,
+            error="No address to probe (no hash and no DNS name)",
+        )
+
+    # Pick the one with most body data, or if tied, fastest
+    best = max(results, key=lambda r: (r.reachable, r.body_length, -r.response_time_sec))
+
+    # Merge via_method info
+    b32_ok = any(r.probe_mode == "b32" and r.reachable for r in results)
+    dns_ok = any(r.probe_mode == "dns" and r.reachable for r in results)
+    if b32_ok and dns_ok:
+        best.via_method = "b32+dns"
+    elif b32_ok:
+        best.via_method = "b32"
+    elif dns_ok:
+        best.via_method = "dns"
+
+    # Record source info in DB
+    if db and best.reachable:
+        db.record_router(
+            ident_hash_hex=ident_hash_hex,
+            i2p_dns_name=i2p_dns_name or best.b32_addr,
+            source="probe",
+        )
+
+    return best
+
+
+def _do_probe(
+    url: str,
+    ident_hash_hex: str,
+    i2p_dns_name: str = "",
+    probe_mode: str = "b32",
+) -> DiscoveryResult:
+    """Single HTTP fetch through proxy. Returns reachable=0 on any failure."""
+    start = time.monotonic()
+    try:
+        resp = fetch_i2p(url, via="http-proxy")
+        elapsed = round(time.monotonic() - start, 2)
+        body_text = resp.text if hasattr(resp, "text") else resp.body.decode("utf-8", errors="replace")
+
+        result = DiscoveryResult(
+            b32_addr=url.split("/")  [2] if "/" in url else "",
+            ident_hash_hex=ident_hash_hex,
+            reachable=200 <= resp.status < 500,
+            status_code=resp.status,
+            body_length=len(resp.body),
+            title="",
+            response_time_sec=elapsed,
+            via_method=probe_mode,
+            probe_mode=probe_mode,
+        )
+
+        # Try to extract title
+        try:
+            title_m = resp.title()
+            if title_m:
+                result.title = title_m.strip()
+        except Exception:
+            pass
+
+        logger.info(
+            "  [%s] %s  status=%d  body=%dB  %.1fs%s",
+            probe_mode, url, resp.status, len(resp.body), elapsed,
+            f"  title={result.title[:40]}" if result.title else "",
+        )
+        return result
+
+    except Exception as exc:
+        elapsed = round(time.monotonic() - start, 2)
+        logger.warning("  [%s] %s  FAILED %.1fs: %s", probe_mode, url, elapsed, exc)
+        return DiscoveryResult(
+            b32_addr=url.split("/")  [2] if "/" in url else "",
+            ident_hash_hex=ident_hash_hex,
+            reachable=False,
+            error=f"{exc}",
+            response_time_sec=elapsed,
+            via_method=probe_mode,
+            probe_mode=probe_mode,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Batch discovery runner
+# ---------------------------------------------------------------------------
+
+def discover_addresses(
+    known_addrs: list[str | tuple[str, str]] | None = None,
+    catalog: AddressBookCatalog | None = None,
+    config: I2PConfig | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+    db_instance: DiscoveryDB | None = None,
+) -> list[DiscoveryResult]:
+    """Probe destinations and record results in persistent DB.
+
+    Args:
+        known_addrs: List of .i2p hostnames, ident hashes, or (hash, dns_name) tuples
+            to probe. Each item can be: http://x.i2p/, x.i2p, a 40-char hex hash,
+            or (ident_hash_hex, i2p_dns_name). If a tuple is given, BOTH the b32 key
+            and DNS name are probed.
+            If omitted, uses catalog destinations if available.
+        catalog: Pre-loaded AddressBookCatalog for source of truth.
+        config: I2P configuration override.
+        db_path: Path to SQLite DB (used when db_instance not provided).
+        db_instance: Optional pre-created DiscoveryDB (for testing).
+
+    Returns:
+        List of DiscoveryResult objects sorted by reachability then speed.
+    """
+    cfg = config or I2PConfig()
+    use_existing_db = db_instance is not None
+    db = db_instance or DiscoveryDB(db_path)
+
+    # ── Gather targets as (hash, dns_name) pairs ──────────────────────
+    targets: list[tuple[str, str]] = []  # (ident_hash_hex, dns_name_or_empty)
+
+    if known_addrs:
+        for addr in known_addrs:
+            if isinstance(addr, tuple):
+                # Already a (hash, dns_name) pair
+                h, d = addr
+                targets.append((h.upper() if h else "", d))
+                continue
+            # Strip URL wrapper
+            raw = addr.removeprefix("http://").removeprefix("https://").rstrip("/")
+            if len(raw) == 40 and all(c in "0123456789abcdefABCDEF" for c in raw):
+                # It's a hash
+                targets.append((raw.upper(), ""))
+            elif not raw.endswith(".b32.i2p"):
+                # Treat as DNS hostname
+                targets.append(("", raw))
+            else:
+                # b32 address — try to extract hash (we store as-is and let probe convert)
+                targets.append(("", raw))
+
+    elif catalog:
+        for de in catalog.all_destinations():
+            if de.b32_addr:
+                dns = ""
+                targets.append((de.ident_hash_hex, dns))
+
+    else:
+        # Well-known sites for PoC — provide both hash and DNS where possible
+        import base64 as _b64
+
+        well_known: list[tuple[str, str]] = []
+
+        # These are .i2p DNS names we can probe; hash will be discovered on first contact
+        well_known.append(("", "i2p-projekt.i2p"))
+        well_known.append(("", "musah.i2p"))
+        well_known.append(("", "freeforum.i2p"))
+        well_known.append(("", "swoogle.i2p"))
+
+        targets = well_known
+
+    # ── Probe each target ─────────────────────────────────────────────
+    results: list[DiscoveryResult] = []
+
+    for hash_hex, dns_name in targets:
+        logger.info("--- Probing: hash=%s  dns=%s", hash_hex or "(none)", dns_name or "(none)")
+        res = probe_destination(
+            ident_hash_hex=hash_hex,
+            i2p_dns_name=dns_name,
+            db=db,
+        )
+        results.append(res)
+
+    # Sort: reachable first, then fastest
+    results.sort(key=lambda r: (not r.reachable, r.response_time_sec))
+    summary = db.summary()
+    logger.info("Discovery DB — %s", summary)
+    db.close()
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Reporting / CLI
+# ---------------------------------------------------------------------------
+
+def print_report(results: list[DiscoveryResult]) -> None:
+    """Pretty-print discovery results to stdout."""
+    reachable = [r for r in results if r.reachable]
+    dead = [r for r in results if not r.reachable]
+
+    print(f"\n{'='*70}")
+    print(f"  I2P DISCOVERY RESULTS")
+    print(f"  Total: {len(results)} | Reachable: {len(reachable)} | Dead: {len(dead)}")
+    print(f"{'='*70}")
+
+    for r in results:
+        status = "OK" if r.reachable else "DOWN"
+        tag = f"[{r.via_method}]" if r.via_method else "[?]"
+        line = (
+            f"  [{status}] {tag:>7}  {r.b32_addr[:40]:<40}"
+            f"  status={r.status_code:<5d}  body={r.body_length:<8d}"
+            f"  time={r.response_time_sec:.1f}s"
+        )
+        if r.title:
+            line += f"  \"{r.title[:50]}\""
+        if r.error:
+            line += f"  err={r.error[:40]}"
+        print(line)
+
+    # Show hashes
+    print(f"\n  Hashes discovered:")
+    for r in results:
+        if r.ident_hash_hex:
+            prefix = "reachable" if r.reachable else "unreachable"
+            hash_snippet = r.ident_hash_hex[:12] + "..." if len(r.ident_hash_hex) > 12 else r.ident_hash_hex
+            print(f"    {r.ident_hash_hex} [{prefix}]")
+        elif r.b32_addr.startswith("http"):
+            host = r.b32_addr.split("/")[2] if "//" in r.b32_addr else ""
+            print(f"    (no hash yet)  DNS: {host}")
+    print()
+
+
+def query_db(hash_hex: str = "", dns_name: str = "", db_path: str = DEFAULT_DB_PATH) -> list[dict]:
+    """Query the persistent discovery DB. Accepts hash or DNS name."""
+    db = DiscoveryDB(db_path)
+    results = []
+    if hash_hex:
+        results = db.get_latest_probes_by_hash(hash_hex.upper())
+    elif dns_name:
+        results = db.get_latest_probes_by_dns_name(dns_name)
+    else:
+        # Return summary
+        s = db.summary()
+        print(f"\nDB Summary: {s}\n")
+        print("Usage: query_db(hash_hex='...') or query_db(dns_name='...')\n")
+    db.close()
+    return results
+
+
+def main() -> None:
+    """CLI entry point for discovery."""
+    import sys
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
+    cfg = I2PConfig()
+
+    targets: list[str | tuple[str, str]] = []
+    if len(sys.argv) > 1:
+        targets = sys.argv[1:]  # type: ignore[assignment]
+    else:
+        # Use well-known defaults
+        pass
+
+    results = discover_addresses(known_addrs=targets or None, config=cfg)
+    print_report(results)
+
+
+if __name__ == "__main__":
+    main()

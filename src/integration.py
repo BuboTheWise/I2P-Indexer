@@ -263,6 +263,7 @@ class DiscoveryDB:
         self._conn = sqlite3.connect(db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_db()
+        self._ensure_discovery_columns()
 
     # ── schema ────────────────────────────────────────────────────────
 
@@ -317,6 +318,7 @@ class DiscoveryDB:
                 content_hash    TEXT    DEFAULT '',  -- SHA-256 of body for change detection
                 last_modified   TEXT    DEFAULT '',  -- HTTP Last-Modified header value
                 found_links     TEXT    DEFAULT '[]',-- JSON array of linked i2p dns names
+                flags           TEXT    DEFAULT '[]',-- arbitrary analysis signals (robots, tech stack, ...)
                 error_msg       TEXT    DEFAULT '',
                 probed_at       REAL    DEFAULT (strftime('%s','now'))
             );
@@ -480,6 +482,7 @@ class DiscoveryDB:
         content_hash: str = "",
         last_modified: str = "",
         found_links: list[str] | None = None,
+        flags: list[str] | None = None,
         error_msg: str = "",
     ) -> int:
         """Record one probe attempt. Returns the new row id."""
@@ -492,12 +495,13 @@ class DiscoveryDB:
                (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, reachable,
                 status_code, body_length, title, response_time, via_method,
                 content_type, content_summary, content_hash, last_modified,
-                found_links, error_msg, probed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                found_links, flags, error_msg, probed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, int(reachable),
              status_code, body_length, title, response_time, via_method,
              content_type, _truncate(content_summary, 4096), content_hash,
-             last_modified, _json.dumps(found_links or []), error_msg, now),
+             last_modified, _json.dumps(found_links or []),
+             _json.dumps(flags or []), error_msg, now),
         )
         self._conn.commit()
         row_id = cur.lastrowid

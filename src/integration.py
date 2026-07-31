@@ -197,6 +197,7 @@ class DiscoveryDB:
                 ab.ident_hash_hex,
                 ab.b32_addr,
                 ab.reachable,
+                datetime(ab.last_probed_at, 'unixepoch') AS last_probed_utc,
                 ab.status_code,
                 ab.body_length,
                 ab.title,
@@ -390,8 +391,8 @@ class DiscoveryDB:
         """Return the 'address book' view: one row per destination showing the
         most recent probe result joined with router/leaseset metadata.
 
-        Columns: ident_hash_hex, b32_addr, dns_name, reachable, status_code,
-        body_length, title, response_time_sec, via_method, content_type,
+        Columns: dns_name, ident_hash_hex, b32_addr, reachable, last_probed_utc,
+        status_code, body_length, title, response_time_sec, via_method, content_type,
         content_summary, last_probed_at, bandwidth_kbps, router_caps, num_leases.
         """
         cur = self._conn.cursor()
@@ -742,8 +743,8 @@ def get_address_book(db_path: str = DEFAULT_DB_PATH) -> list[dict]:
     recent probe, joined against router and leaseset metadata.
 
     Columns returned:
-        ident_hash_hex, b32_addr, dns_name, reachable, status_code,
-        body_length, title, response_time_sec, via_method, content_type,
+        dns_name, ident_hash_hex, b32_addr, reachable, last_probed_utc,
+        status_code, body_length, title, response_time_sec, via_method, content_type,
         content_summary, last_probed_at, bandwidth_kbps, router_caps, num_leases
     """
     db = DiscoveryDB(db_path)
@@ -771,12 +772,14 @@ def print_address_book(entries: list[dict]) -> None:
         tag = e.get("via_method", "") or "?"
         ctype = e.get("content_type", "") or ""
         bw = f" {e['bandwidth_kbps']}kbps" if (e.get("bandwidth_kbps") or 0) > 0 else ""
+        utc = e.get("last_probed_utc", "") or ""
 
         dns = e.get("dns_name", "") or e.get("b32_addr", "")
         title = (e.get("title", "") or "")[:60]
 
         line = (
             f"  [{status}]  {tag:>7}  {dns:<45}"
+            f"   {utc!s}"
             f"  {e['status_code']:>4}   {e['body_length']:>5d}B"
             f"   {e['response_time_sec']:.1f}s{bw}"
         )

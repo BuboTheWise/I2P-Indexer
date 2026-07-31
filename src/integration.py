@@ -105,6 +105,124 @@ def _classify_content(
 
 
 # ---------------------------------------------------------------------------
+# Flag extraction heuristics
+# ---------------------------------------------------------------------------
+
+def _extract_flags(
+    body_text: str,
+    resp_headers: dict | None = None,
+    redirect_depth: int = 0,
+) -> list[str]:
+    """Analyse page content + response headers and emit structured flag strings.
+
+    Each flag is a ``type: detail`` string that describes something interesting
+    about the target (robots policy, tech stack fingerprints, contact signals,
+    forum software, redirect chains).
+
+    Args:
+        body_text: Full HTML/body text from the probe response.
+        resp_headers: HTTP response headers dict (may be empty/None).
+        redirect_depth: Number of redirects followed (>0 means a chain existed).
+
+    Returns:
+        List of flag strings, e.g. ``["robots_disallow_all", "tech_stack: nginx/1.24"]``.
+    """
+    if resp_headers is None:
+        resp_headers = {}
+
+    flags: list[str] = []
+    lower_body = body_text.lower()[:32768]  # first 32 KB for heuristics
+
+    # ── 1. robots_disallow_all ────────────────────────────────────────
+    if "user-agent" in lower_body and "disallow: /" in lower_body:
+        flags.append("robots_disallow_all")
+
+    # ── 2. tech_stack_detected ────────────────────────────────────────
+    detected_techs: list[str] = []
+
+    # Server header
+    for hdr_key in ("Server", "server"):
+        srv = resp_headers.get(hdr_key, "")
+        if srv:
+            detected_techs.append(srv)
+
+    # X-Powered-By header
+    xp = resp_headers.get("X-Powered-By", "") or resp_headers.get("x-powered-by", "")
+    if xp:
+        detected_techs.append(xp)
+
+    # <meta name="generator"> tag
+    import re as _re
+    gen_match = _re.search(r'<meta[^>]+name=["\']?generator["\']?\s+content=["\']([^"\']+)["\']', body_text[:32768], _re.IGNORECASE)
+    if gen_match:
+        detected_techs.append(gen_match.group(1))
+
+    # Common CMS fingerprints in HTML source (case-insensitive)
+    cms_signatures = {
+        "wordpress": [r'wp-content/', r'wp-includes/', r'wordpress'],
+        "joomla": [r'joomla', r'/components/com_', r'media/'],
+        "drupal": [r'drupal', r'/sites/default/files', r'core/misc/drupal'],
+        "mediawiki": [r'mediawiki', r'/w/load.php', r'/index\.php.*action='],
+        "ghost": [r'ghost-', r'/ghost/'],
+        "concrete5": [r'concrete/', r'cms_theme/'],
+    }
+    for cms, patterns in cms_signatures.items():
+        for pat in patterns:
+            if _re.search(pat, body_text[:32768], _re.IGNORECASE):
+                detected_techs.append(cms)
+                break  # one match per CMS is enough
+
+    if detected_techs:
+        flags.append(f"tech_stack: {', '.join(detected_techs[:5])}")
+
+    # ── 3. contact_found ──────────────────────────────────────────────
+    import re as _re2
+    email_re = _re2.compile(
+        r'[a-z0-9_.+-]+@[a-z0-9-]+\.[a-z]{2,}',
+        _re2.IGNORECASE,
+    )
+    found_emails = email_re.findall(body_text[:32768])
+    if found_emails:
+        flags.append(f"contact_found: email ({len(found_emails)} addr(s))")
+
+    # Social media links
+    social_patterns = {
+        "twitter": r'(?:twitter\.com|x\.com)/\w+',
+        "mastodon": r'mastodon\.|\.\w+/@\w+',
+        "github": r'github\.com/\w+',
+        "telegram": r'telegram\.(?:me|org)/\w+',
+    }
+    found_social: list[str] = []
+    for platform, pat in social_patterns.items():
+        if _re2.search(pat, body_text[:32768], _re2.IGNORECASE):
+            found_social.append(platform)
+
+    if found_social:
+        flags.append(f"contact_found: social ({', '.join(found_social)})")
+
+    # ── 4. forum_site ────────────────────────────────────────────────
+    forum_signatures = {
+        "phpBB": [r'phpbb', r'/styles/.*/theme/', r'forum\.php'],
+        "XenForo": [r'xenforo', r'/xf\.', r'js/xenforo\.min\.js'],
+        "Discourse": [r'discourse', r'data-controller=', r'discourse-helpers.js'],
+        "vBulletin": [r'vbulletin', r'/clientscript/vb\.', r'/forum\.php'],
+        "Flarum": [r'flarum', r'/extensions/', r'flarum-header'],
+        "IPS (Invision)": [r'invision', r'/uploads/', r'ipsTemplate'],
+    }
+    for forum_software, patterns in forum_signatures.items():
+        for pat in patterns:
+            if _re2.search(pat, lower_body):
+                flags.append(f"forum_site: {forum_software}")
+                break
+
+    # ── 5. redirect_chain ─────────────────────────────────────────────
+    if redirect_depth > 1:
+        flags.append(f"redirect_chain: depth={redirect_depth}")
+
+    return flags
+
+
+# ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
 
@@ -127,6 +245,7 @@ class DiscoveryResult:
     found_links: list[str] | None = field(default_factory=list)
     content_hash: str = ""     # SHA-256 of body for change detection
     last_modified: str = ""    # HTTP Last-Modified header value
+    flags: list[str] | None = field(default_factory=list)     # extracted signals (robots_disallow_all, tech_stack_detected, ...)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +392,19 @@ class DiscoveryDB:
             ORDER BY ab.last_probed_at DESC;
             """
         )
+        self._conn.commit()
+
+    # ── schema migrations (new columns for existing databases) ────────
+
+    def _ensure_discovery_columns(self) -> None:
+        """Add new columns if they exist in newer schema but not in this DB."""
+        cur = self._conn.cursor()
+        cur.execute("PRAGMA table_info(discoveries)")
+        existing_cols = {row[1] for row in cur.fetchall()}
+        if "flags" not in existing_cols:
+            cur.execute(
+                "ALTER TABLE discoveries ADD COLUMN flags TEXT DEFAULT '[]'"
+            )
         self._conn.commit()
 
     # ── upsert helpers ────────────────────────────────────────────────

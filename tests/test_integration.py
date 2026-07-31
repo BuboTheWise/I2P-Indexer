@@ -10,6 +10,7 @@ import pytest
 from unittest.mock import MagicMock, patch, call
 
 from src.integration import (
+    _do_probe,
     _extract_i2p_links,
     DEFAULT_DB_PATH,
     DiscoveryDB,
@@ -768,3 +769,186 @@ class TestLinkExtraction:
             source_site="referral.i2p",
         )
         assert added == 3
+
+
+# ---------------------------------------------------------------------------
+# TestContentMetadata — content_hash, last_modified in _do_probe and DB
+# ---------------------------------------------------------------------------
+
+class TestContentMetadata:
+    """Test that content_hash (SHA-256) and last_modified are correctly
+    computed by _do_probe, stored via record_discovery, and retrieved back."""
+
+    # ── 1. SHA-256 hash is correct ────────────────────────────────
+
+    @patch("src.integration.fetch_i2p")
+    def test_do_probe_computes_sha256(self, mock_fetch):
+        """_do_probe computes sha256(resp.body) and stores it in content_hash."""
+        known_body = b"<html><body>Deterministic content for hashing</body></html>"
+        expected_hash = __import__("hashlib").sha256(known_body).hexdigest()
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.body = known_body
+        mock_resp.text = known_body.decode("utf-8", errors="replace")
+        mock_resp.title = MagicMock(return_value="Hash Test")
+        mock_resp.headers = {}
+        mock_fetch.return_value = mock_resp
+
+        result = _do_probe(
+            url="http://test.b32.i2p/",
+            ident_hash_hex="A" * 40,
+            probe_mode="b32",
+        )
+
+        assert result.content_hash == expected_hash
+        assert len(result.content_hash) == 64  # SHA-256 is always 64 hex chars
+
+    # ── 2. Last-Modified header captured ───────────────────────────
+
+    @patch("src.integration.fetch_i2p")
+    def test_do_probe_captures_last_modified(self, mock_fetch):
+        """_do_probe reads resp.headers.get('Last-Modified') and stores it."""
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.body = b"<html><body>Some content</body></html>"
+        mock_resp.text = "<html><body>Some content</body></html>"
+        mock_resp.title = MagicMock(return_value="Modified Page")
+        expected_lm = "Tue, 15 Jul 2026 12:00:00 GMT"
+        mock_resp.headers = {"Last-Modified": expected_lm}
+        mock_fetch.return_value = mock_resp
+
+        result = _do_probe(
+            url="http://test.b32.i2p/",
+            ident_hash_hex="B" * 40,
+            probe_mode="b32",
+        )
+
+        assert result.last_modified == expected_lm
+
+    # ── 3. Empty body → content_hash is empty string ──────────────
+
+    @patch("src.integration.fetch_i2p")
+    def test_do_probe_empty_body_no_hash(self, mock_fetch):
+        """When resp.body is None (unreachable), content_hash defaults to ''."""
+        mock_resp = MagicMock()
+        mock_resp.status = 502
+        mock_resp.body = None
+        mock_resp.text = ""
+        mock_resp.title = MagicMock(return_value=None)
+        mock_resp.headers = {}
+        mock_fetch.return_value = mock_resp
+
+        result = _do_probe(
+            url="http://dead.b32.i2p/",
+            ident_hash_hex="C" * 40,
+            probe_mode="b32",
+        )
+
+        assert result.content_hash == ""
+
+    # ── 4. Missing Last-Modified → empty string ───────────────────
+
+    @patch("src.integration.fetch_i2p")
+    def test_do_probe_no_last_modified_header(self, mock_fetch):
+        """When headers has no Last-Modified, last_modified defaults to ''."""
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.body = b"<html><body>No header</body></html>"
+        mock_resp.text = "<html><body>No header</body></html>"
+        mock_resp.title = MagicMock(return_value="No Header")
+        mock_resp.headers = {"Content-Type": "text/html"}  # no Last-Modified
+        mock_fetch.return_value = mock_resp
+
+        result = _do_probe(
+            url="http://test.b32.i2p/",
+            ident_hash_hex="D" * 40,
+            probe_mode="b32",
+        )
+
+        assert result.last_modified == ""
+
+    # ── 5. record_discovery stores and retrieves the fields ───────
+
+    def test_record_discovery_stores_content_hash_and_last_modified(self, db):
+        """record_discovery persists content_hash and last_modified;
+        raw SQL SELECT confirms they are stored correctly."""
+        test_hash = "deadbeef" * 10 + "de"  # 64-char hex SHA-256
+        test_lm = "Wed, 01 Jan 2025 00:00:00 GMT"
+
+        db.record_discovery(
+            ident_hash_hex="EE" * 20,
+            b32_addr="test.b32.i2p",
+            i2p_dns_name="test.i2p",
+            probe_mode="b32",
+            reachable=True,
+            status_code=200,
+            body_length=500,
+            title="Stored Test",
+            response_time=1.5,
+            content_hash=test_hash,
+            last_modified=test_lm,
+            found_links=["linked.i2p"],
+        )
+
+        # Verify via raw SQL query
+        cur = db._conn.cursor()
+        cur.execute(
+            "SELECT ident_hash_hex, b32_addr, content_hash, last_modified, found_links "
+            "FROM discoveries WHERE b32_addr='test.b32.i2p'"
+        )
+        row = cur.fetchone()
+        assert row is not None
+        assert row[0] == "EE" * 20        # ident_hash_hex
+        assert row[1] == "test.b32.i2p"   # b32_addr
+        assert row[2] == test_hash        # content_hash
+        assert row[3] == test_lm          # last_modified
+        import json
+        assert json.loads(row[4]) == ["linked.i2p"]
+
+    def test_record_discovery_empty_metadata_defaults(self, db):
+        """When content_hash/last_modified not provided, they default to ''."""
+        db.record_discovery(
+            ident_hash_hex="FF" * 20,
+            b32_addr="default.b32.i2p",
+            probe_mode="dns",
+            reachable=False,
+            error_msg="timeout",
+        )
+
+        cur = db._conn.cursor()
+        cur.execute(
+            "SELECT content_hash, last_modified FROM discoveries "
+            "WHERE b32_addr='default.b32.i2p'"
+        )
+        row = cur.fetchone()
+        assert row[0] == ""    # content_hash defaults to empty
+        assert row[1] == ""    # last_modified defaults to empty
+
+    def test_address_book_includes_content_hash_and_last_modified(self, db):
+        """Full roundtrip: record_discovery → address_book view exposes both fields."""
+        expected_hash = "cafe" * 16
+        expected_lm = "Sun, 30 Jun 2025 18:30:00 GMT"
+
+        db.record_discovery(
+            ident_hash_hex="GG" * 10 + "HH",
+            b32_addr="roundtrip.b32.i2p",
+            i2p_dns_name="roundtrip.i2p",
+            probe_mode="b32",
+            reachable=True,
+            status_code=200,
+            body_length=3000,
+            title="Round Trip",
+            response_time=4.2,
+            content_type="blog",
+            content_summary="Blog site",
+            content_hash=expected_hash,
+            last_modified=expected_lm,
+            found_links=["linked1.i2p", "linked2.i2p"],
+        )
+
+        rows = db.address_book()
+        assert len(rows) == 1
+        entry = rows[0]
+        assert entry["content_hash"] == expected_hash
+        assert entry["last_modified"] == expected_lm

@@ -1,6 +1,6 @@
 # Database Schema Reference
 
-The indexer uses a single SQLite file (`indexer.db`) with WAL journal mode. Three operational tables plus auto-generated indexes.
+The indexer uses a single SQLite file (`indexer.db`) with WAL journal mode. Four operational tables, auto-generated indexes, and a denormalized read view.
 
 ## Table: `discoveries`
 
@@ -61,6 +61,34 @@ SELECT datetime(probed_at, 'unixepoch') AS when,
        reachable, status_code
 FROM discoveries
 ORDER BY ident_hash_hex, probed_at;
+```
+
+---
+
+## Table: `targets`
+
+The authoritative target list for discovery sweeps. All probing sources (well-known defaults, addressbook ingest, manual seeds) upsert here first; the discovery loop reads from this table instead of hardcoded Python lists. Auto-migrated on first run.
+
+| Column | Type | PK | Default | Description |
+|---|---|---|---|---|
+| `id` | INTEGER | Yes (autoincrement) | — | Surrogate key |
+| `ident_hash_hex` | TEXT | No (part of UNIQUE) | `''` | SHA-1 hash (empty for DNS-only seeds) |
+| `b32_addr` | TEXT | No | `''` | Computed Base32 address from hash, or DNS name if no hash |
+| `i2p_dns_name` | TEXT | No (part of UNIQUE) | `''` | Human-readable `.i2p` DNS name |
+| `last_probed_at` | REAL | No | `0` | Unix timestamp of last probe |
+| `source` | TEXT | No | `'manual'` | Origin: `'manual'`, `'addressbook'`, etc. |
+
+### Python API
+
+```python
+# Seed or update targets
+db.upsert_targets([
+    ("F95763B5...", "su3-directory.i2p"),
+    ("", "mail.i2pmail.org"),
+])
+
+# Read back for scanning
+targets = db.get_targets()  # -> list[tuple[hash_hex, dns_name]]
 ```
 
 ---
@@ -150,13 +178,13 @@ The view uses a two-tier dedup strategy:
 
 This means a site probed via both `test.i2p` and its raw b32 address appears as two rows — they represent distinct entry points that humans might use differently. Two probes for the same DNS name collapse into one (the latest).
 
-### Columns (15 total)
+### Columns (15 total) — **`dns_name` front-loaded for readability**
 
 | Column | Source | Description |
 |---|---|---|
+| `dns_name` | computed (`CASE`) | Human-readable identity label (DNS or b32 fallback) |
 | `ident_hash_hex` | discoveries → routers/leasesets join | SHA-1 destination hash |
 | `b32_addr` | discoveries | Base32 address |
-| `dns_name` | computed (`COALESCE`) | Human-readable identity label |
 | `reachable` | discoveries (latest probe) | 1 = UP, 0 = DOWN |
 | `status_code` | discoveries (latest probe) | HTTP status code or 0 |
 | `body_length` | discoveries (latest probe) | Response body size in bytes |
@@ -172,7 +200,9 @@ This means a site probed via both `test.i2p` and its raw b32 address appears as 
 
 ### Implementation details
 
-Uses a `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY probed_at DESC)` window function to pick the latest probe per identity, then LEFT JOINs with both `routers` and `leasesets`. Results are ordered by `last_probed_at DESC` so the most recently probed sites appear first.
+Uses a `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY probed_at DESC)` window function to pick the latest probe per identity, then LEFT JOINs with both `routers` and `leasesets`. Results are ordered by `dns_name ASC` for human-readable alphabetical output.
+
+The view is auto-migrated: on first load, `_init_db()` drops any stale `address_book` view (schema evolution) before recreating it so that old databases pick up new dedup/dedup logic transparently.
 
 ### Programmatic access
 

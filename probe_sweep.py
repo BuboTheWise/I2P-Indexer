@@ -55,7 +55,7 @@ def main():
         print(f"Database: {args.db}")
         print(f"Targets in queue: {len(targets)}")
         for hash_hex, dns in targets[:20]:
-            tag = dns or hash_hex[:16] + "..." if hash_hex else "(empty)"
+            tag = dns or (hash_hex[:16] + "..." if hash_hex else "(empty)")
             print(f"  └─ {tag}")
         if len(targets) > 20:
             print(f"  ... and {len(targets) - 20} more")

@@ -194,10 +194,12 @@ class DiscoveryDB:
             CREATE VIEW IF NOT EXISTS address_book AS
             SELECT
                 ab.dns_name,
-                ab.ident_hash_hex,
-                ab.b32_addr,
+                ab.content_type,
                 ab.reachable,
                 datetime(ab.last_probed_at, 'unixepoch') AS last_probed_utc,
+                ab.content_summary,
+                ab.ident_hash_hex,
+                ab.b32_addr,
                 ab.status_code,
                 ab.body_length,
                 ab.title,
@@ -391,9 +393,9 @@ class DiscoveryDB:
         """Return the 'address book' view: one row per destination showing the
         most recent probe result joined with router/leaseset metadata.
 
-        Columns: dns_name, ident_hash_hex, b32_addr, reachable, last_probed_utc,
-        status_code, body_length, title, response_time_sec, via_method, content_type,
-        content_summary, last_probed_at, bandwidth_kbps, router_caps, num_leases.
+        Columns: dns_name, content_type, reachable, last_probed_utc, content_summary,
+        ident_hash_hex, b32_addr, status_code, body_length, title, response_time_sec,
+        via_method, last_probed_at, bandwidth_kbps, router_caps, num_leases.
         """
         cur = self._conn.cursor()
         cur.execute("SELECT * FROM address_book ORDER BY dns_name ASC")
@@ -749,9 +751,9 @@ def get_address_book(db_path: str = DEFAULT_DB_PATH) -> list[dict]:
     recent probe, joined against router and leaseset metadata.
 
     Columns returned:
-        dns_name, ident_hash_hex, b32_addr, reachable, last_probed_utc,
-        status_code, body_length, title, response_time_sec, via_method, content_type,
-        content_summary, last_probed_at, bandwidth_kbps, router_caps, num_leases
+        dns_name, content_type, reachable, last_probed_utc, content_summary,
+        ident_hash_hex, b32_addr, status_code, body_length, title, response_time_sec,
+        via_method, last_probed_at, bandwidth_kbps, router_caps, num_leases
     """
     db = DiscoveryDB(db_path)
     rows = db.address_book()
@@ -775,26 +777,28 @@ def print_address_book(entries: list[dict]) -> None:
 
     for e in entries:
         status = "OK" if e["reachable"] else "DOWN"
-        tag = e.get("via_method", "") or "?"
         ctype = e.get("content_type", "") or ""
-        bw = f" {e['bandwidth_kbps']}kbps" if (e.get("bandwidth_kbps") or 0) > 0 else ""
         utc = e.get("last_probed_utc", "") or ""
+        summary = (e.get("content_summary", "") or "")[:100]
 
         dns = e.get("dns_name", "") or e.get("b32_addr", "")
+
+        ctype_tag = f" @{ctype}" if ctype else "  unknown"
+        line = f"  [{status:>4}] {ctype_tag:<15} {utc!s:<20} {summary}"
+
         title = (e.get("title", "") or "")[:60]
+        tag = e.get("via_method", "") or "?"
+        bw = f" {e['bandwidth_kbps']}kbps" if (e.get("bandwidth_kbps") or 0) > 0 else ""
 
-        line = (
-            f"  [{status}]  {tag:>7}  {dns:<45}"
-            f"   {utc!s}"
-            f"  {e['status_code']:>4}   {e['body_length']:>5d}B"
-            f"   {e['response_time_sec']:.1f}s{bw}"
-        )
-
-        extras = []
-        if ctype:
-            extras.append(f"@{ctype}")
+        extras: list[str] = []
+        if dns and dns != summary[:len(dns)]:
+            extras.append(dns)
         if title:
-            extras.append(title)
+            extras.append(f'"{title}"')
+        if tag:
+            extras.append(f"[{tag}]")
+        if bw:
+            extras.append(bw)
         if extras:
             line += "  " + " ".join(extras)
 

@@ -124,6 +124,7 @@ class DiscoveryDB:
         cur.executescript(
             """
             -- Source routers (from addressbook parsing, webconsole scrape, etc.)
+            DROP VIEW IF EXISTS address_book;
             CREATE TABLE IF NOT EXISTS routers (
                 ident_hash_hex   TEXT PRIMARY KEY,
                 key_type         INTEGER DEFAULT 0,

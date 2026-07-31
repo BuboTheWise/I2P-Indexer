@@ -135,3 +135,89 @@ Parsed from `.ls64` files in the I2P `netdb/` directory. One row per lease set i
 - `discoveries` is the write-heavy table (one row per probe attempt).
 - `routers` and `leasesets` are upsert-on-hash (network topology — stable, rarely changes per run).
 - All three join on `ident_hash_hex`.
+
+---
+
+## View: `address_book`
+
+A denormalized SQL view that collapses multi-row probe history into one row per "human identity." It is the primary read surface for auditing what we know about each destination.
+
+### Dedup key
+
+The view uses a two-tier dedup strategy:
+1. **When `i2p_dns_name` is present and non-empty** → the DNS name becomes the unique identity (e.g., `i2p-projekt.i2p`).
+2. **When `i2p_dns_name` is empty** → falls back to `b32_addr`.
+
+This means a site probed via both `test.i2p` and its raw b32 address appears as two rows — they represent distinct entry points that humans might use differently. Two probes for the same DNS name collapse into one (the latest).
+
+### Columns (15 total)
+
+| Column | Source | Description |
+|---|---|---|
+| `ident_hash_hex` | discoveries → routers/leasesets join | SHA-1 destination hash |
+| `b32_addr` | discoveries | Base32 address |
+| `dns_name` | computed (`COALESCE`) | Human-readable identity label |
+| `reachable` | discoveries (latest probe) | 1 = UP, 0 = DOWN |
+| `status_code` | discoveries (latest probe) | HTTP status code or 0 |
+| `body_length` | discoveries (latest probe) | Response body size in bytes |
+| `title` | discoveries (latest probe) | Extracted page title |
+| `response_time_sec` | discoveries (latest probe) | Round-trip time in seconds |
+| `via_method` | discoveries (latest probe) | How we reached it (`b32`, `dns`) |
+| `content_type` | discoveries (latest probe) | Auto-classified bucket label |
+| `content_summary` | discoveries (latest probe) | Sentence-length content description |
+| `last_probed_at` | discoveries (latest probe) | Unix timestamp of latest probe |
+| `bandwidth_kbps` | routers (LEFT JOIN) | Advertised bandwidth capacity |
+| `router_caps` | routers (LEFT JOIN) | Capability string (e.g., `"fR4"`) |
+| `num_leases` | leasesets (LEFT JOIN) | Number of active leases |
+
+### Implementation details
+
+Uses a `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY probed_at DESC)` window function to pick the latest probe per identity, then LEFT JOINs with both `routers` and `leasesets`. Results are ordered by `last_probed_at DESC` so the most recently probed sites appear first.
+
+### Programmatic access
+
+```python
+from src.integration import get_address_book, print_address_book
+
+entries = get_address_book()          # list[dict]  — ready for JSON export
+print_address_book(entries)           # human-readable table to stdout
+```
+
+### Entity Relationship Diagram (updated)
+
+```
+  ┌──────────────────────┐       ┌────────────────────────┐
+  │      routers         │       │        leasesets        │
+  ├──────────────────────┤       ├────────────────────────┤
+  │ PK ident_hash_hex    │◄──────│ PK ident_hash_hex      │
+  │  key_type            │       │  store_type             │
+  │ ⚡ bandwidth_kbps     │       │ ⚡ num_leases           │
+  │ ⚡ caps, published    │       │  leases_v1_count        │
+  └──────────────────────┘       └────────────────────────┘
+         │                               │
+         │  JOIN ON ident_hash_hex       │
+         ▼                               ▼
+  ┌───────────────────────────────────────────────┐
+  │                   discoveries                 │
+  │              (write-heavy, per-probe)          │
+  ├───────────────────────────────────────────────┤
+  │ id (autoincrement surrogate key)              │
+  │ ident_hash_hex → JOIN to routers/leasesets   │
+  │ b32_addr, i2p_dns_name                       │
+  │ reachable, status_code, body_length           │
+  │ title, response_time, via_method             │
+  │ content_type, content_summary                │
+  │ error_msg, probed_at                         │
+  │ IDX on ident_hash_hex, i2p_dns_name          │
+  └─────────────────────┬─────────────────────────┘
+                        │  WINDOW + JOIN (read view)
+                        ▼
+              ╔═══════════════════════════════╗
+              ║       address_book VIEW        ║
+              ╜═══════════════════════════════╝
+                    1 row per identity
+           (dns_name preferred, b32 fallback)
+              ╚═══════════════════════════════╝
+```
+
+**Legend:** `⚡` = column exposed in the view

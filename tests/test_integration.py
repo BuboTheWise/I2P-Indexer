@@ -14,6 +14,8 @@ from src.integration import (
     DiscoveryDB,
     DiscoveryResult,
     discover_addresses,
+    get_address_book,
+    print_address_book,
     print_report,
     query_db,
 )
@@ -375,3 +377,162 @@ class TestPrintReport:
         print_report([])
         captured = capsys.readouterr()
         assert "Total: 0" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# TestAddressBookView — SQL view + address_book() + print_address_book
+# ---------------------------------------------------------------------------
+class TestAddressBookView:
+    """Verify the 'address_book' SQL view, DB method, and pretty-print."""
+
+    def test_view_exists(self, tmp_db):
+        db = DiscoveryDB(db_path=tmp_db)
+        cur = db._conn.cursor()
+        # The view should be created during _init_db
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='view' AND name='address_book'"
+        )
+        assert cur.fetchone() is not None
+        db.close()
+
+    def test_empty_view(self, tmp_db):
+        db = DiscoveryDB(db_path=tmp_db)
+        rows = db.address_book()
+        assert rows == []
+        db.close()
+
+    def test_one_entry_in_view(self, tmp_db):
+        db = DiscoveryDB(db_path=tmp_db)
+        db.record_discovery(
+            ident_hash_hex="A" * 40,
+            b32_addr="aaaaaa.b32.i2p",
+            i2p_dns_name="test.i2p",
+            probe_mode="b32",
+            reachable=True,
+            status_code=200,
+            body_length=1500,
+            title="Test Page",
+            content_type="blog",
+            content_summary="Blog — «Test Page»",
+        )
+        rows = db.address_book()
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["ident_hash_hex"] == "A" * 40
+        assert r["reachable"] == 1
+        assert r["content_type"] == "blog"
+        assert r["title"] == "Test Page"
+        assert r["dns_name"] == "test.i2p"
+        db.close()
+
+    def test_view_collapses_to_latest(self, tmp_db):
+        """Two probes with the SAME dns_name → view shows only the latest.
+
+        Both have a DNS name so they share the same dedup key.
+        """
+        db = DiscoveryDB(db_path=tmp_db)
+        db.record_discovery(
+            ident_hash_hex="B" * 40,
+            b32_addr="bbbbbb.b32.i2p",
+            i2p_dns_name="test2.i2p",
+            probe_mode="b32",
+            reachable=False, status_code=0,
+        )
+        db.record_discovery(
+            ident_hash_hex="B" * 40,
+            b32_addr="bbbbbb.b32.i2p",
+            i2p_dns_name="test2.i2p",
+            probe_mode="dns",
+            reachable=True, status_code=200, body_length=900,
+        )
+        rows = db.address_book()
+        assert len(rows) == 1
+        assert rows[0]["reachable"] == 1
+        assert rows[0]["status_code"] == 200
+        assert rows[0]["dns_name"] == "test2.i2p"
+        db.close()
+
+    def test_b32_and_dns_create_two_identities(self, tmp_db):
+        """A site probed both as b32-only (dns='') and via DNS name
+        creates two view rows — separate entry points for the same site."""
+        db = DiscoveryDB(db_path=tmp_db)
+        db.record_discovery(
+            ident_hash_hex="X" * 40,
+            b32_addr="xxxxxx.b32.i2p",
+            probe_mode="b32",
+            reachable=True, status_code=200,
+        )
+        db.record_discovery(
+            ident_hash_hex="X" * 40,
+            b32_addr="xxxxxx.b32.i2p",
+            i2p_dns_name="dual.i2p",
+            probe_mode="dns",
+            reachable=True, status_code=200,
+        )
+        rows = db.address_book()
+        # Two dedup keys: 'xxxxxx.b32.i2p' (fallback) and 'dual.i2p'
+        assert len(rows) == 2
+        dns_names = {r["dns_name"] for r in rows}
+        assert dns_names == {"xxxxxx.b32.i2p", "dual.i2p"}
+        db.close()
+
+    def test_multiple_destinations(self, tmp_db):
+        """Three hashes → three view rows."""
+        db = DiscoveryDB(db_path=tmp_db)
+        for prefix in ("C", "D", "E"):
+            db.record_discovery(
+                ident_hash_hex=prefix * 40,
+                b32_addr=f"{prefix * 6}.b32.i2p",
+                probe_mode="b32",
+                reachable=(prefix == "D"),
+                status_code=200 if prefix == "D" else 0,
+            )
+        rows = db.address_book()
+        assert len(rows) == 3
+        reachable_count = sum(1 for r in rows if r["reachable"])
+        assert reachable_count == 1
+        db.close()
+
+    def test_get_address_book_function(self, tmp_db):
+        """Top-level convenience function works and closes DB."""
+        # Seed a record first
+        db = DiscoveryDB(db_path=tmp_db)
+        db.record_discovery(
+            ident_hash_hex="F" * 40,
+            b32_addr="ffffff.b32.i2p",
+            probe_mode="b32",
+            reachable=True,
+            status_code=200,
+            body_length=500,
+            title="Sample Site",
+        )
+        db.close()
+
+        # Now use the convenience getter
+        entries = get_address_book(db_path=tmp_db)
+        assert len(entries) == 1
+        assert "content_type" in entries[0]
+        assert "last_probed_at" in entries[0]
+
+    def test_print_address_book_nonempty(self, capsys):
+        entries = [
+            {"reachable": True, "via_method": "b32", "status_code": 200,
+             "body_length": 1200, "response_time_sec": 3.5,
+             "content_type": "forum", "title": "My Forum", "dns_name": "forum.i2p",
+             "b32_addr": "", "bandwidth_kbps": 0},
+            {"reachable": False, "via_method": "dns", "status_code": 0,
+             "body_length": 0, "response_time_sec": 1.0,
+             "content_type": "", "title": "", "dns_name": "dead.i2p",
+             "b32_addr": "", "bandwidth_kbps": None},
+        ]
+        print_address_book(entries)
+        captured = capsys.readouterr()
+        assert "I2P Address Book" in captured.out
+        assert "OK" in captured.out
+        assert "DOWN" in captured.out
+        assert "@forum" in captured.out
+
+    def test_print_address_book_empty(self, capsys):
+        print_address_book([])
+        captured = capsys.readouterr()
+        assert "empty" in captured.out.lower() or "0 destination" in captured.out

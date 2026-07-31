@@ -173,6 +173,53 @@ class DiscoveryDB:
             -- Index for fast lookups by hash and DNS name
             CREATE INDEX IF NOT EXISTS idx_disc_hash ON discoveries(ident_hash_hex);
             CREATE INDEX IF NOT EXISTS idx_disc_dns  ON discoveries(i2p_dns_name);
+
+            -- "Our address book" view: one row per destination showing the most
+            -- recent probe result joined with router/leaseset metadata.
+            -- Dedup key: DNS name when present and non-empty, else b32 address.
+            -- A site reachable by two different DNS names appears as two rows
+            -- (separate entry points); b32-only probes fall back to the b32 key.
+            CREATE VIEW IF NOT EXISTS address_book AS
+            SELECT
+                ab.ident_hash_hex,
+                ab.b32_addr,
+                ab.dns_name,
+                ab.reachable,
+                ab.status_code,
+                ab.body_length,
+                ab.title,
+                ab.response_time_sec,
+                ab.via_method,
+                ab.content_type,
+                ab.content_summary,
+                ab.last_probed_at,
+                r.bandwidth_kbps,
+                r.caps    AS router_caps,
+                ls.num_leases
+            FROM (
+                SELECT
+                    ident_hash_hex,
+                    b32_addr,
+                    CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END AS dns_name,
+                    reachable,
+                    status_code,
+                    body_length,
+                    title,
+                    response_time   AS response_time_sec,
+                    via_method,
+                    content_type,
+                    content_summary,
+                    probed_at       AS last_probed_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
+                        ORDER BY probed_at DESC
+                    ) AS rn
+                FROM discoveries
+            ) ab
+            LEFT JOIN routers   r  ON r.ident_hash_hex = ab.ident_hash_hex
+            LEFT JOIN leasesets ls ON ls.ident_hash_hex = ab.ident_hash_hex
+            WHERE ab.rn = 1
+            ORDER BY ab.last_probed_at DESC;
             """
         )
         self._conn.commit()
@@ -326,6 +373,19 @@ class DiscoveryDB:
             "unique_destinations": n_unique,
             "reachable_count": n_reachable,
         }
+
+    def address_book(self) -> list[dict]:
+        """Return the 'address book' view: one row per destination showing the
+        most recent probe result joined with router/leaseset metadata.
+
+        Columns: ident_hash_hex, b32_addr, dns_name, reachable, status_code,
+        body_length, title, response_time_sec, via_method, content_type,
+        content_summary, last_probed_at, bandwidth_kbps, router_caps, num_leases.
+        """
+        cur = self._conn.cursor()
+        cur.execute("SELECT * FROM address_book ORDER BY last_probed_at DESC")
+        cols = [desc[0] for desc in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def close(self) -> None:
         self._conn.close()
@@ -649,6 +709,63 @@ def query_db(hash_hex: str = "", dns_name: str = "", db_path: str = DEFAULT_DB_P
         print("Usage: query_db(hash_hex='...') or query_db(dns_name='...')\n")
     db.close()
     return results
+
+
+def get_address_book(db_path: str = DEFAULT_DB_PATH) -> list[dict]:
+    """Return the address_book view — one row per destination with the most
+    recent probe, joined against router and leaseset metadata.
+
+    Columns returned:
+        ident_hash_hex, b32_addr, dns_name, reachable, status_code,
+        body_length, title, response_time_sec, via_method, content_type,
+        content_summary, last_probed_at, bandwidth_kbps, router_caps, num_leases
+    """
+    db = DiscoveryDB(db_path)
+    rows = db.address_book()
+    db.close()
+    return rows
+
+
+def print_address_book(entries: list[dict]) -> None:
+    """Pretty-print the address book view to a human-readable table."""
+    if not entries:
+        print("\n  (address book is empty — run a discovery first)\n")
+        return
+
+    reachable = sum(1 for e in entries if e["reachable"])
+    dead = len(entries) - reachable
+
+    print(f"\n{'='*72}")
+    print(f"  I2P Address Book  —  {len(entries)} destination(s), "
+          f"{reachable} reachable, {dead} unreachable")
+    print(f"{'='*72}")
+
+    for e in entries:
+        status = "OK" if e["reachable"] else "DOWN"
+        tag = e.get("via_method", "") or "?"
+        ctype = e.get("content_type", "") or ""
+        bw = f" {e['bandwidth_kbps']}kbps" if (e.get("bandwidth_kbps") or 0) > 0 else ""
+
+        dns = e.get("dns_name", "") or e.get("b32_addr", "")
+        title = (e.get("title", "") or "")[:60]
+
+        line = (
+            f"  [{status}]  {tag:>7}  {dns:<45}"
+            f"  {e['status_code']:>4}   {e['body_length']:>5d}B"
+            f"   {e['response_time_sec']:.1f}s{bw}"
+        )
+
+        extras = []
+        if ctype:
+            extras.append(f"@{ctype}")
+        if title:
+            extras.append(title)
+        if extras:
+            line += "  " + " ".join(extras)
+
+        print(line)
+
+    print(f"\n{'='*72}\n")
 
 
 def main() -> None:

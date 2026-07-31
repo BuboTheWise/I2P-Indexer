@@ -34,6 +34,9 @@ The system shall provide a `query_db()` helper that accepts an identifier (hash 
 ### FR-08: Terminal Report
 The system shall render probe results as a formatted terminal report via `print_report()`, including status, response size, latency, and content classification.
 
+### FR-09: Address Book View
+The system shall expose an SQL view (`address_book`) that collapses multi-probe history into one row per "human identity." The dedup key is the DNS name when present (non-empty), otherwise the b32 address. Each row joins with `routers` and `leasesets` metadata via `ident_hash_hex`. Access via `get_address_book()`  → `list[dict]` and `print_address_book(entries)` for terminal display.
+
 ## 4. Non-Functional Requirements
 
 ### NFR-01: No Browser Automation

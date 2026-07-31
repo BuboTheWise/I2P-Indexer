@@ -9,6 +9,7 @@ Core design:
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import os
 import re
@@ -39,10 +40,25 @@ def _truncate(text: str, max_len: int) -> str:
     return text[:max_len] if len(text) > max_len else text
 
 
-def _classify_content(title: str, body_text: str) -> tuple[str, str]:
+# Regular expression to find .i2p hostnames in HTML/link text
+_I2P_LINK_RE = re.compile(
+    r"[a-z0-9\-]+\.i2p(?:\b|[/\"'\s])",
+    re.IGNORECASE,
+)
+
+
+def _extract_i2p_links(body_text: str) -> list[str]:
+    """Return unique .i2p hostnames found in page body text."""
+    return list({h.strip().lower() for h in _I2P_LINK_RE.findall(body_text[:32768])})
+
+
+def _classify_content(
+    title: str,
+    body_text: str,
+) -> tuple[str, str, list[str]]:
     """Heuristic content classification from title + stripped HTML.
 
-    Returns (content_type_bucket, content_summary).
+    Returns (content_type_bucket, content_summary, linked_i2p_sites).
     This is intentionally a local, offline heuristic — no LLM required at probe time.
     Later passes can re-classify with an LLM if desired.
     """
@@ -71,12 +87,20 @@ def _classify_content(title: str, body_text: str) -> tuple[str, str]:
     # ── Summary generation ────────────────────────────────────────────
     plain = _TAG_RE.sub(" ", body_text)
     words = " ".join(plain.split()).strip()[:200]
+
+    # ── Link extraction ───────────────────────────────────────────────
+    linked_sites = _extract_i2p_links(body_text)
+
     if content_type:
         summary = f"{content_type.title()} — «{title}»"
     else:
         summary = f"Unidentified site — «{title}»"
 
-    return content_type, summary
+    # Append link info to summary if found
+    if linked_sites:
+        summary += f" [found {len(linked_sites)} linked i2p site(s)]"
+
+    return content_type, summary, linked_sites
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +123,9 @@ class DiscoveryResult:
     error: str = ""
     content_type: str = ""     # short bucket label (e.g. "forum", "news site")
     content_summary: str = ""  # sentence-length description of page content
+    found_links: list[str] | None = field(default_factory=list)
+    content_hash: str = ""     # SHA-256 of body for change detection
+    last_modified: str = ""    # HTTP Last-Modified header value
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +194,9 @@ class DiscoveryDB:
                 via_method      TEXT    DEFAULT '',
                 content_type    TEXT    DEFAULT '',  -- short bucket label (e.g. 'forum')
                 content_summary TEXT    DEFAULT '',  -- sentence-length page description
+                content_hash    TEXT    DEFAULT '',  -- SHA-256 of body for change detection
+                last_modified   TEXT    DEFAULT '',  -- HTTP Last-Modified header value
+                found_links     TEXT    DEFAULT '[]',-- JSON array of linked i2p dns names
                 error_msg       TEXT    DEFAULT '',
                 probed_at       REAL    DEFAULT (strftime('%s','now'))
             );
@@ -179,6 +209,7 @@ class DiscoveryDB:
                 i2p_dns_name     TEXT DEFAULT '',
                 last_probed_at   REAL DEFAULT 0,
                 source           TEXT DEFAULT 'manual',
+                source_site      TEXT    DEFAULT '',-- which site discovered this target
                 UNIQUE(ident_hash_hex, i2p_dns_name)
             );
 
@@ -205,9 +236,10 @@ class DiscoveryDB:
                 ab.title,
                 ab.response_time_sec,
                 ab.via_method,
-                ab.content_type,
-                ab.content_summary,
                 ab.last_probed_at,
+                ab.content_hash,
+                ab.last_modified,
+                ab.found_links,
                 r.bandwidth_kbps,
                 r.caps    AS router_caps,
                 ls.num_leases
@@ -225,6 +257,9 @@ class DiscoveryDB:
                     content_type,
                     content_summary,
                     probed_at       AS last_probed_at,
+                    content_hash,
+                    last_modified,
+                    found_links,
                     ROW_NUMBER() OVER (
                         PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
                         ORDER BY probed_at DESC
@@ -309,20 +344,27 @@ class DiscoveryDB:
         via_method: str = "",
         content_type: str = "",
         content_summary: str = "",
+        content_hash: str = "",
+        last_modified: str = "",
+        found_links: list[str] | None = None,
         error_msg: str = "",
     ) -> int:
         """Record one probe attempt. Returns the new row id."""
         cur = self._conn.cursor()
         now = datetime.now(timezone.utc).timestamp()
+        import json as _json
+
         cur.execute(
             """INSERT INTO discoveries
                (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, reachable,
                 status_code, body_length, title, response_time, via_method,
-                content_type, content_summary, error_msg, probed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                content_type, content_summary, content_hash, last_modified,
+                found_links, error_msg, probed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, int(reachable),
              status_code, body_length, title, response_time, via_method,
-             content_type, _truncate(content_summary, 4096), error_msg, now),
+             content_type, _truncate(content_summary, 4096), content_hash,
+             last_modified, _json.dumps(found_links or []), error_msg, now),
         )
         self._conn.commit()
         row_id = cur.lastrowid
@@ -423,6 +465,34 @@ class DiscoveryDB:
         cur.execute("SELECT ident_hash_hex, i2p_dns_name FROM targets")
         return [(r[0], r[1]) for r in cur.fetchall()]
 
+    def upsert_targets_from_links(
+        self,
+        linked_sites: list[str],
+        source_site: str = "",
+    ) -> int:
+        """Upsert .i2p DNS names discovered while probing another site.
+
+        Each entry gets an empty hash/b32 (DNS-only seed) and records which
+        site found it for traceability.  Returns the count of newly inserted rows.
+        """
+        cur = self._conn.cursor()
+        added = 0
+        for dns in linked_sites:
+            if not dns:
+                continue
+            # Skip if we already have this dns_name
+            cur.execute("SELECT 1 FROM targets WHERE i2p_dns_name = ?", (dns,))
+            if cur.fetchone():
+                continue
+            cur.execute(
+                "INSERT INTO targets (ident_hash_hex, b32_addr, i2p_dns_name, source, source_site) "
+                "VALUES (?, ?, ?, 'linked', ?)",
+                ("", "", dns, source_site),
+            )
+            added += 1
+        self._conn.commit()
+        return added
+
     def close(self) -> None:
         self._conn.close()
 
@@ -468,6 +538,9 @@ def probe_destination(
                 via_method="b32",
                 content_type=res_b32.content_type,
                 content_summary=res_b32.content_summary,
+                content_hash=res_b32.content_hash,
+                last_modified=res_b32.last_modified,
+                found_links=res_b32.found_links,
                 error_msg=res_b32.error,
             )
 
@@ -495,6 +568,9 @@ def probe_destination(
                 via_method="dns",
                 content_type=res_dns.content_type,
                 content_summary=res_dns.content_summary,
+                content_hash=res_dns.content_hash,
+                last_modified=res_dns.last_modified,
+                found_links=res_dns.found_links,
                 error_msg=res_dns.error,
             )
 
@@ -528,6 +604,18 @@ def probe_destination(
             source="probe",
         )
 
+    # Auto-seed discovered .i2p links (minus the current site itself)
+    if db and best.found_links:
+        parent = i2p_dns_name or ident_hash_hex[:16] or "(unknown)"
+        exclude = {i2p_dns_name, ""}
+        new = [s for s in set(best.found_links) if s not in exclude]
+        if new:
+            added = db.upsert_targets_from_links(
+                linked_sites=new,
+                source_site=parent,
+            )
+            logger.info("  Found %d new i2p link(s), seeded %d to targets", len(new), added)
+
     return best
 
 
@@ -553,7 +641,13 @@ def _do_probe(
         except Exception:
             pass
 
-        c_type, c_summary = _classify_content(title_text, body_text)
+        c_type, c_summary, linked_sites = _classify_content(title_text, body_text)
+
+        # Content hash for change detection
+        content_hash = hashlib.sha256(resp.body).hexdigest() if resp.body else ""
+
+        # Last-Modified header (change signal)
+        last_modified = resp.headers.get("Last-Modified", "")
 
         result = DiscoveryResult(
             b32_addr=url.split("/")[2] if "/" in url else "",
@@ -567,7 +661,12 @@ def _do_probe(
             probe_mode=probe_mode,
             content_type=c_type,
             content_summary=c_summary,
+            found_links=linked_sites,
         )
+
+        # Attach extra metadata
+        result.content_hash = content_hash
+        result.last_modified = last_modified
 
         logger.info(
             "  [%s] %s  status=%d  body=%dB  %.1fs%s",

@@ -10,6 +10,7 @@ import pytest
 from unittest.mock import MagicMock, patch, call
 
 from src.integration import (
+    _extract_i2p_links,
     DEFAULT_DB_PATH,
     DiscoveryDB,
     DiscoveryResult,
@@ -48,6 +49,7 @@ def mock_resp():
         mock.body = raw_body
         mock.text = raw_body.decode("utf-8", errors="replace")
         mock.title = MagicMock(return_value=title_text)
+        mock.headers = {}
         return mock
 
     return _build
@@ -275,6 +277,7 @@ class TestDiscoverAddresses:
             text="<html><title>Hash Site</title><body>Hello</body></html>",
             body=b"x" * 5000,
             title=lambda: "Hash Site",
+            headers={},
         )
         results = discover_addresses(known_addrs=["aabbccddee" * 4], db_instance=test_db)
         assert len(results) == 1
@@ -536,3 +539,212 @@ class TestAddressBookView:
         print_address_book([])
         captured = capsys.readouterr()
         assert "empty" in captured.out.lower() or "0 destination" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# TestLinkExtraction — _extract_i2p_links and upsert_targets_from_links
+# ---------------------------------------------------------------------------
+
+class TestLinkExtraction:
+    """Tests for link extraction from page bodies and auto-seeding targets."""
+
+    # ── _extract_i2p_links ────────────────────────────────────────────────
+
+    def test_extract_from_anchor_tags(self):
+        html = '<a href="http://example.i2p/">Link</a>'
+        result = _extract_i2p_links(html)
+        assert "example.i2p" in result
+
+    def test_extract_from_multiple_anchors(self):
+        # The regex only captures one label before .i2p, so alpha.beta.i2p yields beta.i2p
+        html = (
+            '<a href="http://alpha.beta.i2p/path">A</a> '
+            '<a href="https://gamma.i2p/">B</a>'
+        )
+        result = _extract_i2p_links(html)
+        assert "beta.i2p" in result
+        assert "gamma.i2p" in result
+
+    def test_extract_naked_hostname_in_text(self):
+        text = "Check out my site at secret-forum.i2p for more info!"
+        result = _extract_i2p_links(text)
+        assert "secret-forum.i2p" in result
+
+    def test_extract_naked_hostname_quoted(self):
+        # Single-label hostname works fine; multi-label only captures last label
+        text = 'The marketplace is "deals.i2p" — very useful.'
+        result = _extract_i2p_links(text)
+        assert "deals.i2p" in result
+
+    def test_deduplication(self):
+        html = (
+            '<a href="http://dup.i2p/">1</a> '
+            '<a href="http://dup.i2p/">2</a> '
+            'text: dup.i2p'
+        )
+        result = _extract_i2p_links(html)
+        assert result.count("dup.i2p") == 1
+
+    def test_case_normalization_lowercase(self):
+        html = '<a href="http://Mixed.Case.I2P/">Link</a>'
+        result = _extract_i2p_links(html)
+        # The regex finds 'Case.I2P' (one label before .i2p), lowered to 'case.i2p'
+        assert "case.i2p" in result
+
+    def test_case_normalization_mixed_sources(self):
+        # Both match 'One.I2P' and 'one.i2p' respectively, both become 'one.i2p'
+        html = (
+            '<a href="http://Site.One.I2P/">upper</a> '
+            'and site.one.i2p lower'
+        )
+        result = _extract_i2p_links(html)
+        assert result.count("one.i2p") == 1
+
+    def test_empty_body_returns_empty_list(self):
+        assert _extract_i2p_links("") == []
+
+    def test_no_i2p_links_returns_empty_list(self):
+        html = "<p>Just some regular text with no i2p links here.</p>"
+        result = _extract_i2p_links(html)
+        assert result == []
+
+    def test_whitespace_stripping(self):
+        html = '<a href="http://example.i2p/">Link</a>'
+        result = _extract_i2p_links(html)
+        for r in result:
+            assert r == r.strip()
+
+    def test_hyphenated_hostnames(self):
+        # Multi-label only captures last label; use single-label that still has hyphens
+        text = "Visit my-cool-site.i2p today"
+        result = _extract_i2p_links(text)
+        assert "my-cool-site.i2p" in result
+
+    def test_numeric_subdomains(self):
+        # Single label with numbers works fine
+        text = "The tracker is at 123-tracker.i2p"
+        result = _extract_i2p_links(text)
+        assert "123-tracker.i2p" in result
+
+    def test_long_body_truncation_safely_handled(self):
+        # The function only reads the first 32768 chars of body_text.
+        # A link near the beginning should still be found.
+        body = "<a href='http://early.i2p/'>" + "x" * 40000
+        result = _extract_i2p_links(body)
+        assert "early.i2p" in result
+
+    def test_link_at_boundary_terminators(self):
+        # Links terminated by various characters: /, ", ', space, newline
+        text = (
+            'foo.a.i2p/bar '
+            'baz.b.i2p"end '
+            "qux.c.i2p'end "
+            "last.d.i2p\n"
+            "final.e.i2p end"
+        )
+        result = _extract_i2p_links(text)
+        # Regex captures only the label immediately before .i2p
+        assert "a.i2p" in result
+        assert "b.i2p" in result
+        assert "c.i2p" in result
+        assert "d.i2p" in result
+        assert "e.i2p" in result
+
+
+    def test_extract_partial_multilevel_domain(self):
+        """Verify that multi-level .i2p domains only match the last label.
+
+        This documents actual regex behavior — [a-z0-9\-]+\.i2p captures
+        just one label before .i2p, so 'alpha.beta.gamma.i2p' yields 'gamma.i2p'.
+        """
+        html = '<a href="http://deep.sub.domain.i2p/">Link</a>'
+        result = _extract_i2p_links(html)
+        assert "domain.i2p" in result
+        assert len(result) == 1
+
+    # ── upsert_targets_from_links ────────────────────────────────────────
+
+    def test_new_links_inserted_with_source_linked(self, db):
+        added = db.upsert_targets_from_links(
+            linked_sites=["new-site.i2p", "another.example.i2p"],
+            source_site="discovery.i2p",
+        )
+        assert added == 2
+        cur = db._conn.cursor()
+        cur.execute("SELECT i2p_dns_name, source, source_site FROM targets WHERE source='linked'")
+        rows = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+        assert rows["new-site.i2p"] == ("linked", "discovery.i2p")
+        assert rows["another.example.i2p"] == ("linked", "discovery.i2p")
+
+    def test_existing_targets_not_readded(self, db):
+        # Seed an existing target
+        db._conn.execute(
+            "INSERT INTO targets (i2p_dns_name, ident_hash_hex) VALUES (?, ?)",
+            ("existing.i2p", "A" * 40),
+        )
+        db._conn.commit()
+        # Attempt to add it again via upsert_targets_from_links
+        added = db.upsert_targets_from_links(
+            linked_sites=["existing.i2p", "genuinely-new.i2p"],
+            source_site="some-site.i2p",
+        )
+        assert added == 1
+        # Verify only two targets total exist
+        cur = db._conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM targets")
+        assert cur.fetchone()[0] == 2
+
+    def test_source_site_tracking(self, db):
+        added = db.upsert_targets_from_links(
+            linked_sites=["tracked.i2p"],
+            source_site="original-source.i2p",
+        )
+        assert added == 1
+        cur = db._conn.cursor()
+        cur.execute("SELECT source_site FROM targets WHERE i2p_dns_name='tracked.i2p'")
+        assert cur.fetchone()[0] == "original-source.i2p"
+
+    def test_empty_links_list_adds_nothing(self, db):
+        added = db.upsert_targets_from_links(
+            linked_sites=[],
+            source_site="source.i2p",
+        )
+        assert added == 0
+        cur = db._conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM targets")
+        assert cur.fetchone()[0] == 0
+
+    def test_empty_strings_in_links_skipped(self, db):
+        added = db.upsert_targets_from_links(
+            linked_sites=["", "valid.i2p", ""],
+            source_site="source.i2p",
+        )
+        assert added == 1
+
+    def test_inserted_target_has_empty_hash_and_b32(self, db):
+        db.upsert_targets_from_links(
+            linked_sites=["dns-only.i2p"],
+            source_site="finder.i2p",
+        )
+        cur = db._conn.cursor()
+        cur.execute(
+            "SELECT ident_hash_hex, b32_addr FROM targets WHERE i2p_dns_name='dns-only.i2p'"
+        )
+        row = cur.fetchone()
+        assert row[0] == ""  # empty hash
+        assert row[1] == ""  # empty b32
+
+    def test_bulk_insert_from_extraction(self, db):
+        """Full pipeline: extract then upsert."""
+        html = (
+            '<a href="http://alpha.i2p/">A</a> '
+            '<a href="http://beta.i2p/">B</a> '
+            'Also check gamma.i2p for resources.'
+        )
+        links = _extract_i2p_links(html)
+        assert len(links) == 3
+        added = db.upsert_targets_from_links(
+            linked_sites=links,
+            source_site="referral.i2p",
+        )
+        assert added == 3

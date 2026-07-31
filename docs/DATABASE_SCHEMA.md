@@ -6,7 +6,7 @@ The indexer uses a single SQLite file (`indexer.db`) with WAL journal mode. Four
 
 Stores the result of each probe attempt. One row per fetch — retries over time accumulate rows for the same destination.
 
-| Column | Type | Nullable | Default | Description |
+|| Column | Type | Nullable | Default | Description |
 |---|---|---|---|---|
 | `id` | INTEGER | No (PK) | autoincrement | Surrogate key |
 | `ident_hash_hex` | TEXT | No | — | 40-char SHA-1 identity hash (join key to `routers` / `leasesets`) |
@@ -21,6 +21,9 @@ Stores the result of each probe attempt. One row per fetch — retries over time
 | `via_method` | TEXT | Yes | `''` | Path that succeeded: `'b32'`, `'dns'`, or `'b32+dns'` |
 | `content_type` | TEXT | Yes | `''` | Content bucket label (e.g., `"forum"`, `"news site"`) |
 | `content_summary` | TEXT | Yes | `''` | Sentence-length description of page content |
+| `content_hash` | TEXT | Yes | `''` | SHA-256 hash of response body for change detection |
+| `last_modified` | TEXT | Yes | `''` | HTTP `Last-Modified` header value (if present) |
+| `found_links` | TEXT | Yes | `'[]'` | JSON array of `.i2p` hostnames found in page content |
 | `error_msg` | TEXT | Yes | `''` | Error description on failure |
 | `probed_at` | REAL | Yes | `strftime('%s','now')` | Unix timestamp of probe |
 
@@ -178,23 +181,23 @@ The view uses a two-tier dedup strategy:
 
 This means a site probed via both `test.i2p` and its raw b32 address appears as two rows — they represent distinct entry points that humans might use differently. Two probes for the same DNS name collapse into one (the latest).
 
-### Columns (15 total) — **`dns_name` front-loaded for readability**
+### Columns (15 total) — **human-readable fields first, technical fields at end**
 
 | Column | Source | Description |
 |---|---|---|
-| `dns_name` | computed (`CASE`) | Human-readable identity label (DNS or b32 fallback) |
-| `ident_hash_hex` | discoveries → routers/leasesets join | SHA-1 destination hash |
-| `b32_addr` | discoveries | Base32 address |
+| `dns_name` | computed (`CASE`) | Human-readable identity label |
+| `content_type` | computations | Computed content classification |
 | `reachable` | discoveries (latest probe) | 1 = UP, 0 = DOWN |
 | `last_probed_utc` | computed (`datetime()`) | Human-readable UTC timestamp of latest probe |
+| `content_summary` | computations | Natural-language summary of site content |
+| `ident_hash_hex` | discoveries → routers/leasesets join | SHA-1 destination hash |
+| `b32_addr` | discoveries | Base32 address |
 | `status_code` | discoveries (latest probe) | HTTP status code or 0 |
 | `body_length` | discoveries (latest probe) | Response body size in bytes |
 | `title` | discoveries (latest probe) | Extracted page title |
 | `response_time_sec` | discoveries (latest probe) | Round-trip time in seconds |
 | `via_method` | discoveries (latest probe) | How we reached it (`b32`, `dns`) |
-| `content_type` | discoveries (latest probe) | Auto-classified bucket label |
-| `content_summary` | discoveries (latest probe) | Sentence-length content description |
-| `last_probed_at` | discoveries (latest probe) | Unix timestamp of latest probe |
+| `last_probed_at` | discoveries (latest probe) | Unix epoch seconds of latest probe |
 | `bandwidth_kbps` | routers (LEFT JOIN) | Advertised bandwidth capacity |
 | `router_caps` | routers (LEFT JOIN) | Capability string (e.g., `"fR4"`) |
 | `num_leases` | leasesets (LEFT JOIN) | Number of active leases |

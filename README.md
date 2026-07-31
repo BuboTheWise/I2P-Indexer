@@ -89,16 +89,35 @@ Each row is the most recent probe for that identity (DNS name preferred, b32 add
 
 ### Custom target list
 
+Targets live in the **`targets` table**, not in Python code. Seed them programmatically or via CLI:
+
 ```python
-from src.integration import discover_addresses
+from src.integration import discover_addresses, DiscoveryDB
 
-targets = [
-    ("A3B2C1D0E5F4...", "my-secure-forum.i2p"),      # (hash, dns) tuple → b32-first
-    ("other-site.i2p",),                               # DNS-only fallback
-]
+db = DiscoveryDB("indexer.db")
+db.upsert_targets([
+    ("A3B2C1D0E5F4...", "my-secure-forum.i2p"),      # (hash, dns) tuple -> b32-first
+    ("", "other-site.i2p"),                             # DNS-only fallback
+])
 
-results = discover_addresses(known_addrs=targets)
+# discover_addresses reads from the targets table when no args given
+results = discover_addresses()  # probes all entries in targets table
 ```
+
+### Sweep mode (--sweep N)
+
+Probe targets repeatedly until `N` online sites are found. Minimal output, one line per new site:
+
+```bash
+# Find 10 reachable sites
+python -m src.integration --sweep 10
+
+# Scan with default (5 target hits)
+python -m src.integration --sweep 5
+```
+
+Output:
+
 
 ## Content analysis
 

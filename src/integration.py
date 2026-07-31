@@ -484,16 +484,19 @@ def discover_addresses(
                 targets.append((de.ident_hash_hex, dns))
 
     else:
-        # Well-known sites for PoC — provide both hash and DNS where possible
+        # Well-known sites for PoC — provide hash+DNS where possible
         import base64 as _b64
 
         well_known: list[tuple[str, str]] = []
 
-        # These are .i2p DNS names we can probe; hash will be discovered on first contact
+        # I2P Projekt homepage (DNS-only)
         well_known.append(("", "i2p-projekt.i2p"))
-        well_known.append(("", "musah.i2p"))
-        well_known.append(("", "freeforum.i2p"))
-        well_known.append(("", "swoogle.i2p"))
+
+        # I2P SU3 Directory - hash + DNS
+        well_known.append(("F95763B51C40A9EF8E2C5CE3D19D43EC8E5F10E9", "su3-directory.i2p"))
+
+        # I2P mail.de (DNS-only)
+        well_known.append(("", "mail.i2pmail.org"))
 
         targets = well_known
 

@@ -598,6 +598,7 @@ def discover_addresses(
     config: I2PConfig | None = None,
     db_path: str = DEFAULT_DB_PATH,
     db_instance: DiscoveryDB | None = None,
+    probe_delay: float = 5.0,
 ) -> list[DiscoveryResult]:
     """Probe destinations and record results in persistent DB.
 
@@ -611,6 +612,8 @@ def discover_addresses(
         config: I2P configuration override.
         db_path: Path to SQLite DB (used when db_instance not provided).
         db_instance: Optional pre-created DiscoveryDB (for testing).
+        probe_delay: Seconds to wait between targets (default 5s). I2P is slow;
+            this prevents hammering the network with rapid-fire requests.
 
     Returns:
         List of DiscoveryResult objects sorted by reachability then speed.
@@ -657,11 +660,14 @@ def discover_addresses(
         db.upsert_targets(initial)
         targets = db.get_targets()
 
-    # ── Probe each target ─────────────────────────────────────────────
+    # ── Probe each target (one at a time — I2P is slow) ───────────────
     results: list[DiscoveryResult] = []
 
-    for hash_hex, dns_name in targets:
-        logger.info("--- Probing: hash=%s  dns=%s", hash_hex or "(none)", dns_name or "(none)")
+    for i, (hash_hex, dns_name) in enumerate(targets):
+        if i > 0:
+            logger.info("Waiting %.1fs before next probe...", probe_delay)
+            time.sleep(probe_delay)
+        logger.info("--- Probing [%d/%d]: hash=%s  dns=%s", i + 1, len(targets), hash_hex or "(none)", dns_name or "(none)")
         res = probe_destination(
             ident_hash_hex=hash_hex,
             i2p_dns_name=dns_name,

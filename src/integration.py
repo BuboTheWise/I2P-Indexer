@@ -170,6 +170,17 @@ class DiscoveryDB:
                 probed_at       REAL    DEFAULT (strftime('%s','now'))
             );
 
+            -- Master target list — source of truth for discovery work
+            CREATE TABLE IF NOT EXISTS targets (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                ident_hash_hex   TEXT DEFAULT '',
+                b32_addr         TEXT NOT NULL DEFAULT '',
+                i2p_dns_name     TEXT DEFAULT '',
+                last_probed_at   REAL DEFAULT 0,
+                source           TEXT DEFAULT 'manual',
+                UNIQUE(ident_hash_hex, i2p_dns_name)
+            );
+
             -- Index for fast lookups by hash and DNS name
             CREATE INDEX IF NOT EXISTS idx_disc_hash ON discoveries(ident_hash_hex);
             CREATE INDEX IF NOT EXISTS idx_disc_dns  ON discoveries(i2p_dns_name);
@@ -181,9 +192,9 @@ class DiscoveryDB:
             -- (separate entry points); b32-only probes fall back to the b32 key.
             CREATE VIEW IF NOT EXISTS address_book AS
             SELECT
+                ab.dns_name,
                 ab.ident_hash_hex,
                 ab.b32_addr,
-                ab.dns_name,
                 ab.reachable,
                 ab.status_code,
                 ab.body_length,
@@ -383,9 +394,30 @@ class DiscoveryDB:
         content_summary, last_probed_at, bandwidth_kbps, router_caps, num_leases.
         """
         cur = self._conn.cursor()
-        cur.execute("SELECT * FROM address_book ORDER BY last_probed_at DESC")
+        cur.execute("SELECT * FROM address_book ORDER BY dns_name ASC")
         cols = [desc[0] for desc in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def upsert_targets(self, targets: list[tuple[str, str]]) -> int:
+        """Upsert target destinations. Tuple is (ident_hash_hex, i2p_dns_name)."""
+        cur = self._conn.cursor()
+        n = 0
+        for h, d in targets:
+            b32 = _hex_to_b32_addr(h) if len(h) == 40 else ""
+            cur.execute(
+                "INSERT OR REPLACE INTO targets "
+                "(ident_hash_hex, b32_addr, i2p_dns_name) VALUES (?, ?, ?)",
+                (h, b32, d or ""),
+            )
+            n += 1
+        self._conn.commit()
+        return n
+
+    def get_targets(self) -> list[tuple[str, str]]:
+        """Return the target queue as (hash_hex, dns_name) tuples."""
+        cur = self._conn.cursor()
+        cur.execute("SELECT ident_hash_hex, i2p_dns_name FROM targets")
+        return [(r[0], r[1]) for r in cur.fetchall()]
 
     def close(self) -> None:
         self._conn.close()
@@ -614,21 +646,14 @@ def discover_addresses(
                 targets.append((de.ident_hash_hex, dns))
 
     else:
-        # Well-known sites for PoC — provide hash+DNS where possible
-        import base64 as _b64
-
-        well_known: list[tuple[str, str]] = []
-
-        # I2P Projekt homepage (DNS-only)
-        well_known.append(("", "i2p-projekt.i2p"))
-
-        # I2P SU3 Directory - hash + DNS
-        well_known.append(("F95763B51C40A9EF8E2C5CE3D19D43EC8E5F10E9", "su3-directory.i2p"))
-
-        # I2P mail.de (DNS-only)
-        well_known.append(("", "mail.i2pmail.org"))
-
-        targets = well_known
+        # Seed DB with defaults, then query the target list
+        initial: list[tuple[str, str]] = [
+            ("", "i2p-projekt.i2p"),
+            ("F95763B51C40A9EF8E2C5CE3D19D43EC8E5F10E9", "su3-directory.i2p"),
+            ("", "mail.i2pmail.org"),
+        ]
+        db.upsert_targets(initial)
+        targets = db.get_targets()
 
     # ── Probe each target ─────────────────────────────────────────────
     results: list[DiscoveryResult] = []

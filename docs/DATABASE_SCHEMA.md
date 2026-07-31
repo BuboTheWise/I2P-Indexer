@@ -6,7 +6,7 @@ The indexer uses a single SQLite file (`indexer.db`) with WAL journal mode. Four
 
 Stores the result of each probe attempt. One row per fetch — retries over time accumulate rows for the same destination.
 
-|| Column | Type | Nullable | Default | Description |
+| Column | Type | Nullable | Default | Description |
 |---|---|---|---|---|
 | `id` | INTEGER | No (PK) | autoincrement | Surrogate key |
 | `ident_hash_hex` | TEXT | No | — | 40-char SHA-1 identity hash (join key to `routers` / `leasesets`) |
@@ -181,7 +181,7 @@ The view uses a two-tier dedup strategy:
 
 This means a site probed via both `test.i2p` and its raw b32 address appears as two rows — they represent distinct entry points that humans might use differently. Two probes for the same DNS name collapse into one (the latest).
 
-### Columns (15 total) — **human-readable fields first, technical fields at end**
+### Columns (18 total) — **human-readable fields first, technical fields at end**
 
 | Column | Source | Description |
 |---|---|---|
@@ -198,6 +198,9 @@ This means a site probed via both `test.i2p` and its raw b32 address appears as 
 | `response_time_sec` | discoveries (latest probe) | Round-trip time in seconds |
 | `via_method` | discoveries (latest probe) | How we reached it (`b32`, `dns`) |
 | `last_probed_at` | discoveries (latest probe) | Unix epoch seconds of latest probe |
+| `content_hash` | discoveries (latest probe) | SHA-256 hash of response body for change detection |
+| `last_modified` | discoveries (latest probe) | HTTP Last-Modified header value |
+| `found_links` | discoveries (latest probe) | JSON array of `.i2p` hostnames extracted from page |
 | `bandwidth_kbps` | routers (LEFT JOIN) | Advertised bandwidth capacity |
 | `router_caps` | routers (LEFT JOIN) | Capability string (e.g., `"fR4"`) |
 | `num_leases` | leasesets (LEFT JOIN) | Number of active leases |

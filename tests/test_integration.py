@@ -417,6 +417,9 @@ class TestAddressBookView:
             title="Test Page",
             content_type="blog",
             content_summary="Blog — «Test Page»",
+            content_hash="abc123def456",
+            last_modified="Wed, 01 Jan 2025 00:00:00 GMT",
+            found_links=["linked.i2p"],
         )
         rows = db.address_book()
         assert len(rows) == 1
@@ -426,6 +429,15 @@ class TestAddressBookView:
         assert r["content_type"] == "blog"
         assert r["title"] == "Test Page"
         assert r["dns_name"] == "test.i2p"
+        # Verify new metadata columns are present in the view
+        assert "content_hash" in r
+        assert "last_modified" in r
+        assert "found_links" in r
+        assert r["content_hash"] == "abc123def456"
+        assert r["last_modified"] == "Wed, 01 Jan 2025 00:00:00 GMT"
+        # found_links is stored as JSON string
+        import json
+        assert json.loads(r["found_links"]) == ["linked.i2p"]
         db.close()
 
     def test_view_collapses_to_latest(self, tmp_db):
@@ -522,11 +534,15 @@ class TestAddressBookView:
             {"reachable": True, "via_method": "b32", "status_code": 200,
              "body_length": 1200, "response_time_sec": 3.5,
              "content_type": "forum", "title": "My Forum", "dns_name": "forum.i2p",
-             "b32_addr": "", "bandwidth_kbps": 0},
+             "b32_addr": "", "bandwidth_kbps": 0,
+             "content_hash": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+             "last_modified": "Thu, 30 Jul 2026 14:30:00 GMT",
+             "found_links": '["other.i2p", "more.i2p", "third.i2p"]'},
             {"reachable": False, "via_method": "dns", "status_code": 0,
              "body_length": 0, "response_time_sec": 1.0,
              "content_type": "", "title": "", "dns_name": "dead.i2p",
-             "b32_addr": "", "bandwidth_kbps": None},
+             "b32_addr": "", "bandwidth_kbps": None,
+             "content_hash": "", "last_modified": "", "found_links": '[]'},
         ]
         print_address_book(entries)
         captured = capsys.readouterr()
@@ -534,6 +550,10 @@ class TestAddressBookView:
         assert "OK" in captured.out
         assert "DOWN" in captured.out
         assert "@forum" in captured.out
+        # Verify new columns appear
+        assert "#abcdef123456" in captured.out       # abbreviated content_hash
+        assert "modified:2026-07-30 14:30" in captured.out  # formatted last_modified
+        assert "3 linked sites" in captured.out            # found_links count
 
     def test_print_address_book_empty(self, capsys):
         print_address_book([])
@@ -652,7 +672,7 @@ class TestLinkExtraction:
 
 
     def test_extract_partial_multilevel_domain(self):
-        """Verify that multi-level .i2p domains only match the last label.
+        r"""Verify that multi-level .i2p domains only match the last label.
 
         This documents actual regex behavior — [a-z0-9\-]+\.i2p captures
         just one label before .i2p, so 'alpha.beta.gamma.i2p' yields 'gamma.i2p'.

@@ -186,6 +186,7 @@ This means a site probed via both `test.i2p` and its raw b32 address appears as 
 | `ident_hash_hex` | discoveries → routers/leasesets join | SHA-1 destination hash |
 | `b32_addr` | discoveries | Base32 address |
 | `reachable` | discoveries (latest probe) | 1 = UP, 0 = DOWN |
+| `last_probed_utc` | computed (`datetime()`) | Human-readable UTC timestamp of latest probe |
 | `status_code` | discoveries (latest probe) | HTTP status code or 0 |
 | `body_length` | discoveries (latest probe) | Response body size in bytes |
 | `title` | discoveries (latest probe) | Extracted page title |

@@ -3,3 +3,8 @@ __pycache__/
 *.so
 .venv/
 .DS_Store
+
+# Runtime database — recreated on demand
+indexer.db
+indexer.db-shm
+indexer.db-wal

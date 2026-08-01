@@ -540,7 +540,7 @@ class I2PSAMClient:
 # Unified fetch helper
 # ---------------------------------------------------------------------------
 
-def fetch_i2p(url: str, via: str = "socks") -> Response:
+def fetch_i2p(url: str, via: str = "socks", timeout: float | None = None) -> Response:
     """Fetch an eepsite URL through the I2P proxy.
 
     Parameters
@@ -548,10 +548,12 @@ def fetch_i2p(url: str, via: str = "socks") -> Response:
     url: full .i2p URL (``http://something.i2p/``).
     via: backend to use — ``"socks"``, ``"http-proxy"``, or ``"sam"``.
          Defaults to ``"socks"`` which automatically falls back to HTTP proxy.
+    timeout: optional per-call timeout in seconds. If None, uses the client
+             default (120s). Useful for overriding on a per-target basis.
 
     Returns a ``Response`` object (always non-exception-raising).
     """
-    client = I2PProxyClient()
+    client = I2PProxyClient(timeout=timeout) if timeout is not None else I2PProxyClient()
 
     if via == "socks":
         logger.info("Trying SOCKS5 for %s", url)
@@ -564,7 +566,7 @@ def fetch_i2p(url: str, via: str = "socks") -> Response:
 
     elif via == "sam":
         logger.info("Trying SAM for %s", url)
-        sam = I2PSAMClient()
+        sam = I2PSAMClient(timeout=timeout) if timeout is not None else I2PSAMClient()
         return sam.fetch(url)
 
     else:  # http-proxy

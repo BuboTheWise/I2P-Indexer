@@ -16,7 +16,10 @@ import logging
 import os
 import re
 import sqlite3
+import sys as _sys
+import threading
 import time
+import traceback
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -30,7 +33,14 @@ from src.config import I2PConfig
 from src.i2p_proxy import ProxyBackend, fetch_i2p
 from src.models import DestinationEntry
 
+# Per-target probe timeout (seconds). Override via PROBE_TIMEOUT env var
+# or --probe-timeout CLI flag. Default 120s matches I2PProxyClient default.
+PROBE_TIMEOUT: float = float(os.environ.get("PROBE_TIMEOUT", "120"))
+
 logger = logging.getLogger(__name__)
+
+# Thread-safe access to DB convenience helpers (fix #1)
+_db_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -123,13 +133,13 @@ def parse_susi_export(path: str | Path) -> list[dict]:
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _I2P_LINK_RE = re.compile(
-    r"[a-z0-9\-]+\.i2p(?:\b|[/\"'\s])",
+    r"([a-z0-9](?:[a-z0-9\-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?)*\.i2p)",
     re.IGNORECASE,
 )
 
 
 def _extract_i2p_links(body_text: str) -> list[str]:
-    """Return unique .i2p hostnames found in page body text."""
+    """Return unique .i2p hosts from body text, including multi-level domains."""
     return list({h.strip().lower() for h in _I2P_LINK_RE.findall(body_text[:32768])})
 
 
@@ -161,10 +171,28 @@ def _classify_content(
     ]
 
     content_type = ""
+    spa_framework = None
+    
     for bucket, keywords in type_keywords:
         if any(kw in lower_title or kw in lower_body for kw in keywords):
             content_type = bucket
             break
+
+    # ── SPA / framework detection (catches JS-rendered pages without text) ─
+    if not content_type:
+        import re as _re_spa
+        
+        framework_sigs: dict[str, list[str]] = {
+            "React": [r'react[-_]?app', r'__react_events__', r'data-reactroot', r'react-dom'],
+            "Angular": [r'ng-app', r'ng-version', r'angular\.js', r'ng-reflect-'],
+            "Vue.js": [r'vue\.js', r'data-v-', r'vendor\.(vite|webpack)'],
+            "SvelteKit": [r'__sveltekit__', r'-core-client-js'],
+        }
+        
+        for fw, pats in framework_sigs.items():
+            if any(_re_spa.search(p, lower_body[:16384]) for p in pats):
+                spa_framework = fw
+                break
 
     # ── Plain text for analysis ───────────────────────────────────────
     plain = _TAG_RE.sub(" ", body_text[:16384])
@@ -274,7 +302,29 @@ def _classify_content(
         parts.append(vendor_count)
     if thread_info:
         parts.append(thread_info)
-    
+
+    # ── Technology stack signatures ────────────────────────────────────
+    import re as _re_tech
+    tech_signatures = {
+        "Node.js": ["npm", "node_modules", "express"],
+        "Ruby on Rails": ["csrf-token", "media_types/"],
+        "PHP": ["<?php"],
+        "Python/Django": ["django-", "csrftoken"],
+        "Go": ["go_session", "gorouter"],
+    }
+
+    tech_stack = []
+    for tech_name, pats in tech_signatures.items():
+        for pat in pats:
+            if _re_tech.search(pat, lower_body):
+                tech_stack.append(tech_name)
+                break
+
+    if tech_stack:
+        parts.append(f"Tech: {', '.join(tech_stack)}")
+    if spa_framework:
+        parts.append(f"Framework: {spa_framework}")
+
     summary = ", ".join(parts).strip() if parts else f"Unidentified — «{title}»"
     return content_type, summary, linked_sites
 
@@ -309,20 +359,20 @@ def _extract_flags(
     lower_body = body_text.lower()[:32768]  # first 32 KB for heuristics
 
     # ── 1. robots_disallow_all ────────────────────────────────────────
-    if 'user-agent' in lower_body and 'disallow: /' in lower_body:
-        flags.append('robots_disallow_all')
+    if "user-agent" in lower_body and "disallow: /" in lower_body:
+        flags.append("robots_disallow_all")
 
     # ── 2. tech_stack_detected ────────────────────────────────────────
     detected_techs: list[str] = []
 
     # Server header
-    for hdr_key in ('Server', 'server'):
-        srv = resp_headers.get(hdr_key, '')
+    for hdr_key in ("Server", "server"):
+        srv = resp_headers.get(hdr_key, "")
         if srv:
             detected_techs.append(srv)
 
     # X-Powered-By header
-    xp = resp_headers.get('X-Powered-By', '') or resp_headers.get('x-powered-by', '')
+    xp = resp_headers.get("X-Powered-By", "") or resp_headers.get("x-powered-by", "")
     if xp:
         detected_techs.append(xp)
 
@@ -334,12 +384,12 @@ def _extract_flags(
 
     # Common CMS fingerprints in HTML source (case-insensitive)
     cms_signatures = {
-        'wordpress': [r'wp-content/', r'wp-includes/', r'wordpress'],
-        'joomla': [r'joomla', r'/components/com_', r'media/'],
-        'drupal': [r'drupal', r'/sites/default/files', r'core/misc/drupal'],
-        'mediawiki': [r'mediawiki', r'/w/load.php', r'/index\.php.*action='],
-        'ghost': [r'ghost-', r'/ghost/'],
-        'concrete5': [r'concrete/', r'cms_theme/'],
+        "wordpress": [r'wp-content/', r'wp-includes/', r'wordpress'],
+        "joomla": [r'joomla', r'/components/com_', r'media/'],
+        "drupal": [r'drupal', r'/sites/default/files', r'core/misc/drupal'],
+        "mediawiki": [r'mediawiki', r'/w/load.php', r'/index\.php.*action='],
+        "ghost": [r'ghost-', r'/ghost/'],
+        "concrete5": [r'concrete/', r'cms_theme/'],
     }
     for cms, patterns in cms_signatures.items():
         for pat in patterns:
@@ -362,10 +412,10 @@ def _extract_flags(
 
     # Social media links
     social_patterns = {
-        'twitter': r'(?:twitter\.com|x\.com)/\w+',
-        'mastodon': r'mastodon\.|\.\w+/@\w+',
-        'github': r'github\.com/\w+',
-        'telegram': r'telegram\.(?:me|org)/\w+',
+        "twitter": r'(?:twitter\.com|x\.com)/\w+',
+        "mastodon": r'mastodon\.|\.\w+/@\w+',
+        "github": r'github\.com/\w+',
+        "telegram": r'telegram\.(?:me|org)/\w+',
     }
     found_social: list[str] = []
     for platform, pat in social_patterns.items():
@@ -377,12 +427,12 @@ def _extract_flags(
 
     # ── 4. forum_site ────────────────────────────────────────────────
     forum_signatures = {
-        'phpBB': [r'phpbb', r'/styles/.*/theme/', r'forum\.php'],
-        'XenForo': [r'xenforo', r'/xf\.', r'js/xenforo\.min\.js'],
-        'Discourse': [r'discourse', r'data-controller=', r'discourse-helpers.js'],
-        'vBulletin': [r'vbulletin', r'/clientscript/vb\.', r'/forum\.php'],
-        'Flarum': [r'flarum', r'/extensions/', r'flarum-header'],
-        'IPS (Invision)': [r'invision', r'/uploads/', r'ipsTemplate'],
+        "phpBB": [r'phpbb', r'/styles/.*/theme/', r'forum\.php'],
+        "XenForo": [r'xenforo', r'/xf\.', r'js/xenforo\.min\.js'],
+        "Discourse": [r'discourse', r'data-controller=', r'discourse-helpers.js'],
+        "vBulletin": [r'vbulletin', r'/clientscript/vb\.', r'/forum\.php'],
+        "Flarum": [r'flarum', r'/extensions/', r'flarum-header'],
+        "IPS (Invision)": [r'invision', r'/uploads/', r'ipsTemplate'],
     }
     for forum_software, patterns in forum_signatures.items():
         for pat in patterns:
@@ -1049,11 +1099,13 @@ def probe_destination(
     ident_hash_hex: str,
     i2p_dns_name: str = "",
     db: DiscoveryDB | None = None,
+    timeout: float = PROBE_TIMEOUT,
 ) -> DiscoveryResult:
     """Probe a single destination by BOTH its b32 key address and .i2p DNS name.
 
     Returns the best result (most data from fastest successful probe).
     If a DB is provided, records both attempts.
+    ``timeout`` is the per-target deadline in seconds.
     """
     b32_addr = _hex_to_b32_addr(ident_hash_hex) if len(ident_hash_hex) == 40 else ""
     results: list[DiscoveryResult] = []
@@ -1066,6 +1118,7 @@ def probe_destination(
             ident_hash_hex=ident_hash_hex,
             i2p_dns_name=i2p_dns_name,
             probe_mode="b32",
+            timeout=timeout,
         )
         results.append(res_b32)
         if db:
@@ -1101,6 +1154,7 @@ def probe_destination(
                 ident_hash_hex=ident_hash_hex,
                 i2p_dns_name=i2p_dns_name,
                 probe_mode="dns",
+                timeout=timeout,
             )
             results.append(res_dns)
             if db:
@@ -1174,13 +1228,30 @@ def _do_probe(
     ident_hash_hex: str,
     i2p_dns_name: str = "",
     probe_mode: str = "b32",
+    timeout: float = PROBE_TIMEOUT,
 ) -> DiscoveryResult:
-    """Single HTTP fetch through proxy. Returns reachable=0 on any failure."""
+    """Single HTTP fetch through proxy. Returns reachable=0 on any failure.
+    
+    ``timeout`` is the per-target deadline in seconds (default 120).
+    The underlying I2PProxyClient uses this as a socket timeout.
+    """
     start = time.monotonic()
     try:
-        resp = fetch_i2p(url, via="http-proxy")
+        resp = fetch_i2p(url, via="http-proxy", timeout=timeout)
         elapsed = round(time.monotonic() - start, 2)
         body_text = resp.text if hasattr(resp, "text") else resp.body.decode("utf-8", errors="replace")
+
+        # Memory protection: truncate very large responses before analysis.
+        # Most meaningful content lives in the first 100–256 KB; beyond that
+        # we only keep a length hint so huge pages (e.g. file dumps, API logs)
+        # don't explode memory during classification + flag extraction.
+        if len(body_text) > 256 * 1024:
+            logger.debug(
+                "  [memory] %s – large response (%d KB), truncating to 256 KB for analysis",
+                ident_hash_hex,
+                len(body_text) // 1024,
+            )
+            body_text = body_text[:256 * 1024]
 
         # Extract title and classify content
         title_text = ""
@@ -1240,12 +1311,15 @@ def _do_probe(
 
     except Exception as exc:
         elapsed = round(time.monotonic() - start, 2)
-        logger.warning("  [%s] %s  FAILED %.1fs: %s", probe_mode, url, elapsed, exc)
+        tb = traceback.format_exc()
+        logger.warning(
+            "  [%s] %s  FAILED %.1fs:\n%s", probe_mode, url, elapsed, tb
+        )
         return DiscoveryResult(
             b32_addr=url.split("/")  [2] if "/" in url else "",
             ident_hash_hex=ident_hash_hex,
             reachable=False,
-            error=f"{exc}",
+            error=f"{exc}\n{tb}",
             response_time_sec=elapsed,
             via_method=probe_mode,
             probe_mode=probe_mode,
@@ -1297,6 +1371,7 @@ def discover_addresses(
     db_path: str = DEFAULT_DB_PATH,
     db_instance: DiscoveryDB | None = None,
     probe_delay: float = 5.0,
+    timeout: float = PROBE_TIMEOUT,
     limit: int | None = None,
 ) -> list[DiscoveryResult]:
     """Probe destinations and record results in persistent DB.
@@ -1313,6 +1388,7 @@ def discover_addresses(
         db_instance: Optional pre-created DiscoveryDB (for testing).
         probe_delay: Seconds to wait between targets (default 5s). I2P is slow;
             this prevents hammering the network with rapid-fire requests.
+        timeout: Per-target probe deadline in seconds (default 120s from PROBE_TIMEOUT).
 
     Returns:
         List of DiscoveryResult objects sorted by reachability then speed.
@@ -1375,6 +1451,7 @@ def discover_addresses(
             ident_hash_hex=hash_hex,
             i2p_dns_name=dns_name,
             db=db,
+            timeout=timeout,
         )
         results.append(res)
 
@@ -1390,10 +1467,27 @@ def discover_addresses(
 # Reporting / CLI
 # ---------------------------------------------------------------------------
 
-def print_report(results: list[DiscoveryResult]) -> None:
-    """Pretty-print discovery results to stdout."""
+def print_report(results: list[DiscoveryResult], json_out: bool = False):
+    """Pretty-print or return structured discovery results.
+
+    When ``json_out=False`` (default), prints to stdout for terminal consumption.
+    When ``json_out=True``, returns a dict with status counts, per-result details,
+    and hash metadata — suitable for CSV export or programmatic pipelines.
+    """
     reachable = [r for r in results if r.reachable]
     dead = [r for r in results if not r.reachable]
+
+    # Structured output path
+    if json_out:
+        from dataclasses import asdict
+        return {
+            "total": len(results),
+            "by_status": {k: sum(1 for r in results if getattr(r, k))
+                         for k in ("reachable",)},
+            "reachable_count": len(reachable),
+            "dead_count": len(dead),
+            "results": [asdict(r) for r in results],
+        }
 
     print(f"\n{'='*70}")
     print(f"  I2P DISCOVERY RESULTS")
@@ -1434,18 +1528,19 @@ def print_report(results: list[DiscoveryResult]) -> None:
 
 def query_db(hash_hex: str = "", dns_name: str = "", db_path: str = DEFAULT_DB_PATH) -> list[dict]:
     """Query the persistent discovery DB. Accepts hash or DNS name."""
-    db = DiscoveryDB(db_path)
-    results = []
-    if hash_hex:
-        results = db.get_latest_probes_by_hash(hash_hex.upper())
-    elif dns_name:
-        results = db.get_latest_probes_by_dns_name(dns_name)
-    else:
-        # Return summary
-        s = db.summary()
-        print(f"\nDB Summary: {s}\n")
-        print("Usage: query_db(hash_hex='...') or query_db(dns_name='...')\n")
-    db.close()
+    with _db_lock:
+        db = DiscoveryDB(db_path)
+        results = []
+        if hash_hex:
+            results = db.get_latest_probes_by_hash(hash_hex.upper())
+        elif dns_name:
+            results = db.get_latest_probes_by_dns_name(dns_name)
+        else:
+            # Return summary
+            s = db.summary()
+            print(f"\nDB Summary: {s}\n")
+            print("Usage: query_db(hash_hex='...') or query_db(dns_name='...')\n")
+        db.close()
     return results
 
 
@@ -1458,14 +1553,29 @@ def get_address_book(db_path: str = DEFAULT_DB_PATH) -> list[dict]:
         ident_hash_hex, b32_addr, status_code, body_length, title, response_time_sec,
         via_method, last_probed_at, bandwidth_kbps, router_caps, num_leases
     """
-    db = DiscoveryDB(db_path)
-    rows = db.address_book()
-    db.close()
+    with _db_lock:
+        db = DiscoveryDB(db_path)
+        rows = db.address_book()
+        db.close()
     return rows
 
 
-def print_address_book(entries: list[dict]) -> None:
-    """Pretty-print the address book view to a human-readable table."""
+def print_address_book(entries: list[dict], json_out: bool = False):
+    """Pretty-print or return structured address book data.
+
+    When ``json_out=False`` (default), prints to stdout for terminal consumption.
+    When ``json_out=True``, returns the entries list plus summary counts — suitable
+    for CSV export, programmatic pipelines, or loading in another script.
+    """
+    if json_out:
+        reachable = sum(1 for e in entries if e.get("reachable"))
+        return {
+            "total": len(entries),
+            "reachable_count": reachable,
+            "dead_count": len(entries) - reachable,
+            "entries": entries,
+        }
+
     if not entries:
         print("\n  (address book is empty — run a discovery first)\n")
         return
@@ -1555,18 +1665,32 @@ def print_address_book(entries: list[dict]) -> None:
 def main() -> None:
     """CLI entry point for discovery."""
     import sys
+    import argparse
+    
+    p = argparse.ArgumentParser(description="I2P Indexer — destination discovery")
+    p.add_argument(
+        "--probe-timeout",
+        type=float,
+        default=None,
+        help="Per-target probe timeout in seconds (default: 120)",
+    )
+    p.add_argument("targets", nargs="*", help=".i2p hostnames or SHA-1 hashes to probe")
+    args = p.parse_args()
+
+    if args.probe_timeout is not None:
+        global PROBE_TIMEOUT
+        PROBE_TIMEOUT = args.probe_timeout
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
     cfg = I2PConfig()
 
     targets: list[str | tuple[str, str]] = []
-    if len(sys.argv) > 1:
-        targets = sys.argv[1:]  # type: ignore[assignment]
-    else:
-        # Use well-known defaults
-        pass
+    if args.targets:
+        targets = args.targets
 
-    results = discover_addresses(known_addrs=targets or None, config=cfg)
+    results = discover_addresses(
+        known_addrs=targets or None, config=cfg, timeout=args.probe_timeout or PROBE_TIMEOUT
+    )
     print_report(results)
 
 

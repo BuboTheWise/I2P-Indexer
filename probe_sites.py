@@ -19,5 +19,8 @@ for name, url in SITES:
     except Exception as e:
         results.append({'name': name, 'error': str(e)})
 
-json.dump(results, open('/home/stefan/Projects/I2P Indexer/results/probe.json', 'w'), indent=2)
+import os
+out = os.path.join(os.path.dirname(__file__), 'results', 'probe.json')
+os.makedirs(os.path.dirname(out), exist_ok=True)
+json.dump(results, open(out, 'w'), indent=2)
 print(json.dumps(results, indent=2))

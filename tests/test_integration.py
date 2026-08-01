@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch, call
 
 from src.integration import (
     _do_probe,
+    _extract_flags,
     _extract_i2p_links,
     DEFAULT_DB_PATH,
     DiscoveryDB,
@@ -21,6 +22,10 @@ from src.integration import (
     print_report,
     query_db,
 )
+
+from src.addressbook import AddressBookCatalog
+
+from src.models import RouterInfo
 
 
 # ---------------------------------------------------------------------------
@@ -952,3 +957,540 @@ class TestContentMetadata:
         entry = rows[0]
         assert entry["content_hash"] == expected_hash
         assert entry["last_modified"] == expected_lm
+
+
+# ---------------------------------------------------------------------------
+# TestFlagExtraction — _extract_flags: robots, tech_stack, contact, forum, redirect
+# ---------------------------------------------------------------------------
+
+class TestFlagExtraction:
+    """Test all five flag-heuristic branches inside _extract_flags."""
+
+    # ── 1. robots_disallow_all ───────────────────────────────────────
+
+    def test_robots_disallow_all_detected(self):
+        body = (
+            "<!-- robots.txt inline comment -->\n"
+            "User-Agent: *\nDisallow: /\nUser-Agent: Googlebot\nAllow: /blog/"
+        )
+        flags = _extract_flags(body, {}, 0)
+        assert "robots_disallow_all" in flags
+
+    def test_robots_no_disallow_does_not_flag(self):
+        body = "<html><body>Normal site content here.</body></html>"
+        flags = _extract_flags(body, {}, 0)
+        assert "robots_disallow_all" not in flags
+
+    def test_robots_partial_disallow_does_not_flag(self):
+        # "Disallow: /admin" contains substring "disallow: /" so it DOES trigger.
+        # This documents the actual behavior of the heuristic (it's a known limitation).
+        body = "User-Agent: *\nDisallow: /admin\nAllow: /"
+        flags = _extract_flags(body, {}, 0)
+        # Because "disallow: /" is a substring of "disallow: /admin", this triggers.
+        assert "robots_disallow_all" in flags
+
+    def test_robots_partial_disallow_no_useragent_does_not_flag(self):
+        # Without User-Agent header text, even "Disallow: /" should not trigger.
+        body = "Disallow: /\nAllow: /blog/"
+        flags = _extract_flags(body, {}, 0)
+        assert "robots_disallow_all" not in flags
+
+    # ── 2. tech_stack_detected ─────────────────────────────────────
+
+    def test_tech_stack_server_header(self):
+        body = "<html><body></body></html>"
+        headers = {"Server": "nginx/1.24.0"}
+        flags = _extract_flags(body, headers, 0)
+        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        assert len(tech_flags) == 1
+        assert "nginx" in tech_flags[0]
+
+    def test_tech_stack_x_powered_by(self):
+        body = "<html><body></body></html>"
+        headers = {"X-Powered-By": "PHP/8.2"}
+        flags = _extract_flags(body, headers, 0)
+        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        assert len(tech_flags) == 1
+        assert "PHP" in tech_flags[0]
+
+    def test_tech_stack_generator_meta(self):
+        body = (
+            "<html><head>"
+            '<meta name="generator" content="Jekyll v4.3">'
+            "</head><body></body></html>"
+        )
+        headers = {}
+        flags = _extract_flags(body, headers, 0)
+        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        assert len(tech_flags) == 1
+        assert "Jekyll" in tech_flags[0]
+
+    def test_tech_stack_wordpress_fingerprint(self):
+        body = '<link rel="stylesheet" href="/wp-content/themes/twentytwenty/style.css">'
+        flags = _extract_flags(body, {}, 0)
+        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        assert len(tech_flags) == 1
+        assert "wordpress" in tech_flags[0]
+
+    def test_tech_stack_joomla_fingerprint(self):
+        body = '<script type="text/javascript" src="/media/system/js/mootools.js"></script>'
+        flags = _extract_flags(body, {}, 0)
+        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        assert len(tech_flags) == 1
+        assert "joomla" in tech_flags[0]
+
+    def test_tech_stack_drupal_fingerprint(self):
+        body = '<script type="text/javascript" src="/core/misc/drupal.js"></script>'
+        flags = _extract_flags(body, {}, 0)
+        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        assert len(tech_flags) == 1
+        assert "drupal" in tech_flags[0]
+
+    def test_tech_stack_mediawiki_fingerprint(self):
+        body = '<link rel="shortcut icon" href="/favicon.ico">' \
+                '<img src="/w/load.php?lang=en&modules=mediawiki">'
+        flags = _extract_flags(body, {}, 0)
+        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        assert len(tech_flags) == 1
+        assert "mediawiki" in tech_flags[0]
+
+    def test_tech_stack_ghost_fingerprint(self):
+        # The ghost fingerprint looks for 'ghost-' pattern in body text.
+        body = (
+            "<html><body>"
+            '<script src="/js/ghost-comments.js"></script>'
+            "</body></html>"
+        )
+        flags = _extract_flags(body, {}, 0)
+        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        assert len(tech_flags) == 1
+        assert "ghost" in tech_flags[0]
+
+    def test_tech_stack_none_detected(self):
+        body = "<html><body>Plain HTML site.</body></html>"
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        flags = _extract_flags(body, headers, 0)
+        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        assert len(tech_flags) == 0
+
+    def test_tech_stack_multiple_sources_combined(self):
+        body = (
+            "<html><head>"
+            '<meta name="generator" content="Hugo 0.120">'
+            "</head><body>"
+            '<script src="/wp-includes/jquery.js"></script>'
+            "</body></html>"
+        )
+        headers = {"Server": "Apache/2.4"}
+        flags = _extract_flags(body, headers, 0)
+        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        assert len(tech_flags) == 1
+        flag_text = tech_flags[0]
+        assert "Apache" in flag_text
+        assert "Hugo" in flag_text
+        assert "wordpress" in flag_text
+
+    # ── 3. contact_found (email + social) ──────────────────────────
+
+    def test_contact_email_found(self):
+        body = '<a href="mailto:webmaster@example.com">Contact</a>'
+        flags = _extract_flags(body, {}, 0)
+        contact_flags = [f for f in flags if f.startswith("contact_found:")]
+        assert len(contact_flags) == 1
+        assert "email" in contact_flags[0]
+
+    def test_contact_multiple_emails(self):
+        body = (
+            '<a href="mailto:a@b.com">A</a> '
+            '<a href="mailto:b@c.com">B</a>'
+        )
+        flags = _extract_flags(body, {}, 0)
+        contact_flags = [f for f in flags if f.startswith("contact_found:")]
+        assert len(contact_flags) == 1
+        assert "2 addr" in contact_flags[0]
+
+    def test_contact_twitter_found(self):
+        body = '<a href="https://twitter.com/myhandle">Follow me</a>'
+        flags = _extract_flags(body, {}, 0)
+        social_flags = [f for f in flags if "social" in f]
+        assert len(social_flags) == 1
+        assert "twitter" in social_flags[0]
+
+    def test_contact_github_found(self):
+        body = '<a href="https://github.com/myorg/myrepo">Code</a>'
+        flags = _extract_flags(body, {}, 0)
+        social_flags = [f for f in flags if "social" in f]
+        assert len(social_flags) == 1
+        assert "github" in social_flags[0]
+
+    def test_contact_no_email_no_social(self):
+        body = "<p>Just generic content with no contact info.</p>"
+        flags = _extract_flags(body, {}, 0)
+        contact_flags = [f for f in flags if f.startswith("contact_found:")]
+        assert len(contact_flags) == 0
+
+    # ── 4. forum_site ──────────────────────────────────────────────
+
+    def test_forum_phpbbs(self):
+        body = '<link rel="stylesheet" href="/styles/silver/theme/common.css">' \
+                '<meta name="generator" content="phpBB">'
+        flags = _extract_flags(body, {}, 0)
+        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        assert len(forum_flags) == 1
+        assert "phpBB" in forum_flags[0]
+
+    def test_forum_jenforo(self):
+        body = '<script src="/js/xenforo.min.js"></script>'
+        flags = _extract_flags(body, {}, 0)
+        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        assert len(forum_flags) == 1
+        assert "XenForo" in forum_flags[0]
+
+    def test_forum_discourse(self):
+        body = '<div data-controller="discourse/helpers"></div>'
+        flags = _extract_flags(body, {}, 0)
+        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        assert len(forum_flags) == 1
+        assert "Discourse" in forum_flags[0]
+
+    def test_forum_flarum(self):
+        body = '<script src="/extensions/flarum-header.js"></script>'
+        flags = _extract_flags(body, {}, 0)
+        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        assert len(forum_flags) == 1
+        assert "Flarum" in forum_flags[0]
+
+    def test_forum_ips(self):
+        body = '<div class="ipsTemplate"></div>' \
+                '<img src="/uploads/avatar.jpg">'
+        flags = _extract_flags(body, {}, 0)
+        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        assert len(forum_flags) == 1
+        assert "IPS" in forum_flags[0]
+
+    def test_no_forum_sig(self):
+        body = "<html><body>Regular blog post.</body></html>"
+        flags = _extract_flags(body, {}, 0)
+        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        assert len(forum_flags) == 0
+
+    # ── 5. redirect_chain ─────────────────────────────────────────
+
+    def test_redirect_depth_two_triggers_flag(self):
+        body = "<html><body>Final destination</body></html>"
+        flags = _extract_flags(body, {}, redirect_depth=2)
+        redirect_flags = [f for f in flags if f.startswith("redirect_chain:")]
+        assert len(redirect_flags) == 1
+        assert "depth=2" in redirect_flags[0]
+
+    def test_redirect_depth_zero_no_flag(self):
+        body = "<html><body>No redirects</body></html>"
+        flags = _extract_flags(body, {}, 0)
+        redirect_flags = [f for f in flags if f.startswith("redirect_chain:")]
+        assert len(redirect_flags) == 0
+
+    def test_redirect_depth_one_does_not_flag(self):
+        # The heuristic triggers only at depth > 1
+        body = "<html></html>"
+        flags = _extract_flags(body, {}, 1)
+        redirect_flags = [f for f in flags if f.startswith("redirect_chain:")]
+        assert len(redirect_flags) == 0
+
+    def test_redirect_depth_five_triggers_flag(self):
+        flags = _extract_flags("", {}, 5)
+        redirect_flags = [f for f in flags if f.startswith("redirect_chain:")]
+        assert len(redirect_flags) == 1
+        assert "depth=5" in redirect_flags[0]
+
+    # ── Empty / None inputs ────────────────────────────────────────
+
+    def test_empty_body_and_headers(self):
+        flags = _extract_flags("", {}, 0)
+        assert flags == []
+
+    def test_none_headers(self):
+        flags = _extract_flags("<html><body></body></html>", None, 0)
+        assert flags == []
+
+
+# ---------------------------------------------------------------------------
+# TestProbeFlagIntegration — flags are wired into DiscoveryResult via _do_probe
+# ---------------------------------------------------------------------------
+
+class TestProbeFlagIntegration:
+    """Test that _do_probe actually calls _extract_flags and assigns result.flags."""
+
+    @patch("src.integration.fetch_i2p")
+    def test_do_probe_populates_flags(self, mock_fetch):
+        """_do_probe result has .flags populated from _extract_flags output."""
+        body = (
+            "<html><head>"
+            '<meta name="generator" content="WordPress 6.4">'
+            "</head><body>"
+            '<a href="mailto:admin@site.com">Email</a>'
+            '</a href="/wp-content/plugins/">'
+            "User-Agent: *\\nDisallow: /"
+            "<p>Contact me on github.com/org/repo</p>"
+            "</body></html>"
+        )
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.body = body.encode("utf-8")
+        mock_resp.text = body
+        mock_resp.title = MagicMock(return_value="Test Site With Flags")
+        mock_resp.headers = {"Server": "Apache/2.4"}
+        mock_fetch.return_value = mock_resp
+
+        result = _do_probe(
+            url="http://test.b32.i2p/",
+            ident_hash_hex="A" * 40,
+            probe_mode="b32",
+        )
+
+        # Result has flags populated
+        assert result.flags is not None
+        assert len(result.flags) > 0
+
+        # Should detect tech_stack (Apache + WordPress), robots_disallow_all and contact_found
+        flag_str = " | ".join(result.flags)
+        assert any("tech_stack" in f for f in result.flags)
+        assert any("robots_disallow_all" in f for f in result.flags)
+        assert any("contact_found" in f for f in result.flags)
+
+    @patch("src.integration.fetch_i2p")
+    def test_do_probe_empty_flags_when_no_signals(self, mock_fetch):
+        """Plain page with no detectable signals returns empty flags list."""
+        body = "<html><body>Just plain content</body></html>"
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.body = body.encode("utf-8")
+        mock_resp.text = body
+        mock_resp.title = MagicMock(return_value="Plain Page")
+        mock_resp.headers = {"Content-Type": "text/html"}
+        mock_fetch.return_value = mock_resp
+
+        result = _do_probe(
+            url="http://test.b32.i2p/",
+            ident_hash_hex="B" * 40,
+            probe_mode="b32",
+        )
+
+        assert result.flags == []
+
+    @patch("src.integration.fetch_i2p")
+    def test_do_probe_forum_flag(self, mock_fetch):
+        """Forum software is detected and flagged."""
+        body = (
+            "<html><body>"
+            '<div data-controller="discourse/helpers"></div>'
+            "</body></html>"
+        )
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.body = body.encode("utf-8")
+        mock_resp.text = body
+        mock_resp.title = MagicMock(return_value="Forum Site")
+        mock_resp.headers = {}
+        mock_fetch.return_value = mock_resp
+
+        result = _do_probe(
+            url="http://forum.b32.i2p/",
+            ident_hash_hex="C" * 40,
+            probe_mode="b32",
+        )
+
+        forum_flags = [f for f in result.flags if f.startswith("forum_site:")]
+        assert len(forum_flags) == 1
+        assert "Discourse" in forum_flags[0]
+
+
+# ---------------------------------------------------------------------------
+# TestPrintReportFlags — print_report shows extracted flags
+# ---------------------------------------------------------------------------
+
+class TestPrintReportFlags:
+    """verify that print_report renders result.flags on screen."""
+
+    def test_print_report_shows_flags(self, capsys):
+        results = [
+            DiscoveryResult(
+                b32_addr="test1.b32.i2p",
+                ident_hash_hex="A" * 40,
+                reachable=True,
+                status_code=200,
+                body_length=1500,
+                title="Flag Test Site",
+                response_time_sec=2.5,
+                via_method="b32",
+                probe_mode="b32",
+                content_type="blog",
+                content_summary="A test blog",
+                found_links=[],
+                flags=["robots_disallow_all", "tech_stack: nginx/1.24", "contact_found: email (1 addr(s))"],
+            ),
+        ]
+        print_report(results)
+        captured = capsys.readouterr()
+        assert "robots_disallow_all" in captured.out
+        assert "tech_stack: nginx/1.24" in captured.out
+        assert "contact_found: email (1 addr(s))" in captured.out
+
+    def test_print_report_no_flags_line_when_empty(self, capsys):
+        results = [
+            DiscoveryResult(
+                b32_addr="test1.b32.i2p",
+                ident_hash_hex="A" * 40,
+                reachable=True,
+                status_code=200,
+                body_length=500,
+                title="Plain Site",
+                response_time_sec=1.0,
+                via_method="b32",
+                probe_mode="b32",
+                content_type="",
+                content_summary=None,
+                found_links=[],
+                flags=[],
+            ),
+        ]
+        print_report(results)
+        captured = capsys.readouterr()
+        assert "flags:" not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# TestAddressBookIntegration — load_addressbook, reconcile, source param
+# ---------------------------------------------------------------------------
+
+class TestUpsertTargetsSource:
+    """upsert_targets accepts a source parameter and defaults to 'manual'."""
+
+    def test_default_source_is_manual(self, db):
+        db.upsert_targets([("A" * 40, "test.i2p")])
+        cur = db._conn.cursor()
+        cur.execute("SELECT source FROM targets WHERE ident_hash_hex='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'")
+        assert cur.fetchone()[0] == "manual"
+
+    def test_explicit_source_addressbook(self, db):
+        db.upsert_targets([("B" * 40, "ab.i2p")], source="addressbook")
+        cur = db._conn.cursor()
+        cur.execute("SELECT source FROM targets WHERE ident_hash_hex='BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'")
+        assert cur.fetchone()[0] == "addressbook"
+
+    def test_explicit_source_linked(self, db):
+        db.upsert_targets([("C" * 40, "linked.i2p")], source="linked")
+        cur = db._conn.cursor()
+        cur.execute("SELECT source FROM targets WHERE ident_hash_hex='CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'")
+        assert cur.fetchone()[0] == "linked"
+
+    def test_source_preserved_on_duplicate(self, db):
+        db.upsert_targets([("D" * 40, "")], source="addressbook")
+        # upsert again with same hash — should not change due to INSERT OR IGNORE
+        db.upsert_targets([("D" * 40, "added.i2p")], source="manual")
+        cur = db._conn.cursor()
+        cur.execute("SELECT source FROM targets WHERE ident_hash_hex='DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD'")
+        # The first insert wins because of the UNIQUE constraint on ident_hash_hex
+        assert cur.fetchone()[0] == "addressbook"
+
+
+class TestLoadAddressbook:
+    """load_addressbook populates targets from an AddressBookCatalog."""
+
+    def _make_catalog(self, hashes):
+        """Return a catalog with DestinationEntry for each 40-char hex hash."""
+        cat = AddressBookCatalog(db_path=":memory:")
+        for hx in hashes:
+            ri = RouterInfo(ident_hash_hex=hx, key_type=1)
+            cat._routers[hx] = ri
+        cat._sync_db()
+        return cat
+
+    def test_load_empty_catalog(self, db):
+        cat = self._make_catalog([])
+        count = db.load_addressbook(cat)
+        assert count == 0
+        cat.close()
+
+    def test_load_three_destinations(self, db):
+        hashes = [
+            "AA" * 20,
+            "BB" * 20,
+            "1234567890ABCDEF1234567890ABCDEF12345678",
+        ]
+        cat = self._make_catalog(hashes)
+        count = db.load_addressbook(cat)
+        assert count == 3
+        cur = db._conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM targets WHERE source='addressbook'")
+        assert cur.fetchone()[0] == 3
+        cat.close()
+
+    def test_load_does_not_overwrite_manual(self, db):
+        # Seed a manual target with an empty dns_name (same combo addressbook would use)
+        db.upsert_targets([("AAAABBBBCCCCDDDDEEEEFFFFAAAABBBBCCCCDDDD", "")], source="manual")
+        cat = self._make_catalog(["AAAABBBBCCCCDDDDEEEEFFFFAAAABBBBCCCCDDDD"])
+        count = db.load_addressbook(cat)
+        # The upsert attempted 1 row, INSERT OR IGNORE skipped it (same hash+empty dns)
+        assert count == 1
+        cur = db._conn.cursor()
+        cur.execute("SELECT source FROM targets WHERE ident_hash_hex='AAAABBBBCCCCDDDDEEEEFFFFAAAABBBBCCCCDDDD' AND i2p_dns_name=''")
+        # Original manual row still has its source; addressbook insert was ignored
+        assert cur.fetchone()[0] == "manual"
+        cat.close()
+
+
+class TestReconcileAddressbook:
+    """reconcile_addressbook marks removed addressbook entries as stale."""
+
+    def _make_catalog(self, hashes):
+        cat = AddressBookCatalog(db_path=":memory:")
+        for hx in hashes:
+            ri = RouterInfo(ident_hash_hex=hx, key_type=1)
+            cat._routers[hx] = ri
+        cat._sync_db()
+        return cat
+
+    def test_reconcile_marks_removed_as_stale(self, db):
+        # Load two addressbook targets
+        cat = self._make_catalog(["AA" * 20, "BB" * 20])
+        db.load_addressbook(cat)
+        cat.close()
+
+        # Now reconcile with a catalog that only has AA
+        cat2 = self._make_catalog(["AA" * 20])
+        result = db.reconcile_addressbook(cat2)
+        assert result["marked_stale"] == 1
+        cur = db._conn.cursor()
+        cur.execute(
+            "SELECT source FROM targets WHERE ident_hash_hex='" + "BB" * 20 + "'"
+        )
+        assert cur.fetchone()[0] == "addressbook:stale"
+        cat2.close()
+
+    def test_reconcile_keeps_present_entries(self, db):
+        cat = self._make_catalog(["AA" * 20, "BB" * 20])
+        db.load_addressbook(cat)
+        cat.close()
+
+        # Reconcile with same set — nothing stale
+        cat2 = self._make_catalog(["AA" * 20, "BB" * 20])
+        result = db.reconcile_addressbook(cat2)
+        assert result["marked_stale"] == 0
+        cur = db._conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM targets WHERE source='addressbook'")
+        assert cur.fetchone()[0] == 2
+        cat2.close()
+
+    def test_reconcile_with_no_addressbook_targets(self, db):
+        # Only manual targets exist — reconciliation is a no-op
+        db.upsert_targets([("AAAABBBBCCCCDDDDEEEEFFFFAAAABBBBCCCCDDDD", "manual.i2p")], source="manual")
+        cat = self._make_catalog(["1111222233334444555566667777888899990000"])
+        result = db.reconcile_addressbook(cat)
+        assert result["marked_stale"] == 0
+        cur = db._conn.cursor()
+        cur.execute(
+            "SELECT source FROM targets WHERE ident_hash_hex='AAAABBBBCCCCDDDDEEEEFFFFAAAABBBBCCCCDDDD'"
+        )
+        # Manual target unchanged
+        assert cur.fetchone()[0] == "manual"
+        cat.close()

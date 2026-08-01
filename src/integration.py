@@ -1048,13 +1048,20 @@ class DiscoveryDB:
     def get_targets(self) -> list[tuple[str, str]]:
         """Return the target queue as (hash_hex, dns_name) tuples.
 
-        Priorities: entries with valid identity hash first (b32 probing), then
-        by last_probed_at descending (older probes first).
+        Priorities:
+        1. Previously reachable targets first (highest chance of success).
+        2. Entries with valid identity hash (b32 probing capable).
+        3. By last_probed_at ascending (older probes first).
         """
         cur = self._conn.cursor()
         cur.execute(
-            "SELECT ident_hash_hex, i2p_dns_name FROM targets "
-            "ORDER BY CASE WHEN length(ident_hash_hex)=40 THEN 0 ELSE 1 END ASC, "
+            "SELECT ident_hash_hex, i2p_dns_name FROM targets "\
+            "ORDER BY "\
+            "CASE WHEN EXISTS ("\
+            "    SELECT 1 FROM discoveries d "\
+            "    WHERE d.ident_hash_hex = targets.ident_hash_hex AND d.reachable=1"\
+            ") THEN 0 ELSE 1 END ASC, "\
+            "CASE WHEN length(ident_hash_hex)=40 THEN 0 ELSE 1 END ASC, "\
             "last_probed_at ASC"
         )
         return [(r[0], r[1]) for r in cur.fetchall()]

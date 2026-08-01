@@ -1,7 +1,13 @@
 [project]
-name = "i2p-addressbook"
-version = "0.1.0"
+name = "i2p-indexer"
+version = "1.0.0"
+description = "Client-side discovery and cataloging tool for I2P eepsites"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.11"
+authors = [
+    {name = "BuboTheWise"},
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -5,7 +5,7 @@
 1. Ensure Python 3.11+ is installed and a local I2P daemon is running (Docker).
 2. Clone the repository and create a virtual environment:
    ```bash
-   cd "I2P Indexer"
+   cd "I2P-Indexer"
    python -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt

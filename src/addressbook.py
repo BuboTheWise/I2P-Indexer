@@ -121,9 +121,72 @@ class AddressBookCatalog:
     # ── webconsole fallback ────────────────────────────────────────
 
     def _scrape_webconsole(self) -> int:
-        """Scrape Java I2P webconsole /peers page for router data."""
+        """Scrape Java I2P webconsole for router data.
+
+        The /peers page loads its peer table via AJAX to /xhr1.jsp, which means
+        a plain GET only returns the sidebar navigation frame with no peer rows.
+        We fall back to parsing whatever static content *is* present (router summary
+        in the sidebar) and trying the direct XHR endpoint.
+
+        NOTE: POST actions to the webconsole require a CSRF nonce, so we can't
+        do anything that needs form submission.  GET-only data extraction is our
+        limit without browser automation.
+        """
         import urllib.request
         import re
+
+        count = 0
+
+        # Try the XHR endpoint first — it may return peer table HTML without CSRF
+        count += self._scrape_xhr_peers()
+
+        if count == 0:
+            # Parse whatever static content is on the /peers page sidebar
+            count += self._scrape_static_sidebar()
+
+        if count == 0:
+            # Try /netdb as secondary fallback
+            count += self._scrape_netdb_page()
+
+        return count
+
+    def _scrape_xhr_peers(self) -> int:
+        """Try the AJAX endpoint that powers the peers table."""
+        import urllib.request
+        import re
+
+        xhr_url = f"http://{self._config.webconsole_host}:{self._config.webconsole_port}/xhr1.jsp?requestURI=/peers.jsp"
+        count = 0
+
+        try:
+            req = urllib.request.Request(xhr_url, headers={"User-Agent": "I2P-Indexer/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+
+            # The XHR response still returns the sidebar + any table data
+            # Look for router hash patterns in links or text
+            hashes = self._extract_hashes_from_body(body)
+            for hx in hashes:
+                if hx not in self._routers:
+                    self._routers[hx] = RouterInfo(
+                        ident_hash_hex=hx,
+                        key_type=1,
+                        caps="scraped",
+                    )
+                    count += 1
+
+        except Exception as exc:
+            logger.debug("XHR peers scrape failed: %s", exc)
+
+        return count
+
+    def _scrape_static_sidebar(self) -> int:
+        """Parse the /peers page static content for any hash data.
+
+        Most router data lives in the AJAX-loaded table, but the sidebar may
+        contain links to individual router pages with hashes.
+        """
+        import urllib.request
 
         peers_url = f"http://{self._config.webconsole_host}:{self._config.webconsole_port}/peers"
         count = 0
@@ -133,41 +196,40 @@ class AddressBookCatalog:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
 
-            # Parse table rows. Typical row: hash | status | bw | version | ...
-            tr_tags = re.findall(r"<tr>(.*?)</tr>", body, re.DOTALL)
-            for tr in tr_tags:
-                td_tags = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.DOTALL)
-                if len(td_tags) < 3:
-                    continue
-
-                # Extract hash from cell content or link
-                hash_hex = self._extract_hash_from_cells(td_tags[0])
-                if not hash_hex:
-                    continue
-
-                bw_text = td_tags[2] if len(td_tags) > 2 else ""
-                caps_text = td_tags[3] if len(td_tags) > 3 else ""
-
-                caps_str, bw_val, pub = self._parse_caps_row(caps_text or "", bw_text)
-
-                ri = RouterInfo(
-                    ident_hash_hex=hash_hex,
-                    key_type=1,
-                    bandwidth_kbps=bw_val,
-                    caps=caps_str,
-                    published=pub,
-                )
-                self._routers[hash_hex] = ri
-                count += 1
-
-            if count == 0:
-                # Try /netdb endpoint as secondary fallback
-                count += self._scrape_netdb_page()
+            hashes = self._extract_hashes_from_body(body)
+            for hx in hashes:
+                if hx not in self._routers:
+                    self._routers[hx] = RouterInfo(
+                        ident_hash_hex=hx,
+                        key_type=1,
+                        caps="sidebar",
+                    )
+                    count += 1
 
         except Exception as exc:
             logger.warning("Webconsole scrape failed: %s", exc)
 
         return count
+
+    @staticmethod
+    def _extract_hashes_from_body(body: str) -> set[str]:
+        """Extract 40-char hex hashes from HTML body text."""
+        import re
+        hashes: set[str] = set()
+
+        # Find 40-char hex strings (router identity hashes)
+        for m in re.finditer(r'\b([0-9a-fA-F]{40})\b', body):
+            hx = m.group(1).upper()
+            if hx != "0" * 40:
+                hashes.add(hx)
+
+        # Find base64-encoded filenames that decode to SHA-1 hashes
+        for m in re.finditer(r'(?:href|filename)[="\'>\s]+([A-Za-z0-9+/=_-]{25,35})(?:\.rtr|\.ls64)', body):
+            raw = _b64tohex(m.group(1))
+            if raw and len(raw) == 40:
+                hashes.add(raw.upper())
+
+        return hashes
 
     def _scrape_netdb_page(self) -> int:
         """Parse the /netdb HTML listing page."""

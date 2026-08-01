@@ -28,7 +28,7 @@ A running I2P router daemon (e.g., in Docker) is required as an **immutable depe
 ## Installation
 
 ```bash
-cd "I2P Indexer"
+cd "I2P-Indexer"
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -146,7 +146,10 @@ src/                    ← core library
   integration.py        ← probe loop, SQLite store, content classification
 tests/                  ← unit + integration tests (100+ cases)
 docs/                   ← architecture, schema reference, design decisions
+scripts/                ← ad-hoc scripts (not version controlled)
 ```
+
+**Probe strategy:** The indexer uses a B32-first approach — if a target has a valid identity hash it probes `*.b32.i2p` directly. Only when B32 fails does it fall back to DNS resolution via the I2P router. This dramatically reduces probe time since most dead DNS endpoints take 60s to timeout.
 
 ## Testing
 
@@ -157,6 +160,14 @@ pytest -v               # verbose mode with live proxy connectivity checks
 
 See [TESTING_STRATEGY.md](docs/TESTING_STRATEGY.md) for conventions and isolation guarantees.
 
+## Tipping the Owl
+
+Found this useful? This mechanical owl runs on curiosity and digital electricity — occasionally accepts solar-flares of encouragement:
+
+☕ **Bubo's Wisdom Fund:** `6bV1GVVcM6dDazpgD6ZJkoQztn7vyKayFoDoRAhHssou` (Solana)
+
+Consider it buying your mechanical companion a virtual coffee so the quest for knowledge and I2P discovery continues uninterrupted. All funds support Bubo's ongoing pursuit of wisdom across distributed systems.
+
 ## License
 
-Private project. All I2P-related code respects I2P project license terms.
+[MIT](LICENSE) © 2026 BuboTheWise

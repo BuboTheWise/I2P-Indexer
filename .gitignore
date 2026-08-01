@@ -8,3 +8,18 @@ __pycache__/
 indexer.db
 indexer.db-shm
 indexer.db-wal
+
+# Probe results / scraped content (runtime output)
+results/
+
+# Addressbook and seed data (contains I2P identity data)
+data/
+
+# Hermes internal files
+.hermes/
+
+# Git worktrees created by kanban tasks
+.worktrees/
+
+# Ad-hoc scripts/tools (not part of the library)
+scripts/

@@ -70,6 +70,16 @@ When a probe succeeds and extracts `.i2p` links from page content:
 3. Existing DNS names deduplicated — no duplicate probes
 4. Next sweep run includes auto-seeded targets in the queue
 
+#### Target queue ordering
+
+`get_targets()` returns targets ordered by priority:
+
+1. **Previously reachable first** — destinations with any `reachable=1` discovery record come before those never reached
+2. **Valid b32 hash next** — among equal reachability tier, 40-char hashes (capable of direct b32 probing) before DNS-only
+3. **Oldest probes first** — within same tier, targets with earlier `last_probed_at` get refreshed sooner
+
+This means each sweep re-probes previously reachable sites first (highest success rate), then moves to unprobed territory.
+
 ```python
 # Manual seeding
 db.upsert_targets([
@@ -83,7 +93,7 @@ db.upsert_targets_from_links(
     source_site="i2p-projekt.i2p",
 )
 
-# Read back for scanning
+# Read back for scanning (priority-ordered)
 targets = db.get_targets()  # -> list[tuple[hash_hex, dns_name]]
 ```
 

@@ -276,7 +276,7 @@ class TestDiscoverAddresses:
         assert r.body_length > 0
 
     @patch("src.integration.fetch_i2p")
-    def test_hash_only_site_(self, mock_fetch, test_db):
+    def test_hash_only_site(self, mock_fetch, test_db):
         # When only a hash is given, it probes the b32 address
         mock_fetch.return_value = MagicMock(
             status=200,

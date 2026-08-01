@@ -309,20 +309,20 @@ def _extract_flags(
     lower_body = body_text.lower()[:32768]  # first 32 KB for heuristics
 
     # ── 1. robots_disallow_all ────────────────────────────────────────
-    if "user-agent" in lower_body and "disallow: /" in lower_body:
-        flags.append("robots_disallow_all")
+    if 'user-agent' in lower_body and 'disallow: /' in lower_body:
+        flags.append('robots_disallow_all')
 
     # ── 2. tech_stack_detected ────────────────────────────────────────
     detected_techs: list[str] = []
 
     # Server header
-    for hdr_key in ("Server", "server"):
-        srv = resp_headers.get(hdr_key, "")
+    for hdr_key in ('Server', 'server'):
+        srv = resp_headers.get(hdr_key, '')
         if srv:
             detected_techs.append(srv)
 
     # X-Powered-By header
-    xp = resp_headers.get("X-Powered-By", "") or resp_headers.get("x-powered-by", "")
+    xp = resp_headers.get('X-Powered-By', '') or resp_headers.get('x-powered-by', '')
     if xp:
         detected_techs.append(xp)
 
@@ -334,12 +334,12 @@ def _extract_flags(
 
     # Common CMS fingerprints in HTML source (case-insensitive)
     cms_signatures = {
-        "wordpress": [r'wp-content/', r'wp-includes/', r'wordpress'],
-        "joomla": [r'joomla', r'/components/com_', r'media/'],
-        "drupal": [r'drupal', r'/sites/default/files', r'core/misc/drupal'],
-        "mediawiki": [r'mediawiki', r'/w/load.php', r'/index\.php.*action='],
-        "ghost": [r'ghost-', r'/ghost/'],
-        "concrete5": [r'concrete/', r'cms_theme/'],
+        'wordpress': [r'wp-content/', r'wp-includes/', r'wordpress'],
+        'joomla': [r'joomla', r'/components/com_', r'media/'],
+        'drupal': [r'drupal', r'/sites/default/files', r'core/misc/drupal'],
+        'mediawiki': [r'mediawiki', r'/w/load.php', r'/index\.php.*action='],
+        'ghost': [r'ghost-', r'/ghost/'],
+        'concrete5': [r'concrete/', r'cms_theme/'],
     }
     for cms, patterns in cms_signatures.items():
         for pat in patterns:
@@ -362,10 +362,10 @@ def _extract_flags(
 
     # Social media links
     social_patterns = {
-        "twitter": r'(?:twitter\.com|x\.com)/\w+',
-        "mastodon": r'mastodon\.|\.\w+/@\w+',
-        "github": r'github\.com/\w+',
-        "telegram": r'telegram\.(?:me|org)/\w+',
+        'twitter': r'(?:twitter\.com|x\.com)/\w+',
+        'mastodon': r'mastodon\.|\.\w+/@\w+',
+        'github': r'github\.com/\w+',
+        'telegram': r'telegram\.(?:me|org)/\w+',
     }
     found_social: list[str] = []
     for platform, pat in social_patterns.items():
@@ -377,12 +377,12 @@ def _extract_flags(
 
     # ── 4. forum_site ────────────────────────────────────────────────
     forum_signatures = {
-        "phpBB": [r'phpbb', r'/styles/.*/theme/', r'forum\.php'],
-        "XenForo": [r'xenforo', r'/xf\.', r'js/xenforo\.min\.js'],
-        "Discourse": [r'discourse', r'data-controller=', r'discourse-helpers.js'],
-        "vBulletin": [r'vbulletin', r'/clientscript/vb\.', r'/forum\.php'],
-        "Flarum": [r'flarum', r'/extensions/', r'flarum-header'],
-        "IPS (Invision)": [r'invision', r'/uploads/', r'ipsTemplate'],
+        'phpBB': [r'phpbb', r'/styles/.*/theme/', r'forum\.php'],
+        'XenForo': [r'xenforo', r'/xf\.', r'js/xenforo\.min\.js'],
+        'Discourse': [r'discourse', r'data-controller=', r'discourse-helpers.js'],
+        'vBulletin': [r'vbulletin', r'/clientscript/vb\.', r'/forum\.php'],
+        'Flarum': [r'flarum', r'/extensions/', r'flarum-header'],
+        'IPS (Invision)': [r'invision', r'/uploads/', r'ipsTemplate'],
     }
     for forum_software, patterns in forum_signatures.items():
         for pat in patterns:
@@ -576,15 +576,31 @@ class DiscoveryDB:
     # ── schema migrations (new columns for existing databases) ────────
 
     def _ensure_discovery_columns(self) -> None:
-        """Add new columns if they exist in newer schema but not in this DB."""
+        """Add new columns if they exist in newer schema but not in this DB.
+
+        After adding a column, verify the type matches expectations so that
+        manually-created columns with the wrong type are detected and logged
+        rather than failing silently downstream.
+        """
         cur = self._conn.cursor()
         cur.execute("PRAGMA table_info(discoveries)")
-        existing_cols = {row[1] for row in cur.fetchall()}
-        if "flags" not in existing_cols:
+        col_info = {row[1]: row[2] for row in cur.fetchall()}  # name -> type
+
+        if "flags" not in col_info:
             cur.execute(
                 "ALTER TABLE discoveries ADD COLUMN flags TEXT DEFAULT '[]'"
             )
-        self._conn.commit()
+            self._conn.commit()
+            # Reload and verify the column landed with the right type
+            cur.execute("PRAGMA table_info(discoveries)")
+            col_info = {row[1]: row[2] for row in cur.fetchall()}
+
+        if "flags" in col_info and col_info["flags"] not in ("TEXT", ""):
+            logger.warning(
+                "discoveries.flags has unexpected type '%s' (expected TEXT); "
+                "this may cause issues with flag extraction.",
+                col_info["flags"],
+            )
 
     def _ensure_targets_columns(self) -> None:
         """Add new columns for SUSI export support."""

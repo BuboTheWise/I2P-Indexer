@@ -582,13 +582,13 @@ class TestLinkExtraction:
         assert "example.i2p" in result
 
     def test_extract_from_multiple_anchors(self):
-        # The regex only captures one label before .i2p, so alpha.beta.i2p yields beta.i2p
+        # Multi-label domains now capture the full hostname including all labels
         html = (
             '<a href="http://alpha.beta.i2p/path">A</a> '
             '<a href="https://gamma.i2p/">B</a>'
         )
         result = _extract_i2p_links(html)
-        assert "beta.i2p" in result
+        assert "alpha.beta.i2p" in result
         assert "gamma.i2p" in result
 
     def test_extract_naked_hostname_in_text(self):
@@ -614,17 +614,18 @@ class TestLinkExtraction:
     def test_case_normalization_lowercase(self):
         html = '<a href="http://Mixed.Case.I2P/">Link</a>'
         result = _extract_i2p_links(html)
-        # The regex finds 'Case.I2P' (one label before .i2p), lowered to 'case.i2p'
-        assert "case.i2p" in result
+        # Multi-label regex captures Mixed.Case -> mixed.case (full hostname)
+        assert "mixed.case.i2p" in result
 
     def test_case_normalization_mixed_sources(self):
-        # Both match 'One.I2P' and 'one.i2p' respectively, both become 'one.i2p'
+        # Both sources yield the same full hostname 'site.one.i2p' after lowering,
+        # so dedup leaves one entry.
         html = (
             '<a href="http://Site.One.I2P/">upper</a> '
             'and site.one.i2p lower'
         )
         result = _extract_i2p_links(html)
-        assert result.count("one.i2p") == 1
+        assert result.count("site.one.i2p") == 1
 
     def test_empty_body_returns_empty_list(self):
         assert _extract_i2p_links("") == []
@@ -660,7 +661,8 @@ class TestLinkExtraction:
         assert "early.i2p" in result
 
     def test_link_at_boundary_terminators(self):
-        # Links terminated by various characters: /, ", ', space, newline
+        # Links terminated by various characters: /, ", ', space, newline.
+        # Multi-label regex captures the full hostname including subdomain labels.
         text = (
             'foo.a.i2p/bar '
             'baz.b.i2p"end '
@@ -669,23 +671,23 @@ class TestLinkExtraction:
             "final.e.i2p end"
         )
         result = _extract_i2p_links(text)
-        # Regex captures only the label immediately before .i2p
-        assert "a.i2p" in result
-        assert "b.i2p" in result
-        assert "c.i2p" in result
-        assert "d.i2p" in result
-        assert "e.i2p" in result
+        assert "foo.a.i2p" in result
+        assert "baz.b.i2p" in result
+        assert "qux.c.i2p" in result
+        assert "last.d.i2p" in result
+        assert "final.e.i2p" in result
 
 
     def test_extract_partial_multilevel_domain(self):
-        r"""Verify that multi-level .i2p domains only match the last label.
+        r"""Multi-level .i2p domains now capture the full hostname.
 
-        This documents actual regex behavior — [a-z0-9\-]+\.i2p captures
-        just one label before .i2p, so 'alpha.beta.gamma.i2p' yields 'gamma.i2p'.
+        The new regex [a-z0-9](?:[a-z0-9\-]*[a-z0-9])?(?:\.[...])*\.i2p
+        captures all subdomain labels, so 'deep.sub.domain.i2p' is matched
+        in full rather than just the last label.
         """
         html = '<a href="http://deep.sub.domain.i2p/">Link</a>'
         result = _extract_i2p_links(html)
-        assert "domain.i2p" in result
+        assert "deep.sub.domain.i2p" in result
         assert len(result) == 1
 
     # ── upsert_targets_from_links ────────────────────────────────────────

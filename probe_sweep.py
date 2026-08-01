@@ -101,7 +101,18 @@ def main():
         action="store_true",
         help="Scan I2P addressbook (netdb/ or webconsole) and load into targets before sweeping",
     )
+    p.add_argument(
+        "--probe-timeout",
+        type=float,
+        default=None,
+        help="Per-target probe timeout in seconds (default: 120)",
+    )
     args = p.parse_args()
+
+    # Apply --probe-timeout to module-level PROBE_TIMEOUT if set
+    import src.integration as integration_module
+    if args.probe_timeout is not None:
+        integration_module.PROBE_TIMEOUT = args.probe_timeout
 
     # ── Load addressbook scan ────────────────────────────────────
     if args.load_address_book:
@@ -140,11 +151,13 @@ def main():
         return
 
     # ── Real sweep ────────────────────────────────────────────────
+    effective_timeout = integration_module.PROBE_TIMEOUT
     results = discover_addresses(
         known_addrs=None,
         config=None,
         db_path=args.db,
         probe_delay=args.delay,
+        timeout=effective_timeout,
     )
 
     # Slice to --count if requested

@@ -150,8 +150,76 @@ def _classify_content(
     title: str,
     body_text: str,
 ) -> tuple[str, str, list[str]]:
+    """Classify page content and build a rich English-language summary.
+
+    Detects content type (forum, blog, marketplace, etc.), extracts context-
+    specific metadata, translates non-English excerpts to English via
+    googletrans, and appends a source-language note when translation occurs.
+    """
     import html as _html
     import re as _re
+
+    # --- Language detection + translation helper (lazy, with timeout) ---
+    try:
+        import langid as _langid
+        from googletrans import Translator as _Translator
+        _translator = _Translator()
+        _has_lt = True
+    except ImportError:
+        _has_lt = False
+
+    # Cache per-classification call to avoid repeated lookups
+    _lang_cache: dict[int, str | None] = {}  # id(body) -> detected lang
+    _trans_cache: dict[tuple[int, str], tuple[str, str | None]] = {}
+
+    def _detect_lang(text: str) -> str | None:
+        """Detect language of text, cached per body."""
+        did = id(text)
+        if did in _lang_cache:
+            return _lang_cache[did]
+        try:
+            lang, _score = _langid.classify(" ".join(text.split())[:500])  # type: ignore[unbound]
+            _lang_cache[did] = lang if lang != "en" else None
+            return _lang_cache[did]
+        except Exception:
+            _lang_cache[did] = None
+            return None
+
+    def _translate(text: str) -> tuple[str, str | None]:
+        """Translate non-English text to English with 3s timeout. Returns (result, lang) or (text, None) on failure."""
+        stripped = " ".join(text.split()).strip()[:400]
+        if not stripped or len(stripped) < 5 or not _has_lt:
+            return stripped, None
+
+        cache_key = (len(text), text)
+        if cache_key in _trans_cache:
+            return _trans_cache[cache_key]
+
+        lang = _detect_lang(text)
+        if lang is None:
+            result = (stripped, None)
+            _trans_cache[cache_key] = result
+            return result
+
+        import signal as _signal
+
+        def _timeout_handler(signum: int, frame: object) -> None:  # type: ignore[arg-type]
+            raise TimeoutError("Translation timed out")
+
+        try:
+            _old = _signal.signal(_signal.SIGALRM, _timeout_handler)  # type: ignore[arg-type]
+            _signal.alarm(3)
+            translated = _translator.translate(stripped[:300], src=lang, dest="en")  # type: ignore[unbound]
+            _signal.alarm(0)
+            _signal.signal(_signal.SIGALRM, _old)  # type: ignore[arg-type]
+            result = (translated.text.strip(), lang)
+        except TimeoutError:
+            result = (stripped, lang)
+        except Exception:
+            result = (stripped, None)
+
+        _trans_cache[cache_key] = result
+        return result
 
     lower_title = title.lower()
     lower_body = body_text[:32768].lower()
@@ -221,29 +289,78 @@ def _classify_content(
     if meta_desc_m:
         meta_desc_text = meta_desc_m.group(1).strip()
 
+    # --- Translate title and description ---
+    translated_title = decoded_title
+    title_lang = None
+    if decoded_title and len(decoded_title) > 3:
+        translated_title, title_lang = _translate(decoded_title)
+
+    translated_desc = meta_desc_text
+    desc_lang = None
+    if meta_desc_text and len(meta_desc_text) > 10:
+        translated_desc, desc_lang = _translate(meta_desc_text)
+
     # Preamble
     type_label = content_type.title() if content_type else "Unidentified"
-    if decoded_title:
-        _add(f"\u00ab{type_label}\u00bb \u00ab{decoded_title}\u00bb")
-    elif meta_desc_text:
-        _add(f"\u00ab{type_label}\u00bb {meta_desc_text}")
+    if translated_title:
+        _add(f"\u00ab{type_label}\u00bb \u00ab{translated_title}\u00bb")
+        if title_lang:
+            _add(f"(Translated from {title_lang})")
+    elif translated_desc:
+        _add(f"\u00ab{type_label}\u00bb {translated_desc[:250]}")
+        if desc_lang:
+            _add(f"(Translated from {desc_lang})")
     else:
         _add(type_label)
 
-    if meta_desc_text and len(meta_desc_text) > 10:
-        _add(f"Description: {meta_desc_text[:250]}")
+    if translated_desc and len(translated_desc) > 10:
+        _add(f"Description: {translated_desc[:250]}")
 
-    # Content excerpt from paragraphs
+    # Content excerpt from paragraphs — extract multiple for depth
     para_re = _re.compile(r'<p\b[^>]*>(.*?)</p>', _re.IGNORECASE | _re.DOTALL)
     paras = [_TAG_RE.sub(" ", m).strip() for m in para_re.findall(body_text[:32768])]
+    excerpts_added = 0
+    excerpt_langs: set[str] = set()
     for p in paras:
+        if excerpts_added >= 2:
+            break
         cleaned = " ".join(p.split())
         if 40 < len(cleaned) < 350:
             tl_words = set(lower_title.split())
             overlap = sum(1 for w in tl_words if w in cleaned.lower().split() and len(w) > 3)
             if overlap / max(len(tl_words), 1) < 0.5:
-                _add(f"Content excerpt: \u201c{cleaned[:300]}\u201d")
-                break
+                trans_text, p_lang = _translate(cleaned)
+                _add(f"Content excerpt: \u201c{trans_text[:300]}\u201d")
+                if p_lang:
+                    excerpt_langs.add(p_lang)
+                excerpts_added += 1
+
+    # Add heading text (h1-h3) for more context
+    heading_re = _re.compile(r'<h[1-3]\b[^>]*>(.*?)</h[1-3]>', _re.IGNORECASE | _re.DOTALL)
+    headings = [_TAG_RE.sub(" ", m).strip() for m in heading_re.findall(body_text[:16384])]
+    headings_added = 0
+    skip_heading_words = {"home", "menu", "nav", "navigation", "sidebar", "footer"}
+    for h in headings:
+        if headings_added >= 3:
+            break
+        hl = h.lower().split()[0] if h.split() else ""
+        if len(h) > 5 and len(h) < 200 and hl not in skip_heading_words:
+            trans_h, h_lang = _translate(h)
+            _add(f"Section: {trans_h.strip()}")
+            if h_lang:
+                excerpt_langs.add(h_lang)
+            headings_added += 1
+
+    # Consolidated language note
+    all_langs = set()
+    if title_lang:
+        all_langs.add(title_lang)
+    if desc_lang:
+        all_langs.add(desc_lang)
+    all_langs |= excerpt_langs
+    all_langs -= {"en"}
+    if all_langs and not title_lang and not desc_lang:
+        _add(f"(Content translated from: {', '.join(sorted(all_langs))})")
 
     # --- Marketplace enrichment ---
     if content_type == "marketplace":
@@ -314,21 +431,20 @@ def _classify_content(
                 topics.append(c)
         topics = list(dict.fromkeys(topics))[:5]
         if topics:
-            _add(f"Topic threads seen: {'; '.join(topics)}")
+            # Translate non-English topic titles
+            trans_topics = []
+            topic_langs: set[str] = set()
+            for tp in topics:
+                trans_tp, tp_lang = _translate(tp)
+                trans_topics.append(trans_tp)
+                if tp_lang:
+                    topic_langs.add(tp_lang)
+            _add(f"Topic threads seen: {'; '.join(trans_topics)}")
+            if topic_langs:
+                excerpt_langs |= topic_langs
 
     # --- Blog enrichment ---
     elif content_type == "blog":
-        lang_hints: list[str] = []
-        if _re.search(r'[\u0400-\u04FF]', words_text[:2000]):
-            lang_hints.append("Contains Cyrillic text")
-        if _re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', words_text[:2000]):
-            lang_hints.append("Contains CJK characters")
-        freq = set(words_text[:1000].lower().split())
-        if {"en", "el", "la", "los", "con", "para"}.issubset(freq):
-            lang_hints.append("Likely Spanish content")
-        if lang_hints:
-            _add("Language notes: " + ", ".join(lang_hints))
-
         if any(s in lower_body for s in ["rss", "atom.xml", "<?xml", "<feed"]):
             _add("RSS/Atom feed detected (updateable content)")
 
@@ -342,6 +458,26 @@ def _classify_content(
             if any(_re.search(p, lower_body) for p in pats):
                 _add(f"Powered by: {eng}")
                 break
+
+        # Extract blog post titles from article/headings
+        a_tags = _re.findall(
+            r'<a[^>]*>(.*?)</a>', body_text[:16384], _re.IGNORECASE | _re.DOTALL,
+        )
+        skip_words = {"home", "login", "register", "sign in", "search", "admin",
+                      "profile", "settings", "logout", "terms", "archive"}
+        posts: list[str] = []
+        for t in a_tags:
+            c = _TAG_RE.sub(" ", " ".join(t.split())).strip()
+            if 10 < len(c) < 150 and c.lower().split()[0] not in skip_words:
+                posts.append(c)
+        posts = list(dict.fromkeys(posts))[:5]
+        if posts:
+            # Translate post titles
+            trans_posts = []
+            for p in posts:
+                trans_p, _ = _translate(p)
+                trans_posts.append(trans_p)
+            _add(f"Recent posts: {'; '.join(trans_posts)}")
 
     # --- File archive enrichment ---
     elif content_type == "file archive":

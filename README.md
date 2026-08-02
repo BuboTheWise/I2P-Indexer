@@ -154,7 +154,7 @@ scripts/                ← ad-hoc scripts (not version controlled)
 ## Testing
 
 ```bash
-pytest tests/           # full suite (~113 tests)
+pytest tests/           # full suite (~204 tests)
 pytest -v               # verbose mode with live proxy connectivity checks
 ```
 

@@ -201,22 +201,28 @@ def _classify_content(
             _trans_cache[cache_key] = result
             return result
 
-        import signal as _signal
+        # Use threading timeout instead of SIGALRM (which leaks across the process)
+        import threading as _threading
 
-        def _timeout_handler(signum: int, frame: object) -> None:  # type: ignore[arg-type]
-            raise TimeoutError("Translation timed out")
+        _out: list[str | Exception] = []
 
-        try:
-            _old = _signal.signal(_signal.SIGALRM, _timeout_handler)  # type: ignore[arg-type]
-            _signal.alarm(3)
-            translated = _translator.translate(stripped[:300])  # type: ignore[unbound]
-            _signal.alarm(0)
-            _signal.signal(_signal.SIGALRM, _old)  # type: ignore[arg-type]
-            result = (translated.strip(), lang)
-        except TimeoutError:
-            result = (stripped, lang)
-        except Exception:
+        def _do_translate() -> None:
+            try:
+                out = _translator.translate(stripped[:300])  # type: ignore[unbound]
+                _out.append(str(out) if out else "")
+            except Exception as exc:
+                _out.append(exc)
+
+        _t = _threading.Thread(target=_do_translate, daemon=True)
+        _t.start()
+        _t.join(timeout=3.0)
+
+        if _t.is_alive():
+            result = (stripped, lang)  # timed out
+        elif _out and isinstance(_out[0], Exception):
             result = (stripped, None)
+        else:
+            result = (str(_out[0]).strip() if _out else stripped, lang)
 
         _trans_cache[cache_key] = result
         return result

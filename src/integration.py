@@ -143,21 +143,29 @@ def _extract_i2p_links(body_text: str) -> list[str]:
     return list({h.strip().lower() for h in _I2P_LINK_RE.findall(body_text[:32768])})
 
 
+# Replacement for _classify_content in src/integration.py
+# Lines 146-330 will be replaced with this content.
+
 def _classify_content(
     title: str,
     body_text: str,
 ) -> tuple[str, str, list[str]]:
-    """Heuristic content classification from title + stripped HTML.
-
-    Returns (content_type_bucket, content_summary, linked_i2p_sites).
-    This is intentionally a local, offline heuristic — no LLM required at probe time.
-    Later passes can re-classify with an LLM if desired.
-    """
     import html as _html
-    lower_title = title.lower()
-    lower_body = body_text[:16384].lower()  # first 16KB is enough for heuristics
+    import re as _re
 
-    # ── Bucket detection (expanded) ───────────────────────────────────
+    lower_title = title.lower()
+    lower_body = body_text[:32768].lower()
+
+    plain = _TAG_RE.sub(" ", body_text[:32764])
+    words_text = " ".join(plain.split()).strip()
+
+    meta_desc_m = _re.search(
+        r'<meta[^>]+name=["\']?description["\']?\s+content=["\']([^"\']+)[ "\'"]',
+        body_text[:16384],
+        _re.IGNORECASE,
+    )
+
+    # Bucket detection
     type_keywords: list[tuple[str, list[str]]] = [
         ("forum", ["forum", "board", "thread", "post", "topic"]),
         ("wiki", ["wiki", "knowledge base", "mediawiki"]),
@@ -169,165 +177,233 @@ def _classify_content(
         ("chat room", ["chat", "irc", "messaging"]),
         ("search engine", ["search", "find", "index", "discover"]),
     ]
-
     content_type = ""
-    spa_framework = None
-    
     for bucket, keywords in type_keywords:
         if any(kw in lower_title or kw in lower_body for kw in keywords):
             content_type = bucket
             break
 
-    # ── SPA / framework detection (catches JS-rendered pages without text) ─
-    if not content_type:
-        import re as _re_spa
-        
-        framework_sigs: dict[str, list[str]] = {
-            "React": [r'react[-_]?app', r'__react_events__', r'data-reactroot', r'react-dom'],
-            "Angular": [r'ng-app', r'ng-version', r'angular\.js', r'ng-reflect-'],
-            "Vue.js": [r'vue\.js', r'data-v-', r'vendor\.(vite|webpack)'],
-            "SvelteKit": [r'__sveltekit__', r'-core-client-js'],
-        }
-        
-        for fw, pats in framework_sigs.items():
-            if any(_re_spa.search(p, lower_body[:16384]) for p in pats):
-                spa_framework = fw
-                break
-
-    # ── Plain text for analysis ───────────────────────────────────────
-    plain = _TAG_RE.sub(" ", body_text[:16384])
-    words_text = " ".join(plain.split()).strip()
-    
-    # Extract meta description (often the best summary on the page)
-    import re as _re
-    meta_desc = _re.search(
-        r'<meta[^>]+name=["\']?description["\']?\s+content=["\']([^"\']+)[ "\'"]',
-        body_text[:16384],
-        _re.IGNORECASE,
-    )
-    
-    # ── Marketplace product extraction ────────────────────────────────
-    marketplace_products: list[str] = []
-    if content_type == "marketplace":
-        # Look for price patterns and product listings
-        price_patterns = _re.findall(
-            r'(?:bitcoin|btc|monepcoin|bitcoins?)?\s*[¥$€£₿]\s*[\d,]+\.?\d*',
-            words_text[:2000],
-            _re.IGNORECASE,
-        )
-        
-        # Look for categories/departments
-        product_cats: list[str] = []
-        cat_terms = [
-            "drugs", "services", "digital", "hardware", "software", 
-            "electronics", "clothing", "food", "health", "documents",
-            "accounts", "coupons", "gift cards", "prepaid", "privacy",
-            "vpn", "proxy", "tor", "i2p", "crypto", "mining",
-        ]
-        for cat in cat_terms:
-            if cat in lower_body:
-                product_cats.append(cat)
-        
-        if price_patterns or product_cats:
-            marketplace_products = product_cats
-    
-    # ── Marketplace vendor/seller count ───────────────────────────────
-    vendor_count = ""
-    if content_type == "marketplace":
-        vendor_refs = _re.findall(
-            r'(?:seller|vendor|merchant|shop)\s*#?(\d+)',
-            lower_body,
-        )
-        if vendor_refs:
-            vendor_count = f"at least {len(set(vendor_refs))} referenced seller(s)"
-    
-    # Forum/post count heuristics
-    thread_info = ""
-    if content_type == "forum":
-        post_count = _re.search(r'([\d,]+)\s*(?:posts?|messages?)', words_text[:2000], _re.IGNORECASE)
-        topic_count = _re.search(r'([\d,]+)\s*(?:topics?|threads?)', words_text[:2000], _re.IGNORECASE)
-        if post_count or topic_count:
-            parts = []
-            if post_count:
-                parts.append(f"{post_count.group(1)} posts")
-            if topic_count:
-                parts.append(f"{topic_count.group(1)} threads")
-            thread_info = f"({', '.join(parts)})"
-    
-    # Blog/post count heuristics  
-    blog_info = ""
-    if content_type == "blog":
-        articles = _re.findall(r'about\s*(?:post|article)', words_text[:2000], _re.IGNORECASE)
-        recent_posts = _re.search(r'([\d,]+)\s*(?:recent|latest)\s*(?:post|entry)', 
-                                  words_text[:2000], _re.IGNORECASE)
-    
-    # Link extraction is handled separately
-    linked_sites: list[str] = _extract_i2p_links(body_text[:32768])
-
-    # ── Build the descriptive summary ─────────────────────────────────
-    parts: list[str] = []
-    
-    if content_type:
-        parts.append(content_type.title())
-    else:
-        # Try to infer from title alone
-        if any(kw in lower_title for kw in ["index", "directory", "list"]):
-            parts.append("Directory/Index")
-        elif any(kw in lower_title for kw in ["home", "welcome"]):
-            parts.append("Landing page")
-        else:
-            parts.append("Unidentified site")
-    
-    if title:
-        decoded_title = _html.unescape(title)
-        parts.append(f"«{decoded_title}»")
-    elif meta_desc:
-        desc = meta_desc.group(1).strip()
-        if len(desc) > 200:
-            desc = desc[:197] + "…"
-        parts.append(desc)
-    
-    # Append body-derived context (first meaningful sentence/paragraph)
-    sentences = _re.split(r'[.!?]\s+', words_text[:500])
-    for s in sentences:
-        cleaned = s.strip()
-        if 30 < len(cleaned) < 200 and not any(c in lower_title for c in cleaned.lower()):
-            parts.append(f"Content excerpt: \"{cleaned}\"")
-            break
-    
-    # Marketplace details
-    if marketplace_products:
-        parts.append(f"Selling categories: {', '.join(marketplace_products)}")
-    if vendor_count:
-        parts.append(vendor_count)
-    if thread_info:
-        parts.append(thread_info)
-
-    # ── Technology stack signatures ────────────────────────────────────
-    import re as _re_tech
-    tech_signatures = {
+    # Tech stack detection
+    tech_signatures: dict[str, list[str]] = {
         "Node.js": ["npm", "node_modules", "express"],
         "Ruby on Rails": ["csrf-token", "media_types/"],
         "PHP": ["<?php"],
         "Python/Django": ["django-", "csrftoken"],
         "Go": ["go_session", "gorouter"],
     }
+    tech_stack: list[str] = []
+    for tn, pats in tech_signatures.items():
+        if any(_re.search(p, lower_body) for p in pats):
+            tech_stack.append(tn)
 
-    tech_stack = []
-    for tech_name, pats in tech_signatures.items():
-        for pat in pats:
-            if _re_tech.search(pat, lower_body):
-                tech_stack.append(tech_name)
+    spa_framework: str | None = None
+    framework_sigs: dict[str, list[str]] = {
+        "React": [r'react[-_]?app', r'__react_events__', r'data-reactroot'],
+        "Angular": [r'ng-app', r'ng-version', r'angular\.js'],
+        "Vue.js": [r'vue\.js', r'data-v-'],
+    }
+    for fw, pats in framework_sigs.items():
+        if any(_re.search(p, lower_body) for p in pats):
+            spa_framework = fw
+            break
+
+    linked_sites: list[str] = _extract_i2p_links(body_text[:32768])
+
+    # Build rich summary
+    lines: list[str] = []
+
+    def _add(line: str) -> None:
+        if line.strip():
+            lines.append(line.strip())
+
+    decoded_title = _html.unescape(title).strip() if title else ""
+    meta_desc_text = ""
+    if meta_desc_m:
+        meta_desc_text = meta_desc_m.group(1).strip()
+
+    # Preamble
+    type_label = content_type.title() if content_type else "Unidentified"
+    if decoded_title:
+        _add(f"\u00ab{type_label}\u00bb \u00ab{decoded_title}\u00bb")
+    elif meta_desc_text:
+        _add(f"\u00ab{type_label}\u00bb {meta_desc_text}")
+    else:
+        _add(type_label)
+
+    if meta_desc_text and len(meta_desc_text) > 10:
+        _add(f"Description: {meta_desc_text[:250]}")
+
+    # Content excerpt from paragraphs
+    para_re = _re.compile(r'<p\b[^>]*>(.*?)</p>', _re.IGNORECASE | _re.DOTALL)
+    paras = [_TAG_RE.sub(" ", m).strip() for m in para_re.findall(body_text[:32768])]
+    for p in paras:
+        cleaned = " ".join(p.split())
+        if 40 < len(cleaned) < 350:
+            tl_words = set(lower_title.split())
+            overlap = sum(1 for w in tl_words if w in cleaned.lower().split() and len(w) > 3)
+            if overlap / max(len(tl_words), 1) < 0.5:
+                _add(f"Content excerpt: \u201c{cleaned[:300]}\u201d")
                 break
 
+    # --- Marketplace enrichment ---
+    if content_type == "marketplace":
+        cat_terms = [
+            "drugs", "services", "digital goods", "hardware", "software",
+            "electronics", "clothing", "food", "health", "documents",
+            "accounts", "coupons", "gift cards", "prepaid", "privacy",
+            "vpn", "proxy", "tor", "i2p", "crypto", "mining",
+        ]
+        cats = [c for c in cat_terms if _re.search(r'\b' + _re.escape(c) + r'\b', lower_body[:8000])]
+        if cats:
+            _add(f"Categories sold: {', '.join(cats)}")
+
+        price_mentions = len(_re.findall(
+            r'(?:\d{1,4}(?:,\d{3})*\.\d{2}|\d+)\s*(?:sat\b|sats?\b|bitcoin|btc|monepcoin|bitcoins?|xmr|monero|usd|eur|gbp)',
+            words_text[:4000], _re.IGNORECASE,
+        ))
+        if price_mentions:
+            _add(f"Pricing signals found ({price_mentions} mentions)")
+
+        vendors = _re.findall(r'(?:seller|vendor|merchant|shop)\s*#?(\d+)', lower_body[:8000])
+        if vendors:
+            _add(f"Referenced vendors: at least {len(set(vendors))} unique")
+
+        # Product listing detection
+        li_rows = len(_re.findall(r'<(?:tr|li)[^>]*>', body_text[:32768], _re.IGNORECASE))
+        if li_rows > 10:
+            _add(f"Page has ~{li_rows} table/list rows (product listing layout)")
+
+    # --- Forum enrichment ---
+    elif content_type == "forum":
+        stats_parts: list[str] = []
+        cnt_matches = _re.findall(
+            r'(\d[\d,]*)\s*(posts?|messages?|threads?|topics?|members?|users?)',
+            words_text[:4000], _re.IGNORECASE,
+        )
+        seen: set[str] = set()
+        for val, unit in cnt_matches:
+            u = unit.lower()[:4]
+            if u not in seen:
+                stats_parts.append(f"{val} {u}")
+                seen.add(u)
+        if stats_parts:
+            _add(f"Stats: {', '.join(stats_parts[:6])}")
+
+        fsw = {
+            "phpBB": [r'phpbb'],
+            "vBulletin": [r'vbulletin', r'veraction'],
+            "Flarum": ["flarum"],
+            "Discourse": ["discourse"],
+            "SMF": ["simplemachines", "smf"],
+        }
+        for sw, sigs in fsw.items():
+            if any(si in lower_body for si in sigs):
+                _add(f"Forum software: {sw}")
+                break
+
+        # Recent topic/thread titles from links
+        a_tags = _re.findall(
+            r'<a[^>]*>(.*?)</a>', body_text[:16384], _re.IGNORECASE | _re.DOTALL,
+        )
+        skip_words = {"home", "login", "register", "sign in", "search", "admin",
+                      "profile", "settings", "logout", "terms"}
+        topics: list[str] = []
+        for t in a_tags:
+            c = _TAG_RE.sub(" ", " ".join(t.split())).strip()
+            if 10 < len(c) < 120 and c.lower().split()[0] not in skip_words:
+                topics.append(c)
+        topics = list(dict.fromkeys(topics))[:5]
+        if topics:
+            _add(f"Topic threads seen: {'; '.join(topics)}")
+
+    # --- Blog enrichment ---
+    elif content_type == "blog":
+        lang_hints: list[str] = []
+        if _re.search(r'[\u0400-\u04FF]', words_text[:2000]):
+            lang_hints.append("Contains Cyrillic text")
+        if _re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', words_text[:2000]):
+            lang_hints.append("Contains CJK characters")
+        freq = set(words_text[:1000].lower().split())
+        if {"en", "el", "la", "los", "con", "para"}.issubset(freq):
+            lang_hints.append("Likely Spanish content")
+        if lang_hints:
+            _add("Language notes: " + ", ".join(lang_hints))
+
+        if any(s in lower_body for s in ["rss", "atom.xml", "<?xml", "<feed"]):
+            _add("RSS/Atom feed detected (updateable content)")
+
+        blog_eng = {
+            "Ghost": [r'ghost-'],
+            "WordPress": [r'wp-content/', r'wordpress'],
+            "Jekyll": [r'jekyll', r'jekyll-feed'],
+            "Hugo": ["hugo"],
+        }
+        for eng, pats in blog_eng.items():
+            if any(_re.search(p, lower_body) for p in pats):
+                _add(f"Powered by: {eng}")
+                break
+
+    # --- File archive enrichment ---
+    elif content_type == "file archive":
+        if any(s in lower_body for s in ["index of /", "parent directory"]):
+            _add("Apache/Nginx auto-generated directory listing")
+
+        # Filter to known file extensions only (avoid random words)
+        KNOWN_EXTS = {
+            "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "tgz", "txz",
+            "pdf", "doc", "docx", "odt", "txt", "rtf", "epub", "cbz", "cbr",
+            "mp3", "flac", "ogg", "wav", "aac", "wma", "opus", "m4a",
+            "mp4", "mkv", "avi", "wmv", "mov", "webm", "flv",
+            "iso", "img", "dmg", "vdi", "vhdx",
+            "exe", "msi", "deb", "rpm",
+            "torrent", "nzb",
+            "csv", "xls", "xlsx",
+            "ppt", "pptx",
+            "apk", "ipa",
+            "html", "php", "js", "py", "c", "h", "java", "go", "rs",
+        }
+        exts = list(dict.fromkeys(
+            e for e in _re.findall(r'\.([a-z]{2,6})\b', lower_body[:16384])
+            if e in KNOWN_EXTS
+        ))[:10]
+        if exts:
+            _add(f"File types present: {', '.join(exts)}")
+
+    # --- Search engine enrichment ---
+    elif content_type == "search engine":
+        result_count = _re.search(r'(\d[\d,]*)\s*(?:results?|pages? indexed)', words_text[:2000], _re.IGNORECASE)
+        if result_count:
+            _add(f"Catalog: ~{result_count.group(1)} indexed results/pages")
+
+        # Blockchain explorer detection
+        if any(k in lower_body for k in ["blockchain", "block height", "txid", "transaction hash"]):
+            coins = []
+            coin_sigs: dict[str, list[str]] = {
+                "Bitcoin": ["bitcoin", "btc"],
+                "Monero": ["monero", "xmr"],
+                "Ethereum": ["ethereum", "eth"],
+            }
+            for coin, sigs in coin_sigs.items():
+                if any(s in lower_body for s in sigs):
+                    coins.append(coin)
+            if coins:
+                _add(f"Blockchain explorer for: {', '.join(coins)}")
+
+        # Generic search form detection
+        if any(s in lower_body for s in ['<form', 'name="q"', 'name="query"', 'name="search"']):
+            _add("Has search form (content indexing)")
+
+    # Common footer info
     if tech_stack:
-        parts.append(f"Tech: {', '.join(tech_stack)}")
-    if spa_framework:
-        parts.append(f"Framework: {spa_framework}")
+        _add(f"Tech stack: {', '.join(tech_stack)}")
+    elif spa_framework:
+        _add(f"SPA framework: {spa_framework}")
 
-    summary = ", ".join(parts).strip() if parts else f"Unidentified — «{title}»"
-    return content_type, summary, linked_sites
+    n_links = len(linked_sites)
+    if n_links:
+        _add(f"Found {n_links} linked i2p site(s)")
 
+    return content_type, "\n".join(lines), linked_sites
 
 # ---------------------------------------------------------------------------
 # Flag extraction heuristics
@@ -364,6 +440,7 @@ def _extract_flags(
 
     # ── 2. tech_stack_detected ────────────────────────────────────────
     detected_techs: list[str] = []
+    import re as _re
 
     # Server header
     for hdr_key in ("Server", "server"):
@@ -376,11 +453,22 @@ def _extract_flags(
     if xp:
         detected_techs.append(xp)
 
-    # <meta name="generator"> tag
-    import re as _re
-    gen_match = _re.search(r'<meta[^>]+name=["\']?generator["\']?\s+content=["\']([^"\']+)["\']', body_text[:32768], _re.IGNORECASE)
+    # <meta name="generator"> tag — known generators only
+    KNOWN_GENERATORS = [
+        "WordPress", "Joomla", "Drupal", "MediaWiki", "Ghost", "Hugo",
+        "Jekyll", "Squarespace", "Wix", "Weebly", "Pelican", "Haddock",
+        "Gatsby", "Next.js", "Nuxt", "VitePress", "Docusaurus",
+        "Grav", "Concrete5", "TYPO3", "MODX", "ExpressionEngine",
+        "October CMS", "CraftCMS", "Statamic", "Kirby",
+    ]
+    gen_match = _re.search(r'<meta[^>]+name=["\']?generator["\']?\s+content=["\']([^"\']+)[ "\'"]', body_text[:32768], _re.IGNORECASE)
     if gen_match:
-        detected_techs.append(gen_match.group(1))
+        gen_value = gen_match.group(1).strip()
+        # Only record known generators; skip personal messages / junk
+        for kg in KNOWN_GENERATORS:
+            if kg.lower() in gen_value.lower():
+                detected_techs.append(gen_value)
+                break
 
     # Common CMS fingerprints in HTML source (case-insensitive)
     cms_signatures = {

@@ -19,6 +19,7 @@ from src.integration import (
     discover_addresses,
     get_address_book,
     print_address_book,
+    probe_destination,
     print_report,
     query_db,
 )
@@ -324,6 +325,56 @@ class TestDiscoverAddresses:
         results = discover_addresses(db_instance=test_db)
         assert len(results) >= 3  # at least the 4 well-known sites
 
+    @patch("src.integration.probe_destination")
+    def test_db_closed_on_exception_in_probe_loop(self, mock_probe):
+        """discover_addresses must close its own DB connection even when an exception raised mid-loop."""
+        import sqlite3
+
+        tmp_dir = tempfile.mkdtemp()
+        db_path = os.path.join(tmp_dir, "leak_test.db")
+
+        # First probe succeeds; second raises an exception mid-loop
+        r1 = DiscoveryResult(
+            b32_addr="a.i2p", ident_hash_hex="", reachable=True, response_time_sec=1.0,
+        )
+        mock_probe.side_effect = [r1, RuntimeError("simulated probe failure")]
+
+        with pytest.raises(RuntimeError, match="simulated probe failure"):
+            # Do NOT pass db_instance — discover_addresses must own the connection
+            discover_addresses(known_addrs=["http://a.i2p/", "http://b.i2p/"], db_path=db_path)
+
+        # After the exception was caught above, try to open the DB anew.
+        # If discover_addresses leaked its connection, the file would still be
+        # locked or the original conn wouldn't be closed.
+        verify = sqlite3.connect(db_path)
+        cur = verify.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row[0] for row in cur.fetchall()}
+        assert "discoveries" in tables  # confirms we can still read the schema
+        verify.close()
+
+        # Also confirm that if we manually open and close, the file doesn't
+        # report an 'in use' / lock error — a sign the previous handle was released.
+        db2 = DiscoveryDB(db_path=db_path)
+        db2.close()
+
+    @patch("src.integration.probe_destination")
+    def test_db_not_closed_when_caller_passes_instance(self, mock_probe, tmp_path):
+        """discover_addresses must NOT close a caller-provided db_instance."""
+        r1 = DiscoveryResult(
+            b32_addr="a.i2p", ident_hash_hex="", reachable=True, response_time_sec=1.0,
+        )
+        mock_probe.return_value = r1
+
+        db_conn = DiscoveryDB(db_path=str(tmp_path / "caller.db"))
+        results = discover_addresses(known_addrs=["http://a.i2p/"], db_instance=db_conn)
+        assert len(results) == 1
+        # The caller's connection should still be open — operations must succeed
+        cur = db_conn._conn.cursor()
+        cur.execute("SELECT count(*) FROM discoveries")
+        # Just confirm we can query it without sqlite3.ProgrammingError
+        db_conn.close()
+
 
 # ---------------------------------------------------------------------------
 # query_db tests
@@ -565,6 +616,83 @@ class TestAddressBookView:
         print_address_book([])
         captured = capsys.readouterr()
         assert "empty" in captured.out.lower() or "0 destination" in captured.out
+
+    def test_address_book_limit(self, tmp_db):
+        """Insert >100 rows then fetch with limit=5 — should return exactly 5."""
+        db = DiscoveryDB(db_path=tmp_db)
+        for i in range(120):
+            h = f"{i:040x}"[:40].ljust(40, "a")
+            db.record_discovery(
+                ident_hash_hex=h,
+                b32_addr=f"addr-{i}.b32.i2p",
+                i2p_dns_name=f"site-{i}.i2p",
+                probe_mode="b32",
+                reachable=(i % 3 == 0),
+            )
+        full = db.address_book()
+        assert len(full) == 120, f"Expected 120 unbounded rows, got {len(full)}"
+
+        limited = db.address_book(limit=5)
+        assert len(limited) == 5
+
+        limited_10 = db.address_book(limit=10)
+        assert len(limited_10) == 10
+
+        # Zero limit should return nothing
+        zero = db.address_book(limit=0)
+        assert len(zero) == 0
+
+        # Negative limit treated as-is (SQLite allows it — returns all rows)
+        neg = db.address_book(limit=-1)
+        assert len(neg) == 120
+
+        db.close()
+
+    def test_get_all_hashes_limit(self, tmp_db):
+        """Insert >100 distinct hashes then fetch with limit=5."""
+        db = DiscoveryDB(db_path=tmp_db)
+        for i in range(120):
+            h = f"{i:040x}"[:40].ljust(40, "a")
+            db.record_discovery(
+                ident_hash_hex=h,
+                b32_addr=f"addr-{i}.b32.i2p",
+                probe_mode="b32",
+                reachable=True,
+            )
+        all_hashes = db.get_all_hashes()
+        assert len(all_hashes) == 120
+
+        limited = db.get_all_hashes(limit=5)
+        assert len(limited) == 5
+
+        limited_20 = db.get_all_hashes(limit=20)
+        assert len(limited_20) == 20
+
+        # None still returns everything
+        unbounded = db.get_all_hashes(limit=None)
+        assert len(unbounded) == 120
+
+        db.close()
+
+    def test_address_book_function_limit(self, tmp_db):
+        """Module-level get_address_book() passes limit through."""
+        db = DiscoveryDB(db_path=tmp_db)
+        for i in range(50):
+            h = f"{i:040x}"[:40].ljust(40, "a")
+            db.record_discovery(
+                ident_hash_hex=h,
+                b32_addr=f"addr-{i}.b32.i2p",
+                i2p_dns_name=f"site-{i}.i2p",
+                probe_mode="b32",
+                reachable=True,
+            )
+        db.close()
+
+        full = get_address_book(db_path=tmp_db)
+        assert len(full) == 50
+
+        limited = get_address_book(db_path=tmp_db, limit=10)
+        assert len(limited) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -1496,3 +1624,137 @@ class TestReconcileAddressbook:
         # Manual target unchanged
         assert cur.fetchone()[0] == "manual"
         cat.close()
+
+
+# ---------------------------------------------------------------------------
+# probe_destination tests — alias discovery behavior
+# ---------------------------------------------------------------------------
+
+class TestProbeDestinationAliases:
+    """Test that probe_destination probes DNS even when b32 already succeeded,
+    discovering alias mappings between hash and DNS names.
+    Only skips DNS when the name is literally identical to the derived b32 address."""
+
+    @patch("src.integration._do_probe")
+    def test_b32_ok_triggers_dns_alias_probes(self, mock_do_probe, db):
+        """When b32 succeeds and DNS name differs from b32 addr, DNS still runs with shorter timeout."""
+        res_b32 = DiscoveryResult(
+            b32_addr="abcde.b32.i2p", ident_hash_hex="aabbccddee" * 4,
+            reachable=True, status_code=200, body_length=5000, title="Site",
+            response_time_sec=5.0, probe_mode="b32", via_method="b32",
+        )
+        res_dns = DiscoveryResult(
+            b32_addr="alias.i2p", ident_hash_hex="aabbccddee" * 4,
+            reachable=True, status_code=200, body_length=5100, title="Site Alias",
+            response_time_sec=8.0, probe_mode="dns", via_method="dns",
+        )
+        mock_do_probe.side_effect = [res_b32, res_dns]
+
+        result = probe_destination(
+            ident_hash_hex="aabbccddee" * 4,
+            i2p_dns_name="alias.i2p",
+            db=db,
+            timeout=120,
+        )
+
+        # Both probes should have been called — b32 first, then DNS alias check
+        assert mock_do_probe.call_count == 2
+        first_call = mock_do_probe.call_args_list[0]
+        second_call = mock_do_probe.call_args_list[1]
+        assert first_call.kwargs["probe_mode"] == "b32"
+        assert second_call.kwargs["probe_mode"] == "dns"
+        # DNS alias probe gets the shorter timeout (min of provided and 15)
+        assert second_call.kwargs["timeout"] <= 15
+
+        # Result should show b32+dns since both succeeded
+        assert result.via_method == "b32+dns"
+        # Best result is the one with most body data
+        assert result.body_length == 5100
+
+    @patch("src.integration._do_probe")
+    def test_b32_ok_skips_dns_when_identical(self, mock_do_probe, db):
+        """When DNS name literally equals the b32-derived address, skip the redundant probe."""
+        from src.addressbook import _hex_to_b32_addr
+
+        res_b32 = DiscoveryResult(
+            b32_addr="abcde.b32.i2p", ident_hash_hex="aabbccddee" * 4,
+            reachable=True, status_code=200, body_length=5000, title="Site",
+            response_time_sec=5.0, probe_mode="b32", via_method="b32",
+        )
+        mock_do_probe.return_value = res_b32
+
+        derived_addr = _hex_to_b32_addr("aabbccddee" * 4)
+        result = probe_destination(
+            ident_hash_hex="aabbccddee" * 4,
+            i2p_dns_name=derived_addr,
+            db=db,
+            timeout=120,
+        )
+
+        # Should only call b32 once — DNS is identical to b32 so skipped
+        assert mock_do_probe.call_count == 1
+        assert result.via_method == "b32"
+
+    @patch("src.integration._do_probe")
+    def test_dns_fallback_still_runs_when_b32_fails(self, mock_do_probe, db):
+        """When b32 fails, DNS fallback runs with full timeout."""
+        res_b32_fail = DiscoveryResult(
+            b32_addr="abcde.b32.i2p", ident_hash_hex="aabbccddee" * 4,
+            reachable=False, status_code=0, body_length=0, title="",
+            response_time_sec=120.0, probe_mode="b32", via_method="b32",
+            error="Connection timeout",
+        )
+        res_dns = DiscoveryResult(
+            b32_addr="alias.i2p", ident_hash_hex="aabbccddee" * 4,
+            reachable=True, status_code=200, body_length=10000, title="Found via DNS",
+            response_time_sec=10.0, probe_mode="dns", via_method="dns",
+        )
+        mock_do_probe.side_effect = [res_b32_fail, res_dns]
+
+        result = probe_destination(
+            ident_hash_hex="aabbccddee" * 4,
+            i2p_dns_name="alias.i2p",
+            db=db,
+            timeout=120,
+        )
+
+        # Both probes called: b32 first (fails), DNS fallback second (full timeout)
+        assert mock_do_probe.call_count == 2
+        second_call = mock_do_probe.call_args_list[1]
+        assert second_call.kwargs["probe_mode"] == "dns"
+        assert second_call.kwargs["timeout"] == 120  # Full timeout for fallback
+
+    @patch("src.integration._do_probe")
+    def test_alias_dns_records_discovery(self, mock_do_probe, db):
+        """When alias DNS probe runs after successful b32, discovery is recorded in DB."""
+        res_b32 = DiscoveryResult(
+            b32_addr="abcde.b32.i2p", ident_hash_hex="aabbccddee" * 4,
+            reachable=True, status_code=200, body_length=5000, title="Site",
+            response_time_sec=5.0, probe_mode="b32", via_method="b32",
+            content_type="website", content_summary="A site",
+        )
+        res_dns = DiscoveryResult(
+            b32_addr="alias.i2p", ident_hash_hex="aabbccddee" * 4,
+            reachable=True, status_code=200, body_length=5100, title="Site Alias",
+            response_time_sec=8.0, probe_mode="dns", via_method="dns",
+            content_type="website", content_summary="Alias of site",
+        )
+        mock_do_probe.side_effect = [res_b32, res_dns]
+
+        probe_destination(
+            ident_hash_hex="aabbccddee" * 4,
+            i2p_dns_name="alias.i2p",
+            db=db,
+            timeout=120,
+        )
+
+        # Both probes should have been recorded in DB
+        cur = db._conn.cursor()
+        cur.execute(
+            "SELECT probe_mode, reachable FROM discoveries WHERE ident_hash_hex=?",
+            ("aabbccddee" * 4,),
+        )
+        rows = cur.fetchall()
+        modes = [(r[0], r[1]) for r in rows]
+        assert ("b32", 1) in modes
+        assert ("dns", 1) in modes

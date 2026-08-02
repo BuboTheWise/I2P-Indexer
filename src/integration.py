@@ -16,7 +16,6 @@ import logging
 import os
 import re
 import sqlite3
-import sys as _sys
 import threading
 import time
 import traceback
@@ -24,7 +23,6 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import socks  # required by SOCKS5 proxy path
 
@@ -1045,10 +1043,17 @@ class DiscoveryDB:
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    def get_all_hashes(self) -> list[str]:
-        """Get unique ident hashes discovered so far."""
+    def get_all_hashes(self, limit: int | None = None) -> list[str]:
+        """Get unique ident hashes discovered so far.
+
+        Args:
+            limit: Optional maximum number of hashes to return.
+        """
         cur = self._conn.cursor()
-        cur.execute("SELECT DISTINCT ident_hash_hex FROM discoveries")
+        sql = "SELECT DISTINCT ident_hash_hex FROM discoveries"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        cur.execute(sql)
         return [r[0] for r in cur.fetchall()]
 
     def summary(self) -> dict:
@@ -1072,9 +1077,12 @@ class DiscoveryDB:
             "reachable_count": n_reachable,
         }
 
-    def address_book(self) -> list[dict]:
+    def address_book(self, limit: int | None = None) -> list[dict]:
         """Return the 'address book' view: one row per destination showing the
         most recent probe result joined with router/leaseset metadata.
+
+        Args:
+            limit: Optional maximum number of rows to return.
 
         Columns: dns_name, content_type, reachable, last_probed_utc, content_summary,
         ident_hash_hex, b32_addr, status_code, body_length, title, response_time_sec,
@@ -1082,7 +1090,10 @@ class DiscoveryDB:
         bandwidth_kbps, router_caps, num_leases.
         """
         cur = self._conn.cursor()
-        cur.execute("SELECT * FROM address_book ORDER BY dns_name ASC")
+        sql = "SELECT * FROM address_book ORDER BY dns_name ASC"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        cur.execute(sql)
         cols = [desc[0] for desc in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
@@ -1379,11 +1390,52 @@ def probe_destination(
                 error_msg=res_b32.error,
             )
 
-    # ── Attempt 2: Try .i2p DNS name only if b32 failed or wasn't attempted
+    # ── Attempt 2: Try .i2p DNS name to discover aliases
+    # Even when b32 already succeeded, we still probe the DNS name so that
+    # multiple DNS names pointing to the same destination are all recorded.
+    # Only skip if the DNS name literally IS the derived b32 address itself.
     if i2p_dns_name and not i2p_dns_name.endswith(".b32.i2p"):
         b32_ok = any(r.reachable for r in results if r.probe_mode == "b32")
-        if b32_ok:
-            logger.info("Skipping DNS probe — b32 already succeeded for %s", i2p_dns_name)
+        # Deduplicate: skip only when the DNS name resolves to the same address
+        # we already probed (i.e. it IS the b32 hostname).
+        is_same_addr = i2p_dns_name.lower() == b32_addr.lower() if (b32_addr and i2p_dns_name) else False
+        if is_same_addr:
+            logger.info("Skipping DNS probe — name %s is identical to b32 address %s", i2p_dns_name, b32_addr)
+        elif b32_ok:
+            # b32 already succeeded — still try DNS with a shorter timeout
+            # to discover whether this alias also resolves (cross-reference).
+            dns_timeout = min(timeout, 15)
+            logger.info(
+                "Probing http://%s/  (.i2p DNS alias check, timeout=%ds)", i2p_dns_name, dns_timeout
+            )
+            res_dns = _do_probe(
+                url=f"http://{i2p_dns_name}/",
+                ident_hash_hex=ident_hash_hex,
+                i2p_dns_name=i2p_dns_name,
+                probe_mode="dns",
+                timeout=dns_timeout,
+            )
+            results.append(res_dns)
+            if db:
+                db.record_discovery(
+                    ident_hash_hex=ident_hash_hex,
+                    b32_addr=b32_addr,
+                    i2p_dns_name=i2p_dns_name,
+                    probe_mode="dns",
+                    reachable=res_dns.reachable,
+                    status_code=res_dns.status_code,
+                    body_length=res_dns.body_length,
+                    title=res_dns.title,
+                    response_time=res_dns.response_time_sec,
+                    via_method="dns",
+                    content_type=res_dns.content_type,
+                    content_summary=res_dns.content_summary,
+                    content_hash=res_dns.content_hash,
+                    last_modified=res_dns.last_modified,
+                    found_links=res_dns.found_links,
+                    flags=res_dns.flags,
+                    error_msg=res_dns.error,
+                )
         else:
             logger.info("Probing http://%s/  (.i2p DNS fallback)", i2p_dns_name)
             res_dns = _do_probe(
@@ -1634,70 +1686,73 @@ def discover_addresses(
     use_existing_db = db_instance is not None
     db = db_instance or DiscoveryDB(db_path)
 
-    # ── Gather targets as (hash, dns_name) pairs ──────────────────────
-    targets: list[tuple[str, str]] = []  # (ident_hash_hex, dns_name_or_empty)
+    try:
+        # ── Gather targets as (hash, dns_name) pairs ────────────────
+        targets: list[tuple[str, str]] = []  # (ident_hash_hex, dns_name_or_empty)
 
-    if known_addrs:
-        for addr in known_addrs:
-            if isinstance(addr, tuple):
-                # Already a (hash, dns_name) pair
-                h, d = addr
-                targets.append((h.upper() if h else "", d))
-                continue
-            # Strip URL wrapper
-            raw = addr.removeprefix("http://").removeprefix("https://").rstrip("/")
-            if len(raw) == 40 and all(c in "0123456789abcdefABCDEF" for c in raw):
-                # It's a hash
-                targets.append((raw.upper(), ""))
-            elif not raw.endswith(".b32.i2p"):
-                # Treat as DNS hostname
-                targets.append(("", raw))
-            else:
-                # b32 address — try to extract hash (we store as-is and let probe convert)
-                targets.append(("", raw))
+        if known_addrs:
+            for addr in known_addrs:
+                if isinstance(addr, tuple):
+                    # Already a (hash, dns_name) pair
+                    h, d = addr
+                    targets.append((h.upper() if h else "", d))
+                    continue
+                # Strip URL wrapper
+                raw = addr.removeprefix("http://").removeprefix("https://").rstrip("/")
+                if len(raw) == 40 and all(c in "0123456789abcdefABCDEF" for c in raw):
+                    # It's a hash
+                    targets.append((raw.upper(), ""))
+                elif not raw.endswith(".b32.i2p"):
+                    # Treat as DNS hostname
+                    targets.append(("", raw))
+                else:
+                    # b32 address — try to extract hash (we store as-is and let probe convert)
+                    targets.append(("", raw))
 
-    elif catalog:
-        for de in catalog.all_destinations():
-            if de.b32_addr:
-                dns = ""
-                targets.append((de.ident_hash_hex, dns))
+        elif catalog:
+            for de in catalog.all_destinations():
+                if de.b32_addr:
+                    dns = ""
+                    targets.append((de.ident_hash_hex, dns))
 
-    else:
-        # Seed DB with defaults, then query the target list
-        initial: list[tuple[str, str]] = [
-            ("", "i2p-projekt.i2p"),
-            ("F95763B51C40A9EF8E2C5CE3D19D43EC8E5F10E9", "su3-directory.i2p"),
-            ("", "mail.i2pmail.org"),
-        ]
-        db.upsert_targets(initial)
-        targets = db.get_targets()
+        else:
+            # Seed DB with defaults, then query the target list
+            initial: list[tuple[str, str]] = [
+                ("", "i2p-projekt.i2p"),
+                ("F95763B51C40A9EF8E2C5CE3D19D43EC8E5F10E9", "su3-directory.i2p"),
+                ("", "mail.i2pmail.org"),
+            ]
+            db.upsert_targets(initial)
+            targets = db.get_targets()
 
-    # ── Apply limit if requested ─────────────────────────────────────
-    if limit:
-        targets = targets[:limit]
+        # ── Apply limit if requested ────────────────────────────────
+        if limit:
+            targets = targets[:limit]
 
-    # ── Probe each target (one at a time — I2P is slow) ───────────────
-    results: list[DiscoveryResult] = []
+        # ── Probe each target (one at a time — I2P is slow) ─────────
+        results: list[DiscoveryResult] = []
 
-    for i, (hash_hex, dns_name) in enumerate(targets):
-        if i > 0:
-            logger.info("Waiting %.1fs before next probe...", probe_delay)
-            time.sleep(probe_delay)
-        logger.info("--- Probing [%d/%d]: hash=%s  dns=%s", i + 1, len(targets), hash_hex or "(none)", dns_name or "(none)")
-        res = probe_destination(
-            ident_hash_hex=hash_hex,
-            i2p_dns_name=dns_name,
-            db=db,
-            timeout=timeout,
-        )
-        results.append(res)
+        for i, (hash_hex, dns_name) in enumerate(targets):
+            if i > 0:
+                logger.info("Waiting %.1fs before next probe...", probe_delay)
+                time.sleep(probe_delay)
+            logger.info("--- Probing [%d/%d]: hash=%s  dns=%s", i + 1, len(targets), hash_hex or "(none)", dns_name or "(none)")
+            res = probe_destination(
+                ident_hash_hex=hash_hex,
+                i2p_dns_name=dns_name,
+                db=db,
+                timeout=timeout,
+            )
+            results.append(res)
 
-    # Sort: reachable first, then fastest
-    results.sort(key=lambda r: (not r.reachable, r.response_time_sec))
-    summary = db.summary()
-    logger.info("Discovery DB — %s", summary)
-    db.close()
-    return results
+        # Sort: reachable first, then fastest
+        results.sort(key=lambda r: (not r.reachable, r.response_time_sec))
+        summary = db.summary()
+        logger.info("Discovery DB — %s", summary)
+        return results
+    finally:
+        if not use_existing_db:
+            db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1781,9 +1836,13 @@ def query_db(hash_hex: str = "", dns_name: str = "", db_path: str = DEFAULT_DB_P
     return results
 
 
-def get_address_book(db_path: str = DEFAULT_DB_PATH) -> list[dict]:
+def get_address_book(db_path: str = DEFAULT_DB_PATH, limit: int | None = None) -> list[dict]:
     """Return the address_book view — one row per destination with the most
     recent probe, joined against router and leaseset metadata.
+
+    Args:
+        db_path: Path to the SQLite database.
+        limit: Optional maximum number of rows to return.
 
     Columns returned:
         dns_name, content_type, reachable, last_probed_utc, content_summary,
@@ -1792,7 +1851,7 @@ def get_address_book(db_path: str = DEFAULT_DB_PATH) -> list[dict]:
     """
     with _db_lock:
         db = DiscoveryDB(db_path)
-        rows = db.address_book()
+        rows = db.address_book(limit=limit)
         db.close()
     return rows
 

@@ -22,5 +22,6 @@ for name, url in SITES:
 import os
 out = os.path.join(os.path.dirname(__file__), 'results', 'probe.json')
 os.makedirs(os.path.dirname(out), exist_ok=True)
-json.dump(results, open(out, 'w'), indent=2)
+with open(out, 'w') as f:
+    json.dump(results, f, indent=2)
 print(json.dumps(results, indent=2))

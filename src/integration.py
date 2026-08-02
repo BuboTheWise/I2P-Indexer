@@ -162,8 +162,8 @@ def _classify_content(
     # --- Language detection + translation helper (lazy, with timeout) ---
     try:
         import langid as _langid
-        from googletrans import Translator as _Translator
-        _translator = _Translator()
+        from deep_translator import GoogleTranslator as _GTrans  # type: ignore[import-untyped]
+        _translator = _GTrans(source="auto", target="en")
         _has_lt = True
     except ImportError:
         _has_lt = False
@@ -209,10 +209,10 @@ def _classify_content(
         try:
             _old = _signal.signal(_signal.SIGALRM, _timeout_handler)  # type: ignore[arg-type]
             _signal.alarm(3)
-            translated = _translator.translate(stripped[:300], src=lang, dest="en")  # type: ignore[unbound]
+            translated = _translator.translate(stripped[:300])  # type: ignore[unbound]
             _signal.alarm(0)
             _signal.signal(_signal.SIGALRM, _old)  # type: ignore[arg-type]
-            result = (translated.text.strip(), lang)
+            result = (translated.strip(), lang)
         except TimeoutError:
             result = (stripped, lang)
         except Exception:

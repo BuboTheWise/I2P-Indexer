@@ -232,10 +232,26 @@ def _classify_content(
     words_text = " ".join(plain.split()).strip()
 
     meta_desc_m = _re.search(
-        r'<meta[^>]+name=["\']?description["\']?\s+content=["\']([^"\']+)[ "\'"]',
+        r'<meta[^>]+name=["\']?description["\']?\s+content=["\']([^"\']+)["\'"]',
         body_text[:16384],
         _re.IGNORECASE,
     )
+
+    # Fallback: reversed attribute order (content before name)
+    if not meta_desc_m:
+        meta_desc_m = _re.search(
+            r'<meta[^>]+content=["\']([^"\']+)["\'"]\s+name=["\']?description["\']?',
+            body_text[:16384],
+            _re.IGNORECASE,
+        )
+
+    # Fallback: og:description (Open Graph) — very common on modern sites
+    if not meta_desc_m:
+        meta_desc_m = _re.search(
+            r'<meta[^>]+property=["\']?og:description["\']?\s+content=["\']([^"\']+)["\'"]',
+            body_text[:16384],
+            _re.IGNORECASE,
+        )
 
     # Bucket detection
     type_keywords: list[tuple[str, list[str]]] = [
@@ -354,17 +370,6 @@ def _classify_content(
             if h_lang:
                 excerpt_langs.add(h_lang)
             headings_added += 1
-
-    # Consolidated language note
-    all_langs = set()
-    if title_lang:
-        all_langs.add(title_lang)
-    if desc_lang:
-        all_langs.add(desc_lang)
-    all_langs |= excerpt_langs
-    all_langs -= {"en"}
-    if all_langs and not title_lang and not desc_lang:
-        _add(f"(Content translated from: {', '.join(sorted(all_langs))})")
 
     # --- Marketplace enrichment ---
     if content_type == "marketplace":
@@ -542,6 +547,27 @@ def _classify_content(
     n_links = len(linked_sites)
     if n_links:
         _add(f"Found {n_links} linked i2p site(s)")
+
+    # ── Fallback: if summary has almost nothing, grab first body text block ──
+    # This prevents terse one-line summaries for pages where no enrichment fired.
+    if len(lines) <= 1 and words_text:
+        first_block = " ".join(words_text.split()[:50])
+        if len(first_block) > 20:
+            trans_fallback, fb_lang = _translate(first_block)
+            _add(f"Body text: \"{trans_fallback[:300]}\"")
+            if fb_lang and fb_lang != "en":
+                excerpt_langs.add(fb_lang)
+
+    # Re-add language note after fallback (it may have added new langs)
+    all_langs = set()
+    if title_lang:
+        all_langs.add(title_lang)
+    if desc_lang:
+        all_langs.add(desc_lang)
+    all_langs |= excerpt_langs
+    all_langs -= {"en"}
+    if all_langs and not title_lang and not desc_lang:
+        _add(f"(Content translated from: {', '.join(sorted(all_langs))})")
 
     return content_type, "\n".join(lines), linked_sites
 

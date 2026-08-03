@@ -1758,3 +1758,80 @@ class TestProbeDestinationAliases:
         modes = [(r[0], r[1]) for r in rows]
         assert ("b32", 1) in modes
         assert ("dns", 1) in modes
+
+
+class TestSummaryQuality:
+    """Tests for _classify_content — ensure summaries are informative, not terse."""
+
+    def test_forum_with_body_contents_gets_rich_summary(self):
+        from src.integration import _classify_content
+
+        body = (
+            "<html><body>"
+            "<h1>I2P Anonymous Forum</h1>"
+            "<p>This is a discussion board for the invisible internet project community. "
+            "Share your experiences.</p>"
+            "<p>Register to post threads and participate in discussions about privacy.</p>"
+            "</body></html>"
+        )
+        ct, summary, links = _classify_content("I2P Forum", body)
+        lines = [l.strip() for l in summary.split("\n") if l.strip()]
+
+        assert len(lines) >= 2, f"Expected multi-line summary, got {len(lines)}: {summary}"
+        assert any("Content excerpt" in l or "Section:" in l for l in lines), \
+            f"No enrichment markers found: {summary}"
+
+    def test_truly_empty_page_stays_short(self):
+        from src.integration import _classify_content
+
+        body = "<html><body><h1>Test</h1></body></html>"
+        ct, summary, links = _classify_content("Test", body)
+        lines = [l.strip() for l in summary.split("\n") if l.strip()]
+
+        # Empty pages should remain short — no point fabricating content
+        assert len(lines) <= 2
+
+    def test_og_description_extraction(self):
+        from src.integration import _classify_content
+
+        body = (
+            "<html><head>"
+            '<meta property="og:title" content="Some Blog"/>'
+            '<meta property="og:description" content="A blog about technology and open source software." />'
+            "</head><body><h1>Blog</h1><p>Welcome.</p></body></html>"
+        )
+        ct, summary, links = _classify_content("Some Blog", body)
+
+        assert "Description:" in summary or "open source" in summary.lower(), \
+            f"OG description not extracted: {summary}"
+
+    def test_reversed_meta_description_extraction(self):
+        from src.integration import _classify_content
+
+        body = (
+            "<html><head>"
+            '<meta content="A wiki about cryptography and encryption." name=description>'
+            "</head><body><h1>Crypto Wiki</h1><p>Welcome.</p></body></html>"
+        )
+        ct, summary, links = _classify_content("Crypto Wiki", body)
+
+        assert "Description:" in summary or "cryptography" in summary.lower(), \
+            f"Reversed meta description not extracted: {summary}"
+
+    def test_fallback_body_text_for_unenrichable_page(self):
+        from src.integration import _classify_content
+
+        # Page where enrichment finds nothing but body has real content
+        body = (
+            "<html><body>"
+            "<h1>My Personal Site</h1>"
+            '<div class="nav"><a href="/">Home</a></div>'
+            "<p>This is my personal homepage hosted on the I2P network. "
+            "Feel free to browse around here.</p>"
+            "</body></html>"
+        )
+        ct, summary, links = _classify_content("Personal Site", body)
+        lines = [l.strip() for l in summary.split("\n") if l.strip()]
+
+        assert len(lines) >= 2, \
+            f"Page with content produced terse summary ({len(lines)}L): {summary}"

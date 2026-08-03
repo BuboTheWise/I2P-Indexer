@@ -1,17 +1,71 @@
 #!/usr/bin/env python3
 """I2P Indexer — discovery sweep with SUSI DNS export support.
 
-Usage examples:
-    python3 probe_sweep.py --check-health                             # Show I2P router health
-    python3 probe_sweep.py --wait-for-i2p 600 --count 50 --delay 3   # Wait for readiness + probe
-    python3 probe_sweep.py --load-address-book                        # Load addressbook + probe
-    python3 probe_sweep.py --import-export data/address_book_export.txt  # Import + sweep all
-    python3 probe_sweep.py --count 100 --delay 3                     # Probe first 100 only
-    python3 probe_sweep.py --dry-run                                  # List targets without probing
-    python3 probe_sweep.py --report sweep_report.txt                 # Generate report after sweep
+Performs HTTP probing of .i2p destinations through the local I2P proxy,
+records results in a persistent SQLite database, and supports filtering
+which targets to probe via --sweep-filter.
 
 The target queue prioritises previously reachable sites first, then valid b32
 hashes, and finally by last_probed_at (oldest probes re-probed first).
+
+--- Sweep filter modes ---
+
+  --sweep-filter all            Probe every target in the database.
+                                Use for full baseline sweeps (e.g. weekly cron).
+                                This is the default when no filter is given.
+
+  --sweep-filter reachable_only Only reprobe targets that have been reachable
+                                at least once. Ideal for daily health checks on
+                                known-live sites since it skips dead/unknown entries
+                                and completes much faster.
+
+  --sweep-filter never_probed   Probe only targets where last_probed_at == 0, i.e.,
+                                freshly imported entries that have never been touched.
+                                Use after loading a new addressbook or SUSI export so
+                                you don't waste time re-probing what you already checked.
+
+  --sweep-filter stale          Probe targets whose last probe is older than
+                                --min-age-hours (default 24h). Catches sites that
+                                may have changed or gone offline since the last sweep.
+                                Combine with --dry-run to inspect the matching set
+                                before launching a real probe.
+
+--- Usage examples ---
+
+    # Quick health check of I2P router:
+    python3 probe_sweep.py --check-health
+
+    # Wait for network readiness, then probe up to 50 targets slowly:
+    python3 probe_sweep.py --wait-for-i2p 600 --count 50 --delay 3
+
+    # Load addressbook + sweep all newly imported entries:
+    python3 probe_sweep.py --load-address-book --sweep-filter never_probed
+
+    # Import SUSI DNS export, then sweep everything in one shot:
+    python3 probe_sweep.py --import-export data/address_book_export.txt
+
+    # Daily reachable-sites check (fast — skips dead entries):
+    python3 probe_sweep.py --sweep-filter reachable_only
+
+    # Stale refresh — re-probe anything not checked in 48 hours:
+    python3 probe_sweep.py --sweep-filter stale --min-age-hours 48
+
+    # Dry run — list what would be probed without actually sending requests:
+    python3 probe_sweep.py --dry-run --sweep-filter reachable_only
+
+--- Cron job usage patterns ---
+
+  # Weekly full baseline (every Sunday 02:00):
+  0 2 * * 0 python3 probe_sweep.py --sweep-filter all --delay 8
+
+  # Daily reachable refresh (04:00, skips known-dead entries):
+  0 4 * * * python3 probe_sweep.py --sweep-filter reachable_only --delay 3
+
+  # Stale site catch-up (hourly, anything not probed in 24h):
+  0 * * * * python3 probe_sweep.py --sweep-filter stale --min-age-hours 24
+
+  # After addressbook load — first pass on new imports only:
+  python3 probe_sweep.py --load-address-book --sweep-filter never_probed
 """
 import argparse
 import json as _json
@@ -243,6 +297,18 @@ def main():
         help="Limit the sweep to this many targets (default: all)",
     )
     p.add_argument(
+        "--sweep-filter",
+        default=None,
+        choices=["reachable_only", "never_probed", "stale", "all"],
+        help="Only probe targets matching this filter (default: all)",
+    )
+    p.add_argument(
+        "--min-age-hours",
+        type=float,
+        default=24.0,
+        help='Hours threshold for "stale" sweep filter (default: 24)',
+    )
+    p.add_argument(
         "--load-address-book",
         action="store_true",
         help="Scan I2P addressbook (netdb/ or webconsole) and load into targets before sweeping",
@@ -322,7 +388,7 @@ def main():
     # ── Dry run — show what would be probed ────────────────────────
     if args.dry_run:
         db = DiscoveryDB(args.db)
-        targets = db.get_targets()
+        targets = db.get_targets(filter_mode=args.sweep_filter or "all", min_age_hours=args.min_age_hours)
         if args.count:
             targets = targets[:args.count]
         print(f"Database: {args.db}")
@@ -343,6 +409,8 @@ def main():
         db_path=args.db,
         probe_delay=args.delay,
         timeout=effective_timeout,
+        filter_mode=args.sweep_filter or "all",
+        min_age_hours=args.min_age_hours,
     )
 
     # Slice to --count if requested

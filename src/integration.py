@@ -1312,17 +1312,60 @@ class DiscoveryDB:
         self._conn.commit()
         return n
 
-    def get_targets(self) -> list[tuple[str, str]]:
+    def get_targets(
+        self,
+        filter_mode: str = "all",
+        min_age_hours: float = 24.0,
+    ) -> list[tuple[str, str]]:
         """Return the target queue as (hash_hex, dns_name) tuples.
 
-        Priorities:
+        Args:
+            filter_mode: Which targets to include.
+                - "all"          — every target in the database (default, backward compatible)
+                - "reachable_only" — only targets with at least one reachable discovery record
+                - "never_probed"   — targets where last_probed_at == 0 (first probe pass)
+                - "stale"         — targets probed more than min_age_hours ago
+            min_age_hours: Hours threshold for "stale" filter (default 24).
+
+        Priorities (within the filtered set):
         1. Previously reachable targets first (highest chance of success).
         2. Entries with valid identity hash (b32 probing capable).
         3. By last_probed_at ascending (older probes first).
         """
+        where_clauses: list[str] = []
+        params: list = []
+
+        if filter_mode == "reachable_only":
+            # Only targets that have at least one reachable discovery.
+            # Match by hash when present, otherwise by dns_name — many DNS-only
+            # targets have empty ident_hash_hex so a plain IN() join would
+            # collapse all rows into a single match on the '' bucket.
+            where_clauses.append(
+                "EXISTS ("
+                "   SELECT 1 FROM discoveries d WHERE reachable = 1 AND ("
+                "       (targets.ident_hash_hex != '' AND "
+                "        d.ident_hash_hex = targets.ident_hash_hex)"
+                "       OR (targets.ident_hash_hex = '' AND "
+                "           d.i2p_dns_name = targets.i2p_dns_name)"
+                "   )"
+                ")"
+            )
+        elif filter_mode == "never_probed":
+            # Targets never probed (or only probed at epoch 0)
+            where_clauses.append("last_probed_at <= 0")
+        elif filter_mode == "stale":
+            # Targets whose last probe is older than min_age_hours
+            cutoff = time.time() - (min_age_hours * 3600)
+            where_clauses.append("last_probed_at < ?")
+            params.append(cutoff)
+
+        where_sql = ""
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
         cur = self._conn.cursor()
-        cur.execute(
-            "SELECT ident_hash_hex, i2p_dns_name FROM targets "\
+        query = (
+            f"SELECT ident_hash_hex, i2p_dns_name FROM targets {where_sql} "\
             "ORDER BY "\
             "CASE WHEN EXISTS ("\
             "    SELECT 1 FROM discoveries d "\
@@ -1331,6 +1374,7 @@ class DiscoveryDB:
             "CASE WHEN length(ident_hash_hex)=40 THEN 0 ELSE 1 END ASC, "\
             "last_probed_at ASC"
         )
+        cur.execute(query, params)
         return [(r[0], r[1]) for r in cur.fetchall()]
 
     def upsert_targets_from_links(
@@ -1688,6 +1732,8 @@ def discover_addresses(
     probe_delay: float = 5.0,
     timeout: float = PROBE_TIMEOUT,
     limit: int | None = None,
+    filter_mode: str = "all",
+    min_age_hours: float = 24.0,
 ) -> list[DiscoveryResult]:
     """Probe destinations and record results in persistent DB.
 
@@ -1704,6 +1750,10 @@ def discover_addresses(
         probe_delay: Seconds to wait between targets (default 5s). I2P is slow;
             this prevents hammering the network with rapid-fire requests.
         timeout: Per-target probe deadline in seconds (default 120s from PROBE_TIMEOUT).
+        filter_mode: Passed through to DiscoveryDB.get_targets(). Controls which
+            targets are returned when no known_addrs/catalog are provided.
+            Options: "all" (default), "reachable_only", "never_probed", "stale".
+        min_age_hours: Hours threshold for "stale" filter_mode (default 24).
 
     Returns:
         List of DiscoveryResult objects sorted by reachability then speed.
@@ -1749,7 +1799,7 @@ def discover_addresses(
                 ("", "mail.i2pmail.org"),
             ]
             db.upsert_targets(initial)
-            targets = db.get_targets()
+            targets = db.get_targets(filter_mode=filter_mode, min_age_hours=min_age_hours)
 
         # ── Apply limit if requested ────────────────────────────────
         if limit:

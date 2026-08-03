@@ -2,11 +2,13 @@
 """I2P Indexer — discovery sweep with SUSI DNS export support.
 
 Usage examples:
-    python3 probe_sweep.py --load-address-book                     # Load addressbook + probe
+    python3 probe_sweep.py --check-health                             # Show I2P router health
+    python3 probe_sweep.py --wait-for-i2p 600 --count 50 --delay 3   # Wait for readiness + probe
+    python3 probe_sweep.py --load-address-book                        # Load addressbook + probe
     python3 probe_sweep.py --import-export data/address_book_export.txt  # Import + sweep all
-    python3 probe_sweep.py --count 100 --delay 3                    # Probe first 100 only
-    python3 probe_sweep.py --dry-run                                # List targets without probing
-    python3 probe_sweep.py --report sweep_report.txt                # Generate report after sweep
+    python3 probe_sweep.py --count 100 --delay 3                     # Probe first 100 only
+    python3 probe_sweep.py --dry-run                                  # List targets without probing
+    python3 probe_sweep.py --report sweep_report.txt                 # Generate report after sweep
 
 The target queue prioritises previously reachable sites first, then valid b32
 hashes, and finally by last_probed_at (oldest probes re-probed first).
@@ -21,11 +23,10 @@ from datetime import datetime, timezone
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ".")
 
-from src.i2p_health import check_i2p_health as _check_i2p_health
-
 logger = logging.getLogger(__name__)
 
 from src.addressbook import AddressBookCatalog
+from src.i2p_health import check_i2p_health as _check_i2p_health
 from src.integration import (
     DEFAULT_DB_PATH,
     DiscoveryDB,

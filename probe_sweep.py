@@ -13,12 +13,17 @@ hashes, and finally by last_probed_at (oldest probes re-probed first).
 """
 import argparse
 import json as _json
+import logging
 import os
 import sys
 from datetime import datetime, timezone
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ".")
+
+from src.i2p_health import check_i2p_health as _check_i2p_health
+
+logger = logging.getLogger(__name__)
 
 from src.addressbook import AddressBookCatalog
 from src.integration import (
@@ -253,7 +258,40 @@ def main():
         default=None,
         help="Generate a per-site markdown report after sweep completes",
     )
+    p.add_argument(
+        "--check-health",
+        action="store_true",
+        help="Show I2P router health and exit",
+    )
+    p.add_argument(
+        "--wait-for-i2p",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Wait up to SECONDS for I2P network readiness before sweeping (default: skip wait)",
+    )
     args = p.parse_args()
+
+    # ── Health-only mode ────────────────────────────────────────
+    if args.check_health:
+        try:
+            health = _check_i2p_health()
+            print(health.summary())
+        except ConnectionError as e:
+            print(f"I2P console unreachable: {e}")
+        return
+
+    # ── Wait for network readiness ──────────────────────────────
+    if args.wait_for_i2p is not None:
+        from src.i2p_health import wait_for_i2p_ready
+        print(f"Waiting up to {args.wait_for_i2p:.0f}s for I2P network readiness ...")
+        try:
+            health = wait_for_i2p_ready(timeout=args.wait_for_i2p)
+            print("I2P ready:")
+            print(health.summary())
+        except TimeoutError:
+            print(f"I2P not ready after {args.wait_for_i2p:.0f}s — proceeding anyway")
+            logger.warning("Sweep starting with non-ready I2P network")
 
     # Apply --probe-timeout to module-level PROBE_TIMEOUT if set
     import src.integration as integration_module

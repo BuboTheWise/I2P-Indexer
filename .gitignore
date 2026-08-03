@@ -23,3 +23,6 @@ data/
 
 # Ad-hoc scripts/tools (not part of the library)
 scripts/
+
+# Generated website output (regenerated after each sweep)
+website/

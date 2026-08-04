@@ -725,6 +725,7 @@ class DiscoveryResult:
     content_hash: str = ""     # SHA-256 of body for change detection
     last_modified: str = ""    # HTTP Last-Modified header value
     flags: list[str] | None = field(default_factory=list)     # extracted signals (robots_disallow_all, tech_stack_detected, ...)
+    needs_review: bool = False  # True when no extractor claimed or partial extract
 
 
 # ---------------------------------------------------------------------------
@@ -906,6 +907,12 @@ class DiscoveryDB:
                 col_info["flags"],
             )
 
+        if "needs_review" not in col_info:
+            cur.execute(
+                "ALTER TABLE discoveries ADD COLUMN needs_review INTEGER DEFAULT 0"
+            )
+            self._conn.commit()
+
     def _ensure_targets_columns(self) -> None:
         """Add new columns for SUSI export support."""
         cur = self._conn.cursor()
@@ -1011,6 +1018,7 @@ class DiscoveryDB:
         last_modified: str = "",
         found_links: list[str] | None = None,
         flags: list[str] | None = None,
+        needs_review: bool = False,
         error_msg: str = "",
     ) -> int:
         """Record one probe attempt. Returns the new row id."""
@@ -1023,13 +1031,13 @@ class DiscoveryDB:
                (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, reachable,
                 status_code, body_length, title, response_time, via_method,
                 content_type, content_summary, content_hash, last_modified,
-                found_links, flags, error_msg, probed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                found_links, flags, needs_review, error_msg, probed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, int(reachable),
              status_code, body_length, title, response_time, via_method,
              content_type, _truncate(content_summary, 4096), content_hash,
              last_modified, _json.dumps(found_links or []),
-             _json.dumps(flags or []), error_msg, now),
+             _json.dumps(flags or []), int(needs_review), error_msg, now),
         )
         self._conn.commit()
         row_id = cur.lastrowid
@@ -1457,6 +1465,7 @@ def probe_destination(
                 last_modified=res_b32.last_modified,
                 found_links=res_b32.found_links,
                 flags=res_b32.flags,
+                needs_review=getattr(res_b32, 'needs_review', False),
                 error_msg=res_b32.error,
             )
 
@@ -1504,6 +1513,7 @@ def probe_destination(
                     last_modified=res_dns.last_modified,
                     found_links=res_dns.found_links,
                     flags=res_dns.flags,
+                    needs_review=getattr(res_dns, 'needs_review', False),
                     error_msg=res_dns.error,
                 )
         else:
@@ -1534,6 +1544,7 @@ def probe_destination(
                     last_modified=res_dns.last_modified,
                     found_links=res_dns.found_links,
                     flags=res_dns.flags,
+                    needs_review=getattr(res_dns, 'needs_review', False),
                     error_msg=res_dns.error,
                 )
 
@@ -1621,13 +1632,22 @@ def _do_probe(
         except Exception:
             pass
 
-        c_type, c_summary, linked_sites = _classify_content(title_text, body_text)
+        # ── Extractor registry (replaces _classify_content) ─────────────
+        from src.extractors import run_extractors
+
+        resp_headers = dict(resp.headers) if hasattr(resp, 'headers') else {}
+        extractor_result = run_extractors(
+            title=title_text,
+            body_text=body_text,
+            headers=resp_headers,
+            status_code=resp.status,
+        )
 
         # Content hash for change detection
         content_hash = hashlib.sha256(resp.body).hexdigest() if resp.body else ""
 
         # Last-Modified header (change signal)
-        last_modified = resp.headers.get("Last-Modified", "") or resp.headers.get("last-modified", "")
+        last_modified = resp_headers.get("Last-Modified", "") or resp_headers.get("last-modified", "")
 
         # ── Flag extraction ────────────────────────────────────────────
         # Derive redirect depth from headers if available: i2p-projekt.i2p
@@ -1635,9 +1655,9 @@ def _do_probe(
         # but we can infer from Location header chain metadata or estimate
         # from response hop patterns. For now, use a heuristic counter based
         # on common redirects observed during probing.
-        redirect_depth = _estimate_redirect_depth(url, resp.headers)
+        redirect_depth = _estimate_redirect_depth(url, resp_headers)
 
-        flags = _extract_flags(body_text, dict(resp.headers), redirect_depth)
+        flags = _extract_flags(body_text, resp_headers, redirect_depth)
 
         result = DiscoveryResult(
             b32_addr=url.split("/")[2] if "/" in url else "",
@@ -1649,11 +1669,14 @@ def _do_probe(
             response_time_sec=elapsed,
             via_method=probe_mode,
             probe_mode=probe_mode,
-            content_type=c_type,
-            content_summary=c_summary,
-            found_links=linked_sites,
+            content_type=extractor_result.content_type,
+            content_summary=extractor_result.content_summary,
+            found_links=extractor_result.links,
             flags=flags,
         )
+
+        # Store needs_review flag on result for DB write
+        result.needs_review = extractor_result.needs_review  # type: ignore[attr-defined]
 
         # Attach extra metadata
         result.content_hash = content_hash

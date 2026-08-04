@@ -43,13 +43,14 @@ def _transform_row(row: dict[str, Any]) -> dict[str, Any]:
         "dns_name": row.get("dns_name", "") or "",
         "title": row.get("title", "") or "",
         "content_type": row.get("content_type", "") or "",
-        "content_summary": summary if summary else "Unidentified",
+        "content_summary": (summary if summary else "Unidentified").replace("\n", " "),
         "reachable": bool(row.get("reachable", False)),
         "last_probed_utc": row.get("last_probed_utc", "") or "",
         "_rt": _format_response_time(rt),
         "_size": _humanize_bytes(bl) if isinstance(bl, (int, type(None))) else "",
         "_bw": str(bw) if bw is not None and bw != "" else "",
         "found_links": found_links_raw if found_links_raw else "[]",
+        "needs_review": bool(row.get("needs_review", False)),
     }
 
 
@@ -141,6 +142,7 @@ td.unreachable{{color:#666;opacity:.55}}
     <col class="c-time">
     <col class="c-bw">
     <col class="c-probe">
+    <col class="c-review" style="width:60px;">
   </colgroup>
   <thead id="head"></thead>
   <tbody   id="body"></tbody>
@@ -151,7 +153,7 @@ td.unreachable{{color:#666;opacity:.55}}
 <div class="footer" id="footer"></div>
 
 <script>
-// --- Embedded dataset (compact) ------------------------------------------
+// --- Embedded dataset ----------------------------------------------------
 const DATA = {DATA_JSON};
 
 // --- Column definitions --------------------------------------------------
@@ -165,6 +167,7 @@ const COLS = [
   {{key:'last_probed_utc',label:'Last Probed',width:150}},
   {{key:'_bw',         label:'Bandwidth',width:70}},
   {{key:'_probe',      label:'#L',        width:30}},
+  {{key:'needs_review',label:'Review',    width:60}},
 ];
 
 /* Precomputed display columns (added by Python for small JSON) */
@@ -235,6 +238,7 @@ function render(){{
     b += `<td>${{esc(r._bw||'')}}</td>`;
     const linkCount = r.found_links && typeof r.found_links === 'string' ? JSON.parse(r.found_links+'').length : 0;
     b += `<td>${{linkCount}}</td>`;
+    b += `<td title="${{r.needs_review ? 'Needs review' : ''}}">${{r.needs_review ? '⚠' : ''}}</td>`;
     b += `</tr>`;
   }}
   document.getElementById('body').innerHTML = b;
@@ -322,17 +326,22 @@ def generate_address_book_html(db_path: str, output_dir: str) -> pathlib.Path:
     # 2. Transform into embed-friendly display rows
     payload = [_transform_row(r) for r in raw_rows]
 
-    # 3. Serialize to compact JSON (no extra whitespace — file can be 500KB+)
-    data_json = json.dumps(payload, separators=(",", ":"))
+    # 3. Serialize to JSON with newlines (browsers cannot parse ~650 KB on a
+    #     single line — V8/tokeniser silently drops the <script>).
+    data_json = json.dumps(payload, indent=2)
 
     # Timestamp for footer
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
-    # 4. Render HTML template
+    # 4. Render HTML template (data_json is indented JSON so browsers can
+    #     parse it across multiple lines — avoids single-line ~650 KB limit)
     html = (
         HTML_TEMPLATE
         .replace("{DATA_JSON}", data_json)
         .replace("{FOOTER_TIMESTAMP}", timestamp)
+        # The template uses doubled braces ({{}}) to guard against accidental
+        # f-string interpolation.  Collapse them back to single braces now.
+        .replace("{{", "{").replace("}}", "}")
     )
 
     # 5. Write to output directory

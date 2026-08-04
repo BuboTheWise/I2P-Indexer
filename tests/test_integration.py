@@ -696,6 +696,86 @@ class TestAddressBookView:
 
 
 # ---------------------------------------------------------------------------
+# TestNeedsReview — get_flagged_destinations + clear_needs_review + reprobe CLI
+# ---------------------------------------------------------------------------
+class TestNeedsReview:
+    """Tests for needs_review flag lifecycle."""
+
+    def test_get_flagged_destinations_returns_flagged(self, tmp_db):
+        db = DiscoveryDB(db_path=tmp_db)
+        db.record_discovery(
+            ident_hash_hex="A" * 40, b32_addr="a.b32.i2p", probe_mode="b32",
+            reachable=False, status_code=0, needs_review=True,
+        )
+        db.record_discovery(
+            ident_hash_hex="B" * 40, b32_addr="b.b32.i2p", probe_mode="dns",
+            reachable=True, status_code=200, content_type="blog",
+        )
+        flagged = db.get_flagged_destinations()
+        assert len(flagged) == 1
+        assert flagged[0][0] == "A" * 40
+        db.close()
+
+    def test_get_flagged_destinations_respects_limit(self, tmp_db):
+        import time as t
+        db = DiscoveryDB(db_path=tmp_db)
+        now = t.time()
+        for i in range(5):
+            h = f"{i:040x}"
+            db.record_discovery(
+                ident_hash_hex=h, b32_addr=f"{i}.b32.i2p", probe_mode="b32",
+                reachable=False, status_code=0, needs_review=True,
+            )
+        flagged = db.get_flagged_destinations(limit=2)
+        assert len(flagged) == 2
+        db.close()
+
+    def test_clear_needs_review(self, tmp_db):
+        db = DiscoveryDB(db_path=tmp_db)
+        h = "C" * 40
+        db.record_discovery(
+            ident_hash_hex=h, b32_addr="c.b32.i2p", probe_mode="b32",
+            reachable=False, status_code=0, needs_review=True,
+        )
+        n = db.clear_needs_review(h)
+        assert n == 1
+        flagged = db.get_flagged_destinations()
+        assert len(flagged) == 0
+        db.close()
+
+    def test_clear_needs_review_idempotent(self, tmp_db):
+        db = DiscoveryDB(db_path=tmp_db)
+        h = "D" * 40
+        result_count = db.clear_needs_review(h)
+        assert result_count == 0
+        result_count = db.clear_needs_review(h)
+        assert result_count == 0
+        db.close()
+
+    def test_clear_only_updates_latest_discovery(self, tmp_db):
+        db = DiscoveryDB(db_path=tmp_db)
+        h = "E" * 40
+        # First probe: flagged
+        db.record_discovery(
+            ident_hash_hex=h, b32_addr="e.b32.i2p", probe_mode="b32",
+            reachable=False, status_code=0, needs_review=True,
+        )
+        # Force older timestamp on first row
+        cur = db._conn.cursor()
+        cur.execute("UPDATE discoveries SET probed_at = probed_at - 7200 WHERE ident_hash_hex = ?", (h,))
+        # Second probe: not flagged (this becomes the latest)
+        db.record_discovery(
+            ident_hash_hex=h, b32_addr="e.b32.i2p", probe_mode="dns",
+            reachable=True, status_code=200, content_type="forum",
+        )
+        # clear targets only latest row — which already needs_review=0, so the flagged old row stays flagged
+        db.clear_needs_review(h)
+        assert cur.execute("SELECT needs_review FROM discoveries WHERE ident_hash_hex = ? ORDER BY probed_at ASC LIMIT 1", (h,)).fetchone()[0] == 1
+        # Latest is already clean
+        assert cur.execute("SELECT needs_review FROM discoveries WHERE ident_hash_hex = ? ORDER BY probed_at DESC LIMIT 1", (h,)).fetchone()[0] == 0
+        db.close()
+    
+# ---------------------------------------------------------------------------
 # TestLinkExtraction — _extract_i2p_links and upsert_targets_from_links
 # ---------------------------------------------------------------------------
 

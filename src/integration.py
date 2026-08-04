@@ -874,6 +874,50 @@ class DiscoveryDB:
         cols = [desc[0] for desc in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
+    def get_flagged_destinations(self, limit: int | None = None) -> list[tuple[str, str]]:
+        """Return destinations flagged with needs_review from the address_book view.
+
+        This is a subset of address_book filtered to only rows where the most recent
+        discovery for that destination has needs_review=1.  Returns (ident_hash_hex,
+        dns_name) tuples suitable for passing to probe_destination().
+
+        Args:
+            limit: Optional maximum number of destinations to return.
+        """
+        cur = self._conn.cursor()
+        if limit is not None and limit < 0:
+            raise ValueError(f"limit must be non-negative, got {limit}")
+        sql = "SELECT ident_hash_hex, dns_name FROM address_book WHERE needs_review = 1"
+        params: list[int | str] = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        cur.execute(sql, params)
+        return [(r[0], r[1]) for r in cur.fetchall()]
+
+    def clear_needs_review(self, ident_hash_hex: str) -> int:
+        """Clear needs_review flag on the most recent discovery for a destination.
+
+        Called after a successful reprobe — if the new extraction succeeded,
+        the previous flagged state is no longer relevant.
+
+        Args:
+            ident_hash_hex: SHA-1 hash of the destination identity.
+
+        Returns:
+            Number of rows updated (0 if nothing to clear).
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            "UPDATE discoveries SET needs_review = 0 "
+            "WHERE ident_hash_hex = ? AND probed_at = ("
+                "SELECT MAX(probed_at) FROM discoveries WHERE ident_hash_hex = ?"
+            ")",
+            (ident_hash_hex, ident_hash_hex),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     def upsert_targets(
         self,
         targets: list[tuple[str, str]],
@@ -1866,16 +1910,33 @@ def main() -> None:
         help="Output as JSON instead of pretty-printed text",
     )
 
+    # ── reprobe: re-probe flagged destinations and clear flags on success ──
+    reprobe_p = sub.add_parser("reprobe", help="Re-probe destinations flagged needs_review")
+    reprobe_p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of flagged destinations to re-probe",
+    )
+    reprobe_p.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Per-target probe timeout in seconds (default: 120)",
+    )
+
     args = p.parse_args()
 
-    if args.probe_timeout is not None:
+    if hasattr(args, "probe_timeout") and args.probe_timeout is not None:
         global PROBE_TIMEOUT
         PROBE_TIMEOUT = args.probe_timeout
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
     cfg = I2PConfig()
 
-    if args.command == "show" or args.command is None and getattr(args, "needs_review", False):
+    if args.command == "reprobe":
+        _do_reprobe(limit=args.limit, timeout=args.timeout)
+    elif args.command == "show" or args.command is None and getattr(args, "needs_review", False):
         # Address book mode (explicit 'show' or --needs-review on bare invocation)
         entries = get_address_book(needs_review_only=getattr(args, "needs_review", False))
         print_address_book(entries, json_out=getattr(args, "json", False), needs_review_only=getattr(args, "needs_review", False))
@@ -1886,6 +1947,93 @@ def main() -> None:
             known_addrs=_targets if _targets else None, config=cfg, timeout=getattr(args, "probe_timeout", None) or PROBE_TIMEOUT
         )
         print_report(results)
+
+
+def _do_reprobe(limit: int | None = None, timeout: float = 120.0) -> None:
+    """Re-probe destinations flagged with needs_review and clear the flag on success.
+
+    Iterates over all destinations currently flagged in the address_book view,
+    probes them via b32+DNS (if available), runs extraction again, and clears
+    the needs_review flag when a successful content_type extraction is obtained.
+
+    Args:
+        limit: Max number of flagged destinations to attempt (None = all).
+        timeout: Per-target probe timeout in seconds.
+    """
+    db = DiscoveryDB(DEFAULT_DB_PATH)
+    try:
+        flagged = db.get_flagged_destinations(limit=limit)
+
+        if not flagged:
+            print("\n  No destinations currently flagged for review.")
+            return
+
+        n_total = len(flagged)
+        print(f"\n  Reprobe queue: {n_total} flagged destination(s)")
+        print(f"  Timeout per target: {timeout}s")
+        print("-" * 48)
+
+        n_ok = 0
+        n_fail = 0
+        n_cleared = 0
+
+        seen_hashes: set[str] = set()
+
+        for idx, (hash_hex, dns_name) in enumerate(flagged, 1):
+            # Deduplicate by hash if we see the same destination multiple times
+            if hash_hex and hash_hex in seen_hashes:
+                continue
+            if hash_hex:
+                seen_hashes.add(hash_hex)
+
+            label = f"[{idx}/{n_total}]"
+            target_label = hash_hex[:12] + "..." if hash_hex else dns_name
+
+            print(f"\n  {label} Probing: {target_label}")
+
+            try:
+                result = probe_destination(
+                    ident_hash_hex=hash_hex if hash_hex else "",
+                    i2p_dns_name=dns_name or "",
+                    db=db,
+                    timeout=timeout,
+                )
+            except Exception as e:
+                print(f"    ERROR: {e}")
+                n_fail += 1
+                continue
+
+            reachable = result.reachable if hasattr(result, "reachable") else False
+            content_type = getattr(result, "content_type", "") or ""
+            title = getattr(result, "title", "") or ""
+
+            status_str = "OK" if reachable else "DOWN"
+            info_parts = [f"status={status_str}"]
+            if content_type:
+                info_parts.append(f"type={content_type}")
+            if title:
+                info_parts.append(f'title="{title[:40]}"')
+            print(f"    {' '.join(info_parts)}")
+
+            if reachable and content_type:
+                # Successful extraction — clear the flag
+                cleared = db.clear_needs_review(hash_hex) if hash_hex else 0
+                if cleared:
+                    n_cleared += 1
+                    print(f"    Flag cleared (content_type extracted successfully)")
+                n_ok += 1
+            elif reachable and not content_type:
+                # Still can't extract — leave flag in place
+                n_ok += 1
+            else:
+                n_fail += 1
+
+        print(f"\n{'='*48}")
+        print(f"  Reprobe complete: {n_ok} ok, {n_fail} failed, "
+              f"{n_cleared} dest(s) unflagged")
+        print(f"{'='*48}\n")
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":

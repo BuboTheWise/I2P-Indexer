@@ -28,4 +28,10 @@ scripts/
 website/
 
 # Auto-generated extractor plugins (runtime artifacts; copy reusable ones to src/ manually)
-src/ext_plugins/
+# The built-in HtmlExtractor is versioned and tracked
+src/ext_plugins/*.py
+!src/ext_plugins/html_extractor.py
+!src/ext_plugins/__init__.py
+
+# UV lock file
+uv.lock

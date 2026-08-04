@@ -94,3 +94,30 @@ class DestinationEntry:
     routers_known: int = 0     # how many .rtr files found
     leasesets_known: int = 0   # how many .ls64 files found
     last_updated: datetime | None = None
+
+
+@dataclass
+class DiscoveryResult:
+    """Structure returned by _do_probe() describing one probe attempt."""
+    b32_addr: str = ''
+    ident_hash_hex: str = ''
+    reachable: bool = False
+    status_code: int = 0
+    body_length: int = 0
+    title: str = ''
+    response_time_sec: float = 0.0
+    via_method: str = 'b32'       # b32 | dns | b32+dns
+    error: str = ''
+    probe_mode: str = 'b32'       # which mode produced this result
+    # Extractor output — always populated even when no extractor claims
+    content_type: str = ''
+    content_summary: Optional[str] = None   # can be None when unreachable
+    found_links: list = field(default_factory=list)
+    # Flagging heuristics (robots, tech stack, contact, forum, redirect)
+    flags: list = field(default_factory=list)
+    # needs_review — set True by extractor framework when no extractor matched
+    needs_review: bool = False
+    reason: str = ''            # reason string for needs_review (e.g. "no_extractor_claimed")
+    # Content fingerprinting
+    content_hash: str = ''     # SHA-256 of page body (empty when unreachable)
+    last_modified: str = ''    # Last-Modified header value, if present

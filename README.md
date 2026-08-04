@@ -9,6 +9,7 @@ The I2P Indexer probes `.i2p` destinations via HTTP proxy or SOCKS5, records rea
 Key capabilities:
 - **Hash-first probing**: attempts direct `*.b32.i2p` requests that bypass SU3/SUSI DNS resolution layers entirely
 - **Dual-mode discovery**: falls back to `.i2p` DNS names and reports which path succeeded
+- **Plugin-based content extraction**: modular extractors in `src/ext_plugins/` auto-loaded at startup; analyzer tool generates new extractors for unclassified sites
 - **Persistent SQLite store**: survival across runs; supports post-hoc analysis via LLM/manual tagging
 - **Addressbook parsing**: reads `.rtr` and `.ls64` binary files from the I2P `netdb/` directory
 
@@ -135,6 +136,79 @@ Every successful fetch classifies the page into a content bucket and generates a
 | chat room | IRC, messaging |
 | search engine | find, index, discover |
 
+### Modular Extractor System
+
+The indexer uses a **plugin-based content extraction system** so new site types can be handled without modifying core code. When the sweeper probes a destination, it feeds the response through an ordered registry of extractors — each extractor declares what content types it handles and produces structured results (bucket label, summary lines, linked `.i2p` sites).
+
+- **Built-in extractor**: Standard HTML pages are classified via tag stripping, meta extraction, keyword-based bucket detection (forum, wiki, blog, marketplace, etc.), and title enrichment.
+- **Plugin extractors**: Custom `.py` modules in `src/ext_plugins/` — auto-loaded on startup with zero configuration. Drop a file, next sweep uses it.
+- **Priority ordering**: Extractors run from lowest to highest priority number (default 100). Built-in system extractors use lower priorities so they always win for standard content types.
+
+**Adding a new extractor manually:**
+
+```python
+# src/ext_plugins/my_custom_extractor.py
+from src.extractors import BaseExtractor, _register
+
+@_register
+class MyCustomExtractor(BaseExtractor):
+    priority = 80
+
+    def can_handle(self, body_text, headers, status_code):
+        return '<custom-tag>' in body_text
+
+    def extract(self, title, body_text, headers):
+        # parse body → return (content_type_bucket, summary_lines, i2p_links)
+        import re
+        summaries = re.findall(r'<summary>(.+?)</summary>', body_text)
+        links = re.findall(r'href="([^"]+\.i2p)"', body_text)
+        return ("custom", summaries[:5], list(set(links)))
+```
+
+When no extractor claims a response, the destination is flagged `needs_review` in the database — ready for the analyzer (below).
+
+### Analyzer — The Feedback Loop
+
+The **analyzer** (`analyzer.py`) closes the extraction gap by inspecting destinations that existing extractors could not classify properly:
+
+1. The sweeper flags a destination as `needs_review=True` when no extractor matches or the result is low quality.
+2. You run `python analyzer.py --inspect <ident_hash>` to probe deeply (full body dump, structural analysis, LLM-assisted classification).
+3. The analyzer generates a new extractor `.py` module tailored to that site's DOM patterns and writes it into `src/ext_plugins/`.
+4. On the next sweep, the new extractor is auto-loaded — no config edits, no daemon restart.
+
+```bash
+# Inspect a flagged destination by its identity hash
+python analyzer.py --inspect A3B2C1D0E5F4...
+
+# List all destinations needing review
+python analyzer.py --list-reviews
+
+# Auto-generate an extractor for the top N unclassified sites
+python analyzer.py --auto-generate --top 5
+```
+
+This creates a self-healing cycle: sweep finds gaps → analyzer inspects and generates extractors → next sweep covers more ground.
+
+### Website / Eepsite Export
+
+Export the address book as static files for hosting on your I2P proxy:
+
+```bash
+python3 probe_sweep.py export
+
+# Custom output location and database
+python3 probe_sweep.py export --output-dir /var/www/eepsite --db-path indexer.db
+```
+
+This produces two files in the output directory:
+
+| File | Purpose |
+|---|---|
+| `address_book.html` | Self-contained HTML page with a dark-themed sortable grid, filtering, and pagination. Embeds all address book rows as JSON — suitable for browsing on any static server or I2P eepsite hosting. Typical size 300–600 KB depending on dataset. |
+| `address_book_hosts.txt` | Plain text host list in `dns=*.b32.i2p` format (matching the SUSI DNS export/hosts format). Each reachable entry gets a comment line with status and probe timestamp. Useful as input for other I2P tools or router imports. Typical size 100–300 KB. |
+
+The `website/` directory is in `.gitignore` — generated files are never version controlled.
+
 ## Project layout
 
 ```
@@ -144,6 +218,10 @@ src/                    ← core library
   config.py             ← I2PConfig: proxy endpoints and ports
   i2p_proxy.py          ← ProxyClient + SAM Client + fetch_i2p() helper
   integration.py        ← probe loop, SQLite store, content classification
+  extractors.py         ← BaseExtractor interface, registry, plugin discovery, orchestrator
+  ext_plugins/          ← auto-discovered extractor modules (gitignored)
+  export_website.py     ← HTML grid + TXT host-list generators for eepsite export
+analyzer.py             ← feedback-loop CLI: inspects flagged destinations, generates extractors
 tests/                  ← unit + integration tests (100+ cases)
 docs/                   ← architecture, schema reference, design decisions
 scripts/                ← ad-hoc scripts (not version controlled)

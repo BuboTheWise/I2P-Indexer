@@ -53,6 +53,9 @@ hashes, and finally by last_probed_at (oldest probes re-probed first).
     # Dry run — list what would be probed without actually sending requests:
     python3 probe_sweep.py --dry-run --sweep-filter reachable_only
 
+    # Export address book as website files:
+    python3 probe_sweep.py export --output-dir website
+
 --- Cron job usage patterns ---
 
   # Weekly full baseline (every Sunday 02:00):
@@ -78,6 +81,11 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ".")
 
 logger = logging.getLogger(__name__)
+
+from src.export_website import (
+    generate_address_book_html,
+    generate_address_book_txt,
+)
 
 from src.addressbook import AddressBookCatalog
 from src.i2p_health import check_i2p_health as _check_i2p_health
@@ -262,7 +270,38 @@ def generate_report(db_path: str, output_path: str) -> None:
 
 
 def main():
-    p = argparse.ArgumentParser(description="I2P Indexer — target discovery sweep")
+    p = argparse.ArgumentParser(
+        description="I2P Indexer — target discovery sweep",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Subcommands:\n"
+            "  export    Generate website files (HTML + TXT) from the address book\n\n"
+            "Examples:\n"
+            "  python3 probe_sweep.py --sweep-filter reachable_only\n"
+            "  python3 probe_sweep.py export --output-dir website\n"
+        ),
+    )
+
+    # ── Subcommands ────────────────────────────────────────────────
+    subparsers = p.add_subparsers(dest="subcommand")
+
+    # -- export: generate address book website files --
+    export_parser = subparsers.add_parser(
+        "export",
+        help="Generate HTML and TXT address book files for I2P eepsite hosting",
+    )
+    export_parser.add_argument(
+        "--output-dir",
+        default="website",
+        help="Directory to write the exported files (default: website)",
+    )
+    export_parser.add_argument(
+        "--db-path",
+        default=None,
+        help=f"Path to SQLite database (default: {DEFAULT_DB_PATH})",
+    )
+
+    # ── Global arguments (flat — apply to sweep when no subcommand) --
     p.add_argument(
         "--db",
         default=DEFAULT_DB_PATH,
@@ -338,6 +377,24 @@ def main():
         help="Wait up to SECONDS for I2P network readiness before sweeping (default: skip wait)",
     )
     args = p.parse_args()
+
+    # ── Export subcommand ─────────────────────────────────────────
+    if args.subcommand == "export":
+        db_path = args.db_path or DEFAULT_DB_PATH
+        output_dir = args.output_dir
+        print(f"Exporting address book from {db_path} -> {output_dir}/")
+        try:
+            html_path = generate_address_book_html(db_path, output_dir)
+            txt_path = generate_address_book_txt(db_path, output_dir)
+            html_size = html_path.stat().st_size
+            txt_size = txt_path.stat().st_size
+            print(f"  HTML: {html_path} ({html_size:,} bytes)")
+            print(f"  TXT:  {txt_path} ({txt_size:,} bytes)")
+            print("Export complete.")
+        except Exception as e:
+            print(f"Export failed: {e}")
+            sys.exit(1)
+        return
 
     # ── Health-only mode ────────────────────────────────────────
     if args.check_health:

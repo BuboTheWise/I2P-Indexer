@@ -141,435 +141,30 @@ def _extract_i2p_links(body_text: str) -> list[str]:
     return list({h.strip().lower() for h in _I2P_LINK_RE.findall(body_text[:32768])})
 
 
-# Replacement for _classify_content in src/integration.py
-# Lines 146-330 will be replaced with this content.
+# _classify_content replaced by extractor registry (src/extractors.py)
+# The HtmlExtractor in ext_plugins/html_extractor.py holds the full logic.
 
 def _classify_content(
     title: str,
     body_text: str,
 ) -> tuple[str, str, list[str]]:
-    """Classify page content and build a rich English-language summary.
+    """Thin wrapper around run_extractors for backward compatibility.
 
-    Detects content type (forum, blog, marketplace, etc.), extracts context-
-    specific metadata, translates non-English excerpts to English via
-    googletrans, and appends a source-language note when translation occurs.
+    Tests and legacy code call this directly; it delegates to the
+    extractor registry which runs HtmlExtractor (plus any other
+    registered extractors).
     """
-    import html as _html
-    import re as _re
+    from src.extractors import run_extractors
 
-    # --- Language detection + translation helper (lazy, with timeout) ---
-    try:
-        import langid as _langid
-        from deep_translator import GoogleTranslator as _GTrans  # type: ignore[import-untyped]
-        _translator = _GTrans(source="auto", target="en")
-        _has_lt = True
-    except ImportError:
-        _has_lt = False
-
-    # Cache per-classification call to avoid repeated lookups
-    _lang_cache: dict[int, str | None] = {}  # id(body) -> detected lang
-    _trans_cache: dict[tuple[int, str], tuple[str, str | None]] = {}
-
-    def _detect_lang(text: str) -> str | None:
-        """Detect language of text, cached per body."""
-        did = id(text)
-        if did in _lang_cache:
-            return _lang_cache[did]
-        try:
-            lang, _score = _langid.classify(" ".join(text.split())[:500])  # type: ignore[unbound]
-            _lang_cache[did] = lang if lang != "en" else None
-            return _lang_cache[did]
-        except Exception:
-            _lang_cache[did] = None
-            return None
-
-    def _translate(text: str) -> tuple[str, str | None]:
-        """Translate non-English text to English with 3s timeout. Returns (result, lang) or (text, None) on failure."""
-        stripped = " ".join(text.split()).strip()[:400]
-        if not stripped or len(stripped) < 5 or not _has_lt:
-            return stripped, None
-
-        cache_key = (len(text), text)
-        if cache_key in _trans_cache:
-            return _trans_cache[cache_key]
-
-        lang = _detect_lang(text)
-        if lang is None:
-            result = (stripped, None)
-            _trans_cache[cache_key] = result
-            return result
-
-        # Use threading timeout instead of SIGALRM (which leaks across the process)
-        import threading as _threading
-
-        _out: list[str | Exception] = []
-
-        def _do_translate() -> None:
-            try:
-                out = _translator.translate(stripped[:300])  # type: ignore[unbound]
-                _out.append(str(out) if out else "")
-            except Exception as exc:
-                _out.append(exc)
-
-        _t = _threading.Thread(target=_do_translate, daemon=True)
-        _t.start()
-        _t.join(timeout=3.0)
-
-        if _t.is_alive():
-            result = (stripped, lang)  # timed out
-        elif _out and isinstance(_out[0], Exception):
-            result = (stripped, None)
-        else:
-            result = (str(_out[0]).strip() if _out else stripped, lang)
-
-        _trans_cache[cache_key] = result
-        return result
-
-    lower_title = title.lower()
-    lower_body = body_text[:32768].lower()
-
-    plain = _TAG_RE.sub(" ", body_text[:32764])
-    words_text = " ".join(plain.split()).strip()
-
-    meta_desc_m = _re.search(
-        r'<meta[^>]+name=["\']?description["\']?\s+content=["\']([^"\']+)["\'"]',
-        body_text[:16384],
-        _re.IGNORECASE,
+    # Default headers — most _classify_content callers pass raw HTML bodies
+    # without real HTTP metadata. Signal text/html so HtmlExtractor can handle.
+    result = run_extractors(
+        title=title,
+        body_text=body_text,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+        status_code=200,
     )
-
-    # Fallback: reversed attribute order (content before name)
-    if not meta_desc_m:
-        meta_desc_m = _re.search(
-            r'<meta[^>]+content=["\']([^"\']+)["\'"]\s+name=["\']?description["\']?',
-            body_text[:16384],
-            _re.IGNORECASE,
-        )
-
-    # Fallback: og:description (Open Graph) — very common on modern sites
-    if not meta_desc_m:
-        meta_desc_m = _re.search(
-            r'<meta[^>]+property=["\']?og:description["\']?\s+content=["\']([^"\']+)["\'"]',
-            body_text[:16384],
-            _re.IGNORECASE,
-        )
-
-    # Bucket detection
-    type_keywords: list[tuple[str, list[str]]] = [
-        ("forum", ["forum", "board", "thread", "post", "topic"]),
-        ("wiki", ["wiki", "knowledge base", "mediawiki"]),
-        ("blog", ["blog", "diary", "journal", "entries"]),
-        ("file archive", ["mirror", "files", "download", "archive", "repository"]),
-        ("marketplace", ["market", "store", "shop", "buy", "sell"]),
-        ("news site", ["news", "headlines", "updates", "press"]),
-        ("mail server", ["mail", "email", "postfix", "smtp"]),
-        ("chat room", ["chat", "irc", "messaging"]),
-        ("search engine", ["search", "find", "index", "discover"]),
-    ]
-    content_type = ""
-    for bucket, keywords in type_keywords:
-        if any(kw in lower_title or kw in lower_body for kw in keywords):
-            content_type = bucket
-            break
-
-    # Tech stack detection
-    tech_signatures: dict[str, list[str]] = {
-        "Node.js": ["npm", "node_modules", "express"],
-        "Ruby on Rails": ["csrf-token", "media_types/"],
-        "PHP": ["<?php"],
-        "Python/Django": ["django-", "csrftoken"],
-        "Go": ["go_session", "gorouter"],
-    }
-    tech_stack: list[str] = []
-    for tn, pats in tech_signatures.items():
-        if any(_re.search(p, lower_body) for p in pats):
-            tech_stack.append(tn)
-
-    spa_framework: str | None = None
-    framework_sigs: dict[str, list[str]] = {
-        "React": [r'react[-_]?app', r'__react_events__', r'data-reactroot'],
-        "Angular": [r'ng-app', r'ng-version', r'angular\.js'],
-        "Vue.js": [r'vue\.js', r'data-v-'],
-    }
-    for fw, pats in framework_sigs.items():
-        if any(_re.search(p, lower_body) for p in pats):
-            spa_framework = fw
-            break
-
-    linked_sites: list[str] = _extract_i2p_links(body_text[:32768])
-
-    # Build rich summary
-    lines: list[str] = []
-
-    def _add(line: str) -> None:
-        if line.strip():
-            lines.append(line.strip())
-
-    decoded_title = _html.unescape(title).strip() if title else ""
-    meta_desc_text = ""
-    if meta_desc_m:
-        meta_desc_text = meta_desc_m.group(1).strip()
-
-    # --- Translate title and description ---
-    translated_title = decoded_title
-    title_lang = None
-    if decoded_title and len(decoded_title) > 3:
-        translated_title, title_lang = _translate(decoded_title)
-
-    translated_desc = meta_desc_text
-    desc_lang = None
-    if meta_desc_text and len(meta_desc_text) > 10:
-        translated_desc, desc_lang = _translate(meta_desc_text)
-
-    # Preamble
-    type_label = content_type.title() if content_type else "Unidentified"
-    if translated_title:
-        _add(f"\u00ab{type_label}\u00bb \u00ab{translated_title}\u00bb")
-        if title_lang:
-            _add(f"(Translated from {title_lang})")
-    elif translated_desc:
-        _add(f"\u00ab{type_label}\u00bb {translated_desc[:250]}")
-        if desc_lang:
-            _add(f"(Translated from {desc_lang})")
-    else:
-        _add(type_label)
-
-    if translated_desc and len(translated_desc) > 10:
-        _add(f"Description: {translated_desc[:250]}")
-
-    # Content excerpt from paragraphs — extract multiple for depth
-    para_re = _re.compile(r'<p\b[^>]*>(.*?)</p>', _re.IGNORECASE | _re.DOTALL)
-    paras = [_TAG_RE.sub(" ", m).strip() for m in para_re.findall(body_text[:32768])]
-    excerpts_added = 0
-    excerpt_langs: set[str] = set()
-    for p in paras:
-        if excerpts_added >= 2:
-            break
-        cleaned = " ".join(p.split())
-        if 40 < len(cleaned) < 350:
-            tl_words = set(lower_title.split())
-            overlap = sum(1 for w in tl_words if w in cleaned.lower().split() and len(w) > 3)
-            if overlap / max(len(tl_words), 1) < 0.5:
-                trans_text, p_lang = _translate(cleaned)
-                _add(f"Content excerpt: \u201c{trans_text[:300]}\u201d")
-                if p_lang:
-                    excerpt_langs.add(p_lang)
-                excerpts_added += 1
-
-    # Add heading text (h1-h3) for more context
-    heading_re = _re.compile(r'<h[1-3]\b[^>]*>(.*?)</h[1-3]>', _re.IGNORECASE | _re.DOTALL)
-    headings = [_TAG_RE.sub(" ", m).strip() for m in heading_re.findall(body_text[:16384])]
-    headings_added = 0
-    skip_heading_words = {"home", "menu", "nav", "navigation", "sidebar", "footer"}
-    for h in headings:
-        if headings_added >= 3:
-            break
-        hl = h.lower().split()[0] if h.split() else ""
-        if len(h) > 5 and len(h) < 200 and hl not in skip_heading_words:
-            trans_h, h_lang = _translate(h)
-            _add(f"Section: {trans_h.strip()}")
-            if h_lang:
-                excerpt_langs.add(h_lang)
-            headings_added += 1
-
-    # --- Marketplace enrichment ---
-    if content_type == "marketplace":
-        cat_terms = [
-            "drugs", "services", "digital goods", "hardware", "software",
-            "electronics", "clothing", "food", "health", "documents",
-            "accounts", "coupons", "gift cards", "prepaid", "privacy",
-            "vpn", "proxy", "tor", "i2p", "crypto", "mining",
-        ]
-        cats = [c for c in cat_terms if _re.search(r'\b' + _re.escape(c) + r'\b', lower_body[:8000])]
-        if cats:
-            _add(f"Categories sold: {', '.join(cats)}")
-
-        price_mentions = len(_re.findall(
-            r'(?:\d{1,4}(?:,\d{3})*\.\d{2}|\d+)\s*(?:sat\b|sats?\b|bitcoin|btc|monepcoin|bitcoins?|xmr|monero|usd|eur|gbp)',
-            words_text[:4000], _re.IGNORECASE,
-        ))
-        if price_mentions:
-            _add(f"Pricing signals found ({price_mentions} mentions)")
-
-        vendors = _re.findall(r'(?:seller|vendor|merchant|shop)\s*#?(\d+)', lower_body[:8000])
-        if vendors:
-            _add(f"Referenced vendors: at least {len(set(vendors))} unique")
-
-        # Product listing detection
-        li_rows = len(_re.findall(r'<(?:tr|li)[^>]*>', body_text[:32768], _re.IGNORECASE))
-        if li_rows > 10:
-            _add(f"Page has ~{li_rows} table/list rows (product listing layout)")
-
-    # --- Forum enrichment ---
-    elif content_type == "forum":
-        stats_parts: list[str] = []
-        cnt_matches = _re.findall(
-            r'(\d[\d,]*)\s*(posts?|messages?|threads?|topics?|members?|users?)',
-            words_text[:4000], _re.IGNORECASE,
-        )
-        seen: set[str] = set()
-        for val, unit in cnt_matches:
-            u = unit.lower()[:4]
-            if u not in seen:
-                stats_parts.append(f"{val} {u}")
-                seen.add(u)
-        if stats_parts:
-            _add(f"Stats: {', '.join(stats_parts[:6])}")
-
-        fsw = {
-            "phpBB": [r'phpbb'],
-            "vBulletin": [r'vbulletin', r'veraction'],
-            "Flarum": ["flarum"],
-            "Discourse": ["discourse"],
-            "SMF": ["simplemachines", "smf"],
-        }
-        for sw, sigs in fsw.items():
-            if any(si in lower_body for si in sigs):
-                _add(f"Forum software: {sw}")
-                break
-
-        # Recent topic/thread titles from links
-        a_tags = _re.findall(
-            r'<a[^>]*>(.*?)</a>', body_text[:16384], _re.IGNORECASE | _re.DOTALL,
-        )
-        skip_words = {"home", "login", "register", "sign in", "search", "admin",
-                      "profile", "settings", "logout", "terms"}
-        topics: list[str] = []
-        for t in a_tags:
-            c = _TAG_RE.sub(" ", " ".join(t.split())).strip()
-            if 10 < len(c) < 120 and c.lower().split()[0] not in skip_words:
-                topics.append(c)
-        topics = list(dict.fromkeys(topics))[:5]
-        if topics:
-            # Translate non-English topic titles
-            trans_topics = []
-            topic_langs: set[str] = set()
-            for tp in topics:
-                trans_tp, tp_lang = _translate(tp)
-                trans_topics.append(trans_tp)
-                if tp_lang:
-                    topic_langs.add(tp_lang)
-            _add(f"Topic threads seen: {'; '.join(trans_topics)}")
-            if topic_langs:
-                excerpt_langs |= topic_langs
-
-    # --- Blog enrichment ---
-    elif content_type == "blog":
-        if any(s in lower_body for s in ["rss", "atom.xml", "<?xml", "<feed"]):
-            _add("RSS/Atom feed detected (updateable content)")
-
-        blog_eng = {
-            "Ghost": [r'ghost-'],
-            "WordPress": [r'wp-content/', r'wordpress'],
-            "Jekyll": [r'jekyll', r'jekyll-feed'],
-            "Hugo": ["hugo"],
-        }
-        for eng, pats in blog_eng.items():
-            if any(_re.search(p, lower_body) for p in pats):
-                _add(f"Powered by: {eng}")
-                break
-
-        # Extract blog post titles from article/headings
-        a_tags = _re.findall(
-            r'<a[^>]*>(.*?)</a>', body_text[:16384], _re.IGNORECASE | _re.DOTALL,
-        )
-        skip_words = {"home", "login", "register", "sign in", "search", "admin",
-                      "profile", "settings", "logout", "terms", "archive"}
-        posts: list[str] = []
-        for t in a_tags:
-            c = _TAG_RE.sub(" ", " ".join(t.split())).strip()
-            if 10 < len(c) < 150 and c.lower().split()[0] not in skip_words:
-                posts.append(c)
-        posts = list(dict.fromkeys(posts))[:5]
-        if posts:
-            # Translate post titles
-            trans_posts = []
-            for p in posts:
-                trans_p, _ = _translate(p)
-                trans_posts.append(trans_p)
-            _add(f"Recent posts: {'; '.join(trans_posts)}")
-
-    # --- File archive enrichment ---
-    elif content_type == "file archive":
-        if any(s in lower_body for s in ["index of /", "parent directory"]):
-            _add("Apache/Nginx auto-generated directory listing")
-
-        # Filter to known file extensions only (avoid random words)
-        KNOWN_EXTS = {
-            "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "tgz", "txz",
-            "pdf", "doc", "docx", "odt", "txt", "rtf", "epub", "cbz", "cbr",
-            "mp3", "flac", "ogg", "wav", "aac", "wma", "opus", "m4a",
-            "mp4", "mkv", "avi", "wmv", "mov", "webm", "flv",
-            "iso", "img", "dmg", "vdi", "vhdx",
-            "exe", "msi", "deb", "rpm",
-            "torrent", "nzb",
-            "csv", "xls", "xlsx",
-            "ppt", "pptx",
-            "apk", "ipa",
-            "html", "php", "js", "py", "c", "h", "java", "go", "rs",
-        }
-        exts = list(dict.fromkeys(
-            e for e in _re.findall(r'\.([a-z]{2,6})\b', lower_body[:16384])
-            if e in KNOWN_EXTS
-        ))[:10]
-        if exts:
-            _add(f"File types present: {', '.join(exts)}")
-
-    # --- Search engine enrichment ---
-    elif content_type == "search engine":
-        result_count = _re.search(r'(\d[\d,]*)\s*(?:results?|pages? indexed)', words_text[:2000], _re.IGNORECASE)
-        if result_count:
-            _add(f"Catalog: ~{result_count.group(1)} indexed results/pages")
-
-        # Blockchain explorer detection
-        if any(k in lower_body for k in ["blockchain", "block height", "txid", "transaction hash"]):
-            coins = []
-            coin_sigs: dict[str, list[str]] = {
-                "Bitcoin": ["bitcoin", "btc"],
-                "Monero": ["monero", "xmr"],
-                "Ethereum": ["ethereum", "eth"],
-            }
-            for coin, sigs in coin_sigs.items():
-                if any(s in lower_body for s in sigs):
-                    coins.append(coin)
-            if coins:
-                _add(f"Blockchain explorer for: {', '.join(coins)}")
-
-        # Generic search form detection
-        if any(s in lower_body for s in ['<form', 'name="q"', 'name="query"', 'name="search"']):
-            _add("Has search form (content indexing)")
-
-    # Common footer info
-    if tech_stack:
-        _add(f"Tech stack: {', '.join(tech_stack)}")
-    elif spa_framework:
-        _add(f"SPA framework: {spa_framework}")
-
-    n_links = len(linked_sites)
-    if n_links:
-        _add(f"Found {n_links} linked i2p site(s)")
-
-    # ── Fallback: if summary has almost nothing, grab first body text block ──
-    # This prevents terse one-line summaries for pages where no enrichment fired.
-    if len(lines) <= 1 and words_text:
-        first_block = " ".join(words_text.split()[:50])
-        if len(first_block) > 20:
-            trans_fallback, fb_lang = _translate(first_block)
-            _add(f"Body text: \"{trans_fallback[:300]}\"")
-            if fb_lang and fb_lang != "en":
-                excerpt_langs.add(fb_lang)
-
-    # Re-add language note after fallback (it may have added new langs)
-    all_langs = set()
-    if title_lang:
-        all_langs.add(title_lang)
-    if desc_lang:
-        all_langs.add(desc_lang)
-    all_langs |= excerpt_langs
-    all_langs -= {"en"}
-    if all_langs and not title_lang and not desc_lang:
-        _add(f"(Content translated from: {', '.join(sorted(all_langs))})")
-
-    return content_type, "\n".join(lines), linked_sites
+    return result.content_type, result.content_summary, result.links
 
 # ---------------------------------------------------------------------------
 # Flag extraction heuristics
@@ -709,8 +304,8 @@ def _extract_flags(
 class DiscoveryResult:
     """Result of probing a single destination."""
 
-    b32_addr: str
-    ident_hash_hex: str
+    b32_addr: str = ""
+    ident_hash_hex: str = ""
     reachable: bool = False
     status_code: int = 0
     body_length: int = 0
@@ -721,11 +316,12 @@ class DiscoveryResult:
     error: str = ""
     content_type: str = ""     # short bucket label (e.g. "forum", "news site")
     content_summary: str = ""  # sentence-length description of page content
-    found_links: list[str] | None = field(default_factory=list)
+    found_links: list[str] = field(default_factory=list)
     content_hash: str = ""     # SHA-256 of body for change detection
     last_modified: str = ""    # HTTP Last-Modified header value
-    flags: list[str] | None = field(default_factory=list)     # extracted signals (robots_disallow_all, tech_stack_detected, ...)
+    flags: list[str] = field(default_factory=list)     # extracted signals (robots_disallow_all, tech_stack_detected, ...)
     needs_review: bool = False  # True when no extractor claimed or partial extract
+    reason: str = ""  # reason string for needs_review (e.g. "no_extractor_claimed")
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +342,7 @@ class DiscoveryDB:
         self._ensure_discovery_columns()
         self._ensure_targets_columns()
         self._ensure_susi_sync_table()
+        self._ensure_address_book_view()
 
     # ── schema ────────────────────────────────────────────────────────
 
@@ -844,6 +441,8 @@ class DiscoveryDB:
                 ab.content_hash,
                 ab.last_modified,
                 ab.found_links,
+                ab.flags,
+                ab.needs_review,
                 r.bandwidth_kbps,
                 r.caps    AS router_caps,
                 ls.num_leases
@@ -864,6 +463,8 @@ class DiscoveryDB:
                     content_hash,
                     last_modified,
                     found_links,
+                    flags,
+                    needs_review,
                     ROW_NUMBER() OVER (
                         PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
                         ORDER BY probed_at DESC
@@ -941,6 +542,148 @@ class DiscoveryDB:
                 value     TEXT DEFAULT '',
                 updated_at REAL DEFAULT 0
             )"""
+        )
+        self._conn.commit()
+
+    def _recreate_address_book_view(self, cur: sqlite3.Cursor) -> None:
+        """DROP then CREATE the address_book view with the current schema."""
+        cur.executescript(
+            """
+            DROP VIEW IF EXISTS address_book;
+            CREATE VIEW address_book AS
+            SELECT
+                ab.dns_name,
+                ab.content_type,
+                ab.reachable,
+                datetime(ab.last_probed_at, 'unixepoch') AS last_probed_utc,
+                ab.content_summary,
+                ab.ident_hash_hex,
+                ab.b32_addr,
+                ab.status_code,
+                ab.body_length,
+                ab.title,
+                ab.response_time_sec,
+                ab.via_method,
+                ab.last_probed_at,
+                ab.content_hash,
+                ab.last_modified,
+                ab.found_links,
+                ab.flags,
+                ab.needs_review,
+                r.bandwidth_kbps,
+                r.caps    AS router_caps,
+                ls.num_leases
+            FROM (
+                SELECT
+                    ident_hash_hex,
+                    b32_addr,
+                    CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END AS dns_name,
+                    reachable,
+                    status_code,
+                    body_length,
+                    title,
+                    response_time   AS response_time_sec,
+                    via_method,
+                    content_type,
+                    content_summary,
+                    probed_at       AS last_probed_at,
+                    content_hash,
+                    last_modified,
+                    found_links,
+                    flags,
+                    needs_review,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
+                        ORDER BY probed_at DESC
+                    ) AS rn
+                FROM discoveries
+            ) ab
+            LEFT JOIN routers   r  ON r.ident_hash_hex = ab.ident_hash_hex
+            LEFT JOIN leasesets ls ON ls.ident_hash_hex = ab.ident_hash_hex
+            WHERE ab.rn = 1
+            ORDER BY ab.last_probed_at DESC;
+            """
+        )
+        self._conn.commit()
+
+    def _ensure_address_book_view(self) -> None:
+        """Migrate the address_book view if it is missing flags/needs_review columns.
+
+        Only drops and recreates when the existing view schema is stale, so that
+        every DiscoveryDB instantiation is cheap on an up-to-date database.
+        """
+        cur = self._conn.cursor()
+        # Pull the current column names from sqlite_master via pragma
+        try:
+            cur.execute(
+                "SELECT sql FROM sqlite_master WHERE type='view' AND name='address_book'"
+            )
+            row = cur.fetchone()
+        except Exception:
+            row = None
+
+        if row and row[0]:
+            # If the current view already mentions flags and needs_review, no migration needed
+            if "flags" in row[0] and "needs_review" in row[0]:
+                return
+
+        logger.info("Updating address_book view to include flags / needs_review columns")
+        cur.executescript(
+            """
+            DROP VIEW IF EXISTS address_book;
+            CREATE VIEW address_book AS
+            SELECT
+                ab.dns_name,
+                ab.content_type,
+                ab.reachable,
+                datetime(ab.last_probed_at, 'unixepoch') AS last_probed_utc,
+                ab.content_summary,
+                ab.ident_hash_hex,
+                ab.b32_addr,
+                ab.status_code,
+                ab.body_length,
+                ab.title,
+                ab.response_time_sec,
+                ab.via_method,
+                ab.last_probed_at,
+                ab.content_hash,
+                ab.last_modified,
+                ab.found_links,
+                ab.flags,
+                ab.needs_review,
+                r.bandwidth_kbps,
+                r.caps    AS router_caps,
+                ls.num_leases
+            FROM (
+                SELECT
+                    ident_hash_hex,
+                    b32_addr,
+                    CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END AS dns_name,
+                    reachable,
+                    status_code,
+                    body_length,
+                    title,
+                    response_time   AS response_time_sec,
+                    via_method,
+                    content_type,
+                    content_summary,
+                    probed_at       AS last_probed_at,
+                    content_hash,
+                    last_modified,
+                    found_links,
+                    flags,
+                    needs_review,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
+                        ORDER BY probed_at DESC
+                    ) AS rn
+                FROM discoveries
+            ) ab
+            LEFT JOIN routers   r  ON r.ident_hash_hex = ab.ident_hash_hex
+            LEFT JOIN leasesets ls ON ls.ident_hash_hex = ab.ident_hash_hex
+            WHERE ab.rn = 1
+            ORDER BY ab.last_probed_at DESC;
+            """
         )
         self._conn.commit()
 
@@ -1659,6 +1402,11 @@ def _do_probe(
 
         flags = _extract_flags(body_text, resp_headers, redirect_depth)
 
+        # Append needs_review reason as a structured flag so it appears in
+        # address_book and can be queried / filtered from the CLI.
+        if extractor_result.needs_review:
+            flags.append(f"needs_review: {extractor_result.reason}")
+
         result = DiscoveryResult(
             b32_addr=url.split("/")[2] if "/" in url else "",
             ident_hash_hex=ident_hash_hex,
@@ -1673,14 +1421,11 @@ def _do_probe(
             content_summary=extractor_result.content_summary,
             found_links=extractor_result.links,
             flags=flags,
+            needs_review=extractor_result.needs_review,
+            reason=extractor_result.reason,
+            content_hash=content_hash,
+            last_modified=last_modified,
         )
-
-        # Store needs_review flag on result for DB write
-        result.needs_review = extractor_result.needs_review  # type: ignore[attr-defined]
-
-        # Attach extra metadata
-        result.content_hash = content_hash
-        result.last_modified = last_modified
 
         logger.info(
             "  [%s] %s  status=%d  body=%dB  %.1fs%s",
@@ -1935,33 +1680,54 @@ def query_db(hash_hex: str = "", dns_name: str = "", db_path: str = DEFAULT_DB_P
     return results
 
 
-def get_address_book(db_path: str = DEFAULT_DB_PATH, limit: int | None = None) -> list[dict]:
-    """Return the address_book view — one row per destination with the most
+def get_address_book(
+    db_path: str = DEFAULT_DB_PATH,
+    limit: int | None = None,
+    needs_review_only: bool = False,
+) -> list[dict]:
+    """Return the address_book view -- one row per destination with the most
     recent probe, joined against router and leaseset metadata.
 
     Args:
         db_path: Path to the SQLite database.
         limit: Optional maximum number of rows to return.
+        needs_review_only: If True, only return entries flagged for review.
 
     Columns returned:
         dns_name, content_type, reachable, last_probed_utc, content_summary,
         ident_hash_hex, b32_addr, status_code, body_length, title, response_time_sec,
-        via_method, last_probed_at, bandwidth_kbps, router_caps, num_leases
+        via_method, last_probed_at, bandwidth_kbps, router_caps, num_leases,
+        flags, needs_review
     """
     with _db_lock:
         db = DiscoveryDB(db_path)
         rows = db.address_book(limit=limit)
         db.close()
+
+    if needs_review_only:
+        rows = [r for r in rows if r.get("needs_review")]
+
     return rows
 
 
-def print_address_book(entries: list[dict], json_out: bool = False):
+def print_address_book(
+    entries: list[dict],
+    json_out: bool = False,
+    needs_review_only: bool = False,
+):
     """Pretty-print or return structured address book data.
 
     When ``json_out=False`` (default), prints to stdout for terminal consumption.
-    When ``json_out=True``, returns the entries list plus summary counts — suitable
+    When ``json_out=True``, returns the entries list plus summary counts -- suitable
     for CSV export, programmatic pipelines, or loading in another script.
+
+    Args:
+        entries: Rows from address_book view.
+        json_out: Return structured JSON-serializable dict instead of printing.
+        needs_review_only: Filter to only destinations flagged needs_review.
     """
+    if needs_review_only:
+        entries = [r for r in entries if r.get("needs_review")]
     if json_out:
         reachable = sum(1 for e in entries if e.get("reachable"))
         return {
@@ -2049,6 +1815,18 @@ def print_address_book(entries: list[dict], json_out: bool = False):
             extras.append(f"modified:{lmod_display}")
         if flinks_display:
             extras.append(flinks_display)
+
+        # Append flags if present (needs_review shows up automatically)
+        flags_raw = e.get("flags", "") or ""
+        try:
+            flags_list = _json.loads(flags_raw) if isinstance(flags_raw, str) else []
+            if not isinstance(flags_list, list):
+                flags_list = []
+        except (_json.JSONDecodeError, TypeError):
+            flags_list = []
+        if flags_list:
+            extras.append(f"flags({','.join(flags_list)})")
+
         if extras:
             line += "  " + " ".join(extras)
 
@@ -2061,15 +1839,33 @@ def main() -> None:
     """CLI entry point for discovery."""
     import sys
     import argparse
-    
+
     p = argparse.ArgumentParser(description="I2P Indexer — destination discovery")
-    p.add_argument(
+    sub = p.add_subparsers(dest="command")
+
+    # ── sweep (default: probe targets) ────────────────────────────────
+    sweep_p = sub.add_parser("sweep", help="Probe I2P destinations")
+    sweep_p.add_argument(
         "--probe-timeout",
         type=float,
         default=None,
         help="Per-target probe timeout in seconds (default: 120)",
     )
-    p.add_argument("targets", nargs="*", help=".i2p hostnames or SHA-1 hashes to probe")
+    sweep_p.add_argument("targets", nargs="*", help=".i2p hostnames or SHA-1 hashes to probe")
+
+    # ── show -- print the address book ────────────────────────────────
+    show_p = sub.add_parser("show", help="Show address book entries")
+    show_p.add_argument(
+        "--needs-review",
+        action="store_true",
+        help="Show only destinations flagged for review (no extractor match or low-quality extract)",
+    )
+    show_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Output as JSON instead of pretty-printed text",
+    )
+
     args = p.parse_args()
 
     if args.probe_timeout is not None:
@@ -2079,14 +1875,17 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
     cfg = I2PConfig()
 
-    targets: list[str | tuple[str, str]] = []
-    if args.targets:
-        targets = args.targets
-
-    results = discover_addresses(
-        known_addrs=targets or None, config=cfg, timeout=args.probe_timeout or PROBE_TIMEOUT
-    )
-    print_report(results)
+    if args.command == "show" or args.command is None and getattr(args, "needs_review", False):
+        # Address book mode (explicit 'show' or --needs-review on bare invocation)
+        entries = get_address_book(needs_review_only=getattr(args, "needs_review", False))
+        print_address_book(entries, json_out=getattr(args, "json", False), needs_review_only=getattr(args, "needs_review", False))
+    else:
+        # Default sweep mode — probe targets
+        _targets = getattr(args, "targets", [])
+        results = discover_addresses(
+            known_addrs=_targets if _targets else None, config=cfg, timeout=getattr(args, "probe_timeout", None) or PROBE_TIMEOUT
+        )
+        print_report(results)
 
 
 if __name__ == "__main__":

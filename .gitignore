@@ -26,3 +26,6 @@ scripts/
 
 # Generated website output (regenerated after each sweep)
 website/
+
+# Auto-generated extractor plugins (runtime artifacts; copy reusable ones to src/ manually)
+src/ext_plugins/

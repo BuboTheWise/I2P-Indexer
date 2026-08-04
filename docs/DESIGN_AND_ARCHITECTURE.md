@@ -97,3 +97,190 @@ Proxy endpoints are centralized in `I2PConfig` (`src/config.py`). Defaults match
 | `webconsole_host` / `webconsole_port` | 127.0.0.1 : 7657 | Java web console (reference only; CSRF-protected, not scrapable) |
 
 All credentials (tokens, tunnel keys, passwords) must be parameterized and never committed to version control.
+
+## Website Export Pipeline
+
+The `export` subcommand transforms probe results into static files suitable for hosting as an I2P eepsite — browseable without any server-side runtime.
+
+### Workflow
+
+```
+probe_sweep.py export
+  │
+  ├─► get_address_book(db_path)          ← reads address_book SQL view
+  │                                     ← one row per identity, latest probe only
+  │
+  ├─► generate_address_book_html()       → website/address_book.html
+  │   · transforms rows (humanize bytes, format times)
+  │   · embeds dataset as JSON inside HTML template
+  │   · single file: dark theme, sortable grid, filter, pagination
+  │
+  └─► generate_address_book_txt()        → website/address_book_hosts.txt
+      · sorts by dns_name
+      · hosts.txt format: dns=*.b32.i2p per entry
+      · comment lines with [OK]/[DOWN] status + probe timestamp
+```
+
+### Design rationale
+
+| Choice | Reason |
+|---|---|
+| Single self-contained HTML file | No external dependencies — works offline, on any static server, and trivially hostable as an I2P eepsite. Embedded JSON keeps the dataset in-memory for instant filtering/sorting. |
+| Dark theme, fixed-width grid | I2P browsing is often done in low-bandwidth environments; minimal CSS reduces download size. Fixed column widths prevent layout shift during sort/filter operations. |
+| TXT matches hosts.txt format | The `dns=address` line format matches what SUSI DNS export produces, making the file compatible with existing I2P tooling for router imports and address reconciliation. |
+| Generated output never committed | `website/` is in `.gitignore`. Re-generating after each sweep ensures files reflect the latest probe state without stale data in version control. |
+
+### SQL view → HTML columns mapping
+
+The `address_book` view (defined in `src/integration.py`, line ~828) provides these columns to the HTML grid:
+
+| View column | HTML grid column | Transform |
+|---|---|---|
+| `reachable` | Status | `OK` / `DOWN` with color coding |
+| `content_type` | Type | raw value (e.g. `forum`, `blog`) |
+| `dns_name` | Site | raw DNS or b32 fallback |
+| `title` | Title | extracted page title, ellipsis overflow |
+| `response_time_sec` | Resp T | formatted as `X.Xs` (empty when null) |
+| `body_length` | Size | humanized bytes (`B`, `KB`, `MB`) |
+| `last_probed_utc` | Last Probed | ISO datetime string |
+| `routers.bandwidth_kbps` | Bandwidth | raw value from routers table join |
+| `found_links` | #L | JSON array length (link count) |
+
+### Size considerations
+
+For the current dataset (~1500 destinations):
+
+- **HTML**: ~300–600 KB depending on dataset size and summary text lengths. The embedded JSON payload is the main contributor.
+- **TXT**: ~100–300 KB, roughly 2 lines per entry (comment + data).
+
+These sizes are acceptable for I2P eepsite hosting — most users access these files locally over the tunnel, not over high-latency links. For datasets above 5000 entries, consider adding server-side pagination or splitting by `content_type`.
+
+## Content Extraction Plugin System
+
+### Why
+
+I2P sites serve content through any Technology stack — forums on custom PHP frameworks, wikis with non-standard templates, static generators, binary APIs, JSON responders, raw text mirrors. A monolithic classifier that tries every detection heuristic in one giant function cannot adapt quickly to new site types. By the time someone writes a keyword rule for a new platform, three more variants appear behind closed tunnels.
+
+The plugin system solves this by making content extraction **open-ended and self-healing**: new extractors are Python modules dropped into `src/ext_plugins/`. The sweeper auto-loads them on startup with zero configuration. When the analyzer inspects a poorly-understood destination, it generates a custom extractor tailored to that site's quirks — next sweep picks it up automatically.
+
+### Architecture Diagram
+
+```
+┌──────────────┐     ┌─────────────────────┐     ┌─────────────────┐
+│    Sweeper   │────►│  Extractor Registry  │────►│   Database      │
+│ (integr.)    │     │  run_extractors()   │     │ DiscoveryDB.    │
+└──────┬───────┘     └──────────┬──────────┘     └────────┬────────┘
+       │                         │                          │
+       │   ┌──────────────────────┤  (if no match / low quality)
+       │   │                     ▼
+       │   │             ┌─────────────┐
+       │   │             │ needs_review│────────────► Flag in DB
+       │   │             └──────┬──────┘
+       │   │                    │
+       │   │              ┌─────▼──────┐
+       │   │              │ Analyzer   │  ← CLI: inspects flagged destinations
+       │   │              │ (NEW)      │
+       │   │              └─────┬──────┘
+       │   │                    │  generates custom extractor .py
+       │   │                    ▼
+       │   │             ┌──────────────────┐
+       │   └────────────►│ src/ext_plugins/ │  ← gitignored directory,
+       │                 │ (auto-discovered) │    each .py = one extractor
+       │                 └──────────────────┘
+       │                         ▲ auto-loaded on next sweep start
+       └─────────────────────────┘
+```
+
+### BaseExtractor Interface
+
+Every content extractor inherits from `BaseExtractor` in `src/extractors.py`:
+
+| Attribute / Method | Signature | Purpose |
+|---|---|---|
+| `priority` | `int = 100` | Lower = runs first. Built-in extractors override this to precede discovered plugins. |
+| `can_handle(body, headers, status)` | `-> bool` | Inspect the raw response body text, HTTP headers, and status code. Return `True` only if this extractor knows how to process this content type. |
+| `extract(title, body, headers)` | `-> (str, list[str], list[str])` | Produce a triple: `(content_type_bucket, summary_lines, linked_i2p_sites)`. If the extractor handles the response but yields little useful text, return a minimal `summary_lines` — the orchestrator detects partial extracts and sets `needs_review=True`. |
+
+Minimal example skeleton:
+
+```python
+from src.extractors import BaseExtractor
+
+class MyForumExtractor(BaseExtractor):
+    priority = 90  # before default plugins, after built-in HTML
+
+    def can_handle(self, body_text, headers, status_code):
+        return '<div class="custom-forum-header">' in body_text
+
+    def extract(self, title, body_text, headers):
+        import re
+        posts = [t.strip() for t in re.findall(r'<h3>(.+?)</h3>', body_text) if t.strip()]
+        links = [m.group(1) for m in re.finditer(r'href="([^.]+\.i2p)"', body_text)]
+        return ("forum", posts[:8], list(set(links)))
+```
+
+### Registry and Plugin Discovery
+
+- **Registration**: The `_register` decorator (applied automatically — no manual step needed at the class level) appends an instance to the module-level `_registry`, sorted by `(priority, class_name)`.
+- **Discovery**: `discover_plugins()` in `src/extractors.py` runs on import. It scans `src/ext_plugins/*.py`, skips files starting with `_`, then `importlib.import_module()` each candidate so that any `_register` calls inside fire immediately.
+- **Ordering**: The orchestrator iterates the registry from lowest to highest priority. The first extractor whose `can_handle()` returns `True` wins — later extractors are not consulted for that response.
+- **Priority convention**:
+
+| Range | Who uses it |
+|---|---|
+| 0–49 | Built-in system extractors (HTML, plain text, known formats) |
+| 50–99 | Statically authored extractors shipped with the repo |
+| 100 | Default plugin priority (auto-generated or hand-written drop-ins) |
+| 101+ | Fallback / catch-all patterns |
+
+### Orchestrator (`run_extractors`)
+
+The `run_extractors()` function in `src/extractors.py` is the entry point that replaces `_classify_content()` in the sweeper. It:
+
+1. Iterates `_registry` from highest priority (lowest number) downward.
+2. On the first `can_handle() → True`, calls `extract()` and validates the result.
+3. Detects **partial extracts**: if body has >200 chars of text but the extractor returns <=1 summary line, it sets `needs_review=True` with reason `"partial_extract_only"`.
+4. On any `no_extractor` scenario (nothing claimed), returns `ExtractorResult(needs_review=True, reason="no_extractor_claimed")`.
+5. All extraction errors are caught per-extractor — a broken plugin never crashes the sweep.
+
+### Component Responsibilities
+
+| Component | File | Role |
+|---|---|---|
+| **Sweeper** | `src/integration.py` | Probes `.i2p` targets via HTTP proxy, collects response body + headers + status code, feeds them to `run_extractors()`. Records `ExtractorResult`, marks `needs_review` flags in SQLite. |
+| **HtmlExtractor** (built-in) | `src/extractors.py` (or soon separate module) | Handles standard HTML pages: tag stripping, `<meta>` extraction, title enrichment, keyword-based bucket detection. Serves as the default "good enough" path. Priority < 100. |
+| **Plugin extractors** | `src/ext_plugins/*.py` | Extractors generated by the analyzer or hand-written for specific sites. Zero config needed — drop a file, next sweep loads it. |
+| **Analyzer** (NEW) | `analyzer.py` | CLI tool that inspects flagged destinations (`needs_review=True`). Performs a deeper probe with richer headers, body inspection, and LLM-assisted analysis to understand the site's structure. Outputs a new `.py` module into `src/ext_plugins/`. |
+
+### The Feedback Loop
+
+The plugin system creates an adaptive cycle:
+
+```
+Sweep probes → Extractors classify → Gaps detected (needs_review flag)
+       ↑                                              │
+       │                                              ▼
+Next sweep auto-loads ─── Analyzer inspects & generates new extractors ──┘
+```
+
+1. The sweeper encounters a destination where no existing extractor claims the response, or an extractor produces only a partial result.
+2. The row is flagged `needs_review=True` in the database with a reason code.
+3. The user runs `analyzer.py --inspect <hash>` to probe the site more deeply (extra headers, full body dump, structural analysis).
+4. The analyzer generates a Python module tailored to that site's DOM patterns or API response format and writes it into `src/ext_plugins/`.
+5. On the next sweep, `discover_plugins()` picks up the new file automatically. No config edits, no restart of the daemon — the extractor is live in the registry.
+
+### File Structure
+
+```
+src/
+  extractors.py            ← BaseExtractor interface, registry, discover_plugins(),
+                             run_extractors() orchestrator
+  ext_plugins/             ← gitignored; auto-generated + hand-written extractor modules
+                              (each *.py registers one or more BaseExtractor subclasses)
+  integration.py           ← sweeper core: probe loop, fetch_i2p, _classify_content
+                             (current keyword-based pass; gradually replaced by run_extractors())
+analyzer.py                ← NEW: feedback-loop CLI tool; inspects flagged destinations,
+                             generates new extractor modules into src/ext_plugins/
+```
+
+The `ext_plugins/` directory is in `.gitignore` — extractors generated for a specific network snapshot are considered runtime artifacts. If you discover a reusable pattern, copy the module into the main repo alongside a test case so it ships with upstream releases.

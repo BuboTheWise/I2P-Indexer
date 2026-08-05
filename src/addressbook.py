@@ -38,7 +38,7 @@ class AddressBookCatalog:
         self._leasesets: dict[str, LeaseSetInfo] = {}
 
         # SQLite backing store
-        self._conn = sqlite3.connect(db_path)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._init_db()
 
     def _init_db(self) -> None:

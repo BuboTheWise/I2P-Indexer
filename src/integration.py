@@ -23,6 +23,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any as TypingAny
 
 import socks  # required by SOCKS5 proxy path
 
@@ -336,13 +337,25 @@ class DiscoveryDB:
 
     def __init__(self, db_path: str = DEFAULT_DB_PATH) -> None:
         self._path = db_path
-        self._conn = sqlite3.connect(db_path)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # Let concurrent processes wait up to 5s for write locks instead of
+        # raising OperationalError immediately (multi-process safety under WAL).
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._lock = threading.Lock()
         self._init_db()
         self._ensure_discovery_columns()
         self._ensure_targets_columns()
         self._ensure_susi_sync_table()
         self._ensure_address_book_view()
+
+    # ── context manager (P4 — prevent connection leaks) ────
+
+    def __enter__(self) -> "DiscoveryDB":
+        return self
+
+    def __exit__(self, exc_type: TypingAny, exc_val: TypingAny, exc_tb: TypingAny) -> None:
+        self.close()
 
     # ── schema ────────────────────────────────────────────────────────
 
@@ -701,25 +714,27 @@ class DiscoveryDB:
         i2p_dns_name: str = "",
         source: str = "probe",
     ) -> None:
-        cur = self._conn.cursor()
-        now = datetime.now(timezone.utc).timestamp()
-        cur.execute(
-            """INSERT INTO routers (ident_hash_hex, key_type, version, bandwidth_kbps,
-                                   options_mask, caps, published, file_size, i2p_dns_name, source, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(ident_hash_hex) DO UPDATE SET
-                   key_type=excluded.key_type,
-                   version=excluded.version,
-                   bandwidth_kbps=excluded.bandwidth_kbps,
-                   options_mask=excluded.options_mask,
-                   caps=excluded.caps,
-                   published=excluded.published,
-                   file_size=excluded.file_size,
-                   i2p_dns_name=COALESCE(NULLIF(excluded.i2p_dns_name, ''), i2p_dns_name),
-                   updated_at=excluded.updated_at""",
+        with self._lock:
+            cur = self._conn.cursor()
+            now = datetime.now(timezone.utc).timestamp()
+            cur.execute(
+                """INSERT INTO routers (ident_hash_hex, key_type, version, bandwidth_kbps,
+                                       options_mask, caps, published, file_size, i2p_dns_name, source, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(ident_hash_hex) DO UPDATE SET
+                       key_type=excluded.key_type,
+                       version=excluded.version,
+                       bandwidth_kbps=excluded.bandwidth_kbps,
+                       options_mask=excluded.options_mask,
+                       caps=excluded.caps,
+                       published=excluded.published,
+                       file_size=excluded.file_size,
+                       i2p_dns_name=COALESCE(NULLIF(excluded.i2p_dns_name, ''), i2p_dns_name),
+                       updated_at=excluded.updated_at""",
             (ident_hash_hex, key_type, version, bandwidth_kbps, 0,
              caps, int(published), file_size, i2p_dns_name, source, now),
-        )
+            )
+            self._conn.commit()
 
     def record_lease_set(
         self,
@@ -729,19 +744,21 @@ class DiscoveryDB:
         i2p_dns_name: str = "",
         source: str = "probe",
     ) -> None:
-        cur = self._conn.cursor()
-        now = datetime.now(timezone.utc).timestamp()
-        cur.execute(
-            """INSERT INTO leasesets (ident_hash_hex, store_type, num_leases,
-                                     i2p_dns_name, source, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(ident_hash_hex) DO UPDATE SET
-                   store_type=excluded.store_type,
-                   num_leases=excluded.num_leases,
-                   i2p_dns_name=COALESCE(NULLIF(excluded.i2p_dns_name, ''), i2p_dns_name),
-                   updated_at=excluded.updated_at""",
-            (ident_hash_hex, store_type, num_leases, i2p_dns_name, source, now),
-        )
+        with self._lock:
+            cur = self._conn.cursor()
+            now = datetime.now(timezone.utc).timestamp()
+            cur.execute(
+                """INSERT INTO leasesets (ident_hash_hex, store_type, num_leases,
+                                         i2p_dns_name, source, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(ident_hash_hex) DO UPDATE SET
+                       store_type=excluded.store_type,
+                       num_leases=excluded.num_leases,
+                       i2p_dns_name=COALESCE(NULLIF(excluded.i2p_dns_name, ''), i2p_dns_name),
+                       updated_at=excluded.updated_at""",
+                (ident_hash_hex, store_type, num_leases, i2p_dns_name, source, now),
+            )
+            self._conn.commit()
 
     def record_discovery(
         self,
@@ -765,26 +782,27 @@ class DiscoveryDB:
         error_msg: str = "",
     ) -> int:
         """Record one probe attempt. Returns the new row id."""
-        cur = self._conn.cursor()
-        now = datetime.now(timezone.utc).timestamp()
-        import json as _json
+        with self._lock:
+            cur = self._conn.cursor()
+            now = datetime.now(timezone.utc).timestamp()
+            import json as _json
 
-        cur.execute(
-            """INSERT INTO discoveries
-               (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, reachable,
-                status_code, body_length, title, response_time, via_method,
-                content_type, content_summary, content_hash, last_modified,
-                found_links, flags, needs_review, error_msg, probed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, int(reachable),
-             status_code, body_length, title, response_time, via_method,
-             content_type, _truncate(content_summary, 4096), content_hash,
-             last_modified, _json.dumps(found_links or []),
-             _json.dumps(flags or []), int(needs_review), error_msg, now),
-        )
-        self._conn.commit()
-        row_id = cur.lastrowid
-        return int(row_id) if row_id is not None else 0
+            cur.execute(
+                """INSERT INTO discoveries
+                   (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, reachable,
+                    status_code, body_length, title, response_time, via_method,
+                    content_type, content_summary, content_hash, last_modified,
+                    found_links, flags, needs_review, error_msg, probed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, int(reachable),
+                 status_code, body_length, title, response_time, via_method,
+                 content_type, _truncate(content_summary, 4096), content_hash,
+                 last_modified, _json.dumps(found_links or []),
+                 _json.dumps(flags or []), int(needs_review), error_msg, now),
+            )
+            self._conn.commit()
+            row_id = cur.lastrowid
+            return int(row_id) if row_id is not None else 0
 
     # ── queries ───────────────────────────────────────────────────────
 
@@ -907,15 +925,16 @@ class DiscoveryDB:
         Returns:
             Number of rows updated (0 if nothing to clear).
         """
-        cur = self._conn.cursor()
-        cur.execute(
-            "UPDATE discoveries SET needs_review = 0 "
-            "WHERE ident_hash_hex = ? AND probed_at = ("
-                "SELECT MAX(probed_at) FROM discoveries WHERE ident_hash_hex = ?"
-            ")",
-            (ident_hash_hex, ident_hash_hex),
-        )
-        self._conn.commit()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE discoveries SET needs_review = 0 "
+                "WHERE ident_hash_hex = ? AND probed_at = ("
+                    "SELECT MAX(probed_at) FROM discoveries WHERE ident_hash_hex = ?"
+                ")",
+                (ident_hash_hex, ident_hash_hex),
+            )
+            self._conn.commit()
         return cur.rowcount
 
     def upsert_targets(
@@ -930,27 +949,26 @@ class DiscoveryDB:
             source: Origin label — 'manual', 'addressbook', 'linked', or
                 'susi_export:...'.  Defaults to 'manual' for backward compatibility.
         """
-        cur = self._conn.cursor()
-        now = datetime.now(timezone.utc).timestamp()
-        n = 0
-        for h, d in targets:
-            b32 = _hex_to_b32_addr(h) if len(h) == 40 else ""
-            cur.execute(
-                "INSERT OR IGNORE INTO targets "
-                "(ident_hash_hex, b32_addr, i2p_dns_name, source) VALUES (?, ?, ?, ?)",
-                (h, b32, d or "", source),
-            )
-            # If source is addressbook, bump the timestamp on existing rows
-            # so fresh sweeps keep them "alive" for reconciliation.
-            if source == "addressbook":
+        with self._lock:
+            cur = self._conn.cursor()
+            now = datetime.now(timezone.utc).timestamp()
+            n = 0
+            for h, d in targets:
+                b32 = _hex_to_b32_addr(h) if len(h) == 40 else ""
                 cur.execute(
-                    "UPDATE targets SET last_updated_at = ? "
-                    "WHERE ident_hash_hex = ? AND source = 'addressbook'",
-                    (now, h),
+                    "INSERT OR IGNORE INTO targets "
+                    "(ident_hash_hex, b32_addr, i2p_dns_name, source) VALUES (?, ?, ?, ?)",
+                    (h, b32, d or "", source),
                 )
-            n += 1
-        self._conn.commit()
-        return n
+                if source == "addressbook":
+                    cur.execute(
+                        "UPDATE targets SET last_updated_at = ? "
+                        "WHERE ident_hash_hex = ? AND source = 'addressbook'",
+                        (now, h),
+                    )
+                n += 1
+            self._conn.commit()
+            return n
 
     def load_addressbook(self, catalog: AddressBookCatalog) -> int:
         """Load all destinations from an AddressBookCatalog into the targets table.
@@ -988,51 +1006,53 @@ class DiscoveryDB:
         Returns:
             {'new': N, 'updated': M, 'marked_stale': K} summary dict.
         """
-        cur = self._conn.cursor()
-        now = datetime.now(timezone.utc).timestamp()
-
-        # Build set of all hashes currently in the catalog
+        # Build set of all hashes currently in the catalog (no lock needed)
         current_hashes: set[str] = set()
         for de in catalog.all_destinations():
             current_hashes.add(de.ident_hash_hex.upper())
 
-        # Refresh timestamps on addressbook targets that are still present
-        updated = 0
-        for hx in current_hashes:
-            cur.execute(
-                "UPDATE targets SET last_updated_at = ? "
-                "WHERE ident_hash_hex = ? AND source = 'addressbook'",
-                (now, hx),
+        with self._lock:
+            cur = self._conn.cursor()
+            now = datetime.now(timezone.utc).timestamp()
+
+            # Refresh timestamps on addressbook targets that are still present
+            updated = 0
+            for hx in current_hashes:
+                cur.execute(
+                    "UPDATE targets SET last_updated_at = ? "
+                    "WHERE ident_hash_hex = ? AND source = 'addressbook'",
+                    (now, hx),
+                )
+                updated += cur.rowcount
+
+            # Mark addressbook targets not in current catalog as stale
+            stale_hashes = tuple(
+                row[0] for row in cur.execute(
+                    "SELECT DISTINCT ident_hash_hex FROM targets WHERE source = 'addressbook'"
+                ).fetchall()
+                if row[0].upper() not in current_hashes
             )
-            updated += cur.rowcount
 
-        # Mark addressbook targets not in current catalog as stale
-        stale_hashes = tuple(
-            row[0] for row in cur.execute(
-                "SELECT DISTINCT ident_hash_hex FROM targets WHERE source = 'addressbook'"
-            ).fetchall()
-            if row[0].upper() not in current_hashes
-        )
+            marked_stale = 0
+            for hx in stale_hashes:
+                cur.execute(
+                    "UPDATE targets SET source = 'addressbook:stale' "
+                    "WHERE ident_hash_hex = ? AND source = 'addressbook'",
+                    (hx,),
+                )
+                marked_stale += cur.rowcount
 
-        marked_stale = 0
-        for hx in stale_hashes:
-            cur.execute(
-                "UPDATE targets SET source = 'addressbook:stale' "
-                "WHERE ident_hash_hex = ? AND source = 'addressbook'",
-                (hx,),
+            # Count newly inserted addressbook rows
+            new_count = sum(
+                1 for row in cur.execute(
+                    "SELECT first_seen_at FROM targets WHERE source = 'addressbook'"
+                ).fetchall()
+                if row[0] == 0  # never actually set by us; just a proxy indicator
+                # Actually count rows updated in this session — use the updated_at change
             )
-            marked_stale += cur.rowcount
 
-        # Count newly inserted addressbook rows
-        new_count = sum(
-            1 for row in cur.execute(
-                "SELECT first_seen_at FROM targets WHERE source = 'addressbook'"
-            ).fetchall()
-            if row[0] == 0  # never actually set by us; just a proxy indicator
-            # Actually count rows updated in this session — use the updated_at change
-        )
+            self._conn.commit()
 
-        self._conn.commit()
         return {"updated": updated, "marked_stale": marked_stale}
 
     def upsert_susi_entries(
@@ -1049,62 +1069,64 @@ class DiscoveryDB:
         Each dict has keys: i2p_dns_name, ident_hash_hex, b32_raw, dest_data_len.
         Returns count of rows inserted or updated.
         """
-        cur = self._conn.cursor()
-        now = datetime.now(timezone.utc).timestamp()
-        n = 0
+        with self._lock:
+            cur = self._conn.cursor()
+            now = datetime.now(timezone.utc).timestamp()
+            n = 0
 
-        # Get current generation counter (monotonic)
-        gen_row = cur.execute(
-            "SELECT MAX(value) FROM susi_sync WHERE key='generation'"
-        ).fetchone()
-        if gen_row and gen_row[0]:
-            generation = int(gen_row[0]) + 1
-        else:
-            generation = 1
-
-        # Mark all susi_export rows as inactive (not in this generation)
-        cur.execute(
-            "UPDATE targets SET susi_active = 0, last_updated_at = ? "
-            "WHERE source LIKE 'susi_export:%'",
-            (now,),
-        )
-
-        for e in entries:
-            dns = e.get("i2p_dns_name", "")
-            h = e.get("ident_hash_hex", "").upper()
-            b32 = e.get("b32_raw", "")
-            if not dns:
-                continue
-
-            # Check existing rows with this DNS name AND hash combo
-            cur.execute(
-                "SELECT id FROM targets WHERE ident_hash_hex = ? AND i2p_dns_name = ?",
-                (h, dns),
-            )
-            row = cur.fetchone()
-            src = f"susi_export:{source_book}"
-            if row:
-                # Exists — reactivate and update
-                cur.execute(
-                    "UPDATE targets SET susi_active = ?, b32_addr = ?, source = ? "
-                    ", last_updated_at = ? WHERE id = ?",
-                    (generation, b32, src, now, row[0]),
-                )
+            # Get current generation counter (monotonic)
+            gen_row = cur.execute(
+                "SELECT MAX(value) FROM susi_sync WHERE key='generation'"
+            ).fetchone()
+            if gen_row and gen_row[0]:
+                generation = int(gen_row[0]) + 1
             else:
-                # New entry or hash rotation — insert fresh
-                cur.execute(
-                    "INSERT INTO targets (ident_hash_hex, b32_addr, i2p_dns_name, source, susi_active) VALUES (?, ?, ?, ?, ?)",
-                    (h, b32, dns, src, generation),
-                )
-            n += 1
+                generation = 1
 
-        # Record this generation in sync table
-        cur.execute(
-            "INSERT OR REPLACE INTO susi_sync (key, value, updated_at) "
-            "VALUES ('generation', ?, ?)",
-            (str(generation), now),
-        )
-        self._conn.commit()
+            # Mark all susi_export rows as inactive (not in this generation)
+            cur.execute(
+                "UPDATE targets SET susi_active = 0, last_updated_at = ? "
+                "WHERE source LIKE 'susi_export:%'",
+                (now,),
+            )
+
+            for e in entries:
+                dns = e.get("i2p_dns_name", "")
+                h = e.get("ident_hash_hex", "").upper()
+                b32 = e.get("b32_raw", "")
+                if not dns:
+                    continue
+
+                # Check existing rows with this DNS name AND hash combo
+                cur.execute(
+                    "SELECT id FROM targets WHERE ident_hash_hex = ? AND i2p_dns_name = ?",
+                    (h, dns),
+                )
+                row = cur.fetchone()
+                src = f"susi_export:{source_book}"
+                if row:
+                    # Exists — reactivate and update
+                    cur.execute(
+                        "UPDATE targets SET susi_active = ?, b32_addr = ?, source = ? "
+                        ", last_updated_at = ? WHERE id = ?",
+                        (generation, b32, src, now, row[0]),
+                    )
+                else:
+                    # New entry or hash rotation — insert fresh
+                    cur.execute(
+                        "INSERT INTO targets (ident_hash_hex, b32_addr, i2p_dns_name, source, susi_active) VALUES (?, ?, ?, ?, ?)",
+                        (h, b32, dns, src, generation),
+                    )
+                n += 1
+
+            # Record this generation in sync table
+            cur.execute(
+                "INSERT OR REPLACE INTO susi_sync (key, value, updated_at) "
+                "VALUES ('generation', ?, ?)",
+                (str(generation), now),
+            )
+            self._conn.commit()
+
         return n
 
     def get_targets(
@@ -1182,26 +1204,32 @@ class DiscoveryDB:
         Each entry gets an empty hash/b32 (DNS-only seed) and records which
         site found it for traceability.  Returns the count of newly inserted rows.
         """
-        cur = self._conn.cursor()
-        added = 0
-        for dns in linked_sites:
-            if not dns:
-                continue
-            # Skip if we already have this dns_name
-            cur.execute("SELECT 1 FROM targets WHERE i2p_dns_name = ?", (dns,))
-            if cur.fetchone():
-                continue
-            cur.execute(
-                "INSERT INTO targets (ident_hash_hex, b32_addr, i2p_dns_name, source, source_site) "
-                "VALUES (?, ?, ?, 'linked', ?)",
-                ("", "", dns, source_site),
-            )
-            added += 1
-        self._conn.commit()
+        with self._lock:
+            cur = self._conn.cursor()
+            added = 0
+            for dns in linked_sites:
+                if not dns:
+                    continue
+                # Skip if we already have this dns_name
+                cur.execute("SELECT 1 FROM targets WHERE i2p_dns_name = ?", (dns,))
+                if cur.fetchone():
+                    continue
+                cur.execute(
+                    "INSERT INTO targets (ident_hash_hex, b32_addr, i2p_dns_name, source, source_site) "
+                    "VALUES (?, ?, ?, 'linked', ?)",
+                    ("", "", dns, source_site),
+                )
+                added += 1
+            self._conn.commit()
+
         return added
 
     def close(self) -> None:
-        self._conn.close()
+        """Close the SQLite connection.  Idempotent — safe to call repeatedly."""
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

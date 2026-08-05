@@ -459,10 +459,12 @@ def main():
         return
 
     # ── Real sweep ────────────────────────────────────────────────
+    from src.config import I2PConfig
+
     effective_timeout = integration_module.PROBE_TIMEOUT
     results = discover_addresses(
         known_addrs=None,
-        config=None,
+        config=I2PConfig(),
         db_path=args.db,
         probe_delay=args.delay,
         timeout=effective_timeout,

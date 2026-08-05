@@ -1,0 +1,52 @@
+{
+  "_comment": "EPHEMERAL — I2P eepsite availability changes without notice. These 5 targets are historically reachable destinations used for smoke-testing the probe/extractor pipeline. Refresh periodically (monthly recommended). Do NOT hardcode into application source; this is a test configuration file only.",
+  "_last_refresh": "2026-08-05",
+  "_refresh_frequency": "monthly",
+  "targets": [
+    {
+      "name": "I2P-Projekt",
+      "url": "http://i2p-projekt.i2p/",
+      "expected_content_type": "text/html",
+      "description": "Official I2P project site hosted inside the network. Long-standing reference eepsite with news, downloads, and documentation.",
+      "proxy_requirement": "http-proxy",
+      "proxy_default_port": 4444,
+      "notes": "One of the most stable I2P destinations; used in official tutorials."
+    },
+    {
+      "name": "I2P-Stat",
+      "url": "http://i2p-stat.i2p/",
+      "expected_content_type": "text/html",
+      "description": "I2P network statistics portal showing live router count, tunnel bandwidth, and network health metrics.",
+      "proxy_requirement": "http-proxy",
+      "proxy_default_port": 4444,
+      "notes": "Also referenced in existing probe_sites.py test data. Renders tabular HTML with network stats."
+    },
+    {
+      "name": "SuicideForum BBS",
+      "url": "http://suicideforum.xqpkhbnwwgclxi2k534y4krbnohlcwdvs6s6f3eg3midrksxh6ka.b32.i2p/",
+      "expected_content_type": "text/html",
+      "description": "One of the oldest I2P forums. PHPBB-based discussion platform with very long operational history, serving as a reference eepsite for base32 address formats.",
+      "proxy_requirement": "http-proxy",
+      "proxy_default_port": 4444,
+      "notes": "Uses base32 address directly rather than .i2p DNS. High uptime historically due to long operation history."
+    },
+    {
+      "name": "Herald I2P News",
+      "url": "http://herald.i2p/",
+      "expected_content_type": "text/html",
+      "description": "I2P-hosted news/blog site. Community-run content aggregator inside the network with regular post updates.",
+      "proxy_requirement": "http-proxy",
+      "proxy_default_port": 4444,
+      "notes": "Standard .i2p hostname resolution via internal SD (Site Database). May return varying status codes depending on maintenance."
+    },
+    {
+      "name": "Debianize I2P",
+      "url": "http://debian.i2p-projekt.i2p/",
+      "expected_content_type": "text/html",
+      "description": "Package repository mirror for I2P router/deb packages on Debian/Ubuntu systems. Subsite of i2p-projekt infrastructure.",
+      "proxy_requirement": "http-proxy",
+      "proxy_default_port": 4444,
+      "notes": "Shares hosting infrastructure with I2P-Projekt so availability correlates. Serves HTML package index pages."
+    }
+  ]
+}

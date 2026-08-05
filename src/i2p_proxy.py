@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from .config import I2PConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,8 +94,10 @@ class I2PProxyClient:
 
     Parameters
     ----------
-    socks_host, socks_port: address of the I2P SOCKS5 proxy (default 127.0.0.1:7656).
-    http_host, http_port: address of the HTTP CONNECT proxy (default 127.0.0.1:4444).
+    config: optional ``I2PConfig`` with proxy endpoints.  When omitted,
+            a default ``I2PConfig()`` is created (127.0.0.1, standard ports).
+    socks_host, socks_port: explicit override for the SOCKS5 proxy address.
+    http_host, http_port: explicit override for the HTTP CONNECT proxy.
     timeout: seconds before we give up on individual requests.
 
     Example — SOCKS5 via PySocks + standard urllib:
@@ -104,16 +108,18 @@ class I2PProxyClient:
 
     def __init__(
         self,
-        socks_host: str = "127.0.0.1",
-        socks_port: int = 7656,
-        http_host: str = "127.0.0.1",
-        http_port: int = 4444,
+        config: Optional[I2PConfig] = None,
+        socks_host: Optional[str] = None,
+        socks_port: Optional[int] = None,
+        http_host: Optional[str] = None,
+        http_port: Optional[int] = None,
         timeout: float = 120.0,
     ):
-        self.socks_host = socks_host
-        self.socks_port = socks_port
-        self.http_host = http_host
-        self.http_port = http_port
+        cfg = config or I2PConfig()
+        self.socks_host = socks_host if socks_host is not None else cfg.socks_host
+        self.socks_port = socks_port if socks_port is not None else cfg.socks_port
+        self.http_host = http_host if http_host is not None else cfg.http_host
+        self.http_port = http_port if http_port is not None else cfg.http_port
         self.timeout = timeout
 
     # -- SOCKS5 via PySocks -------------------------------------------------
@@ -242,7 +248,9 @@ class I2PSAMClient:
 
     Parameters
     ----------
-    host, port: address of the I2P daemon's SAM listener (default 127.0.0.1:9025).
+    config: optional ``I2PConfig`` with SAM endpoints.  When omitted,
+            a default ``I2PConfig()`` is used (127.0.0.1:9025).
+    host, port: explicit override for the SAM listener address.
     session_name: label for this tunnel in the daemon.
 
     Protocol handshake (from i2p spec):
@@ -267,13 +275,15 @@ class I2PSAMClient:
 
     def __init__(
         self,
-        host: str = "127.0.0.1",
-        port: int = 9025,
+        config: Optional[I2PConfig] = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
         session_name: str = "i2p-indexer-sam",
         timeout: float = 60.0,
     ):
-        self.host = host
-        self.port = port
+        cfg = config or I2PConfig()
+        self.host = host if host is not None else cfg.sam_host
+        self.port = port if port is not None else cfg.sam_port
         self.session_name = session_name
         self.timeout = timeout
         self._sock: Optional[socket.socket] = None
@@ -540,7 +550,12 @@ class I2PSAMClient:
 # Unified fetch helper
 # ---------------------------------------------------------------------------
 
-def fetch_i2p(url: str, via: str = "socks", timeout: float | None = None) -> Response:
+def fetch_i2p(
+    url: str,
+    via: str = "socks",
+    timeout: float | None = None,
+    config: Optional[I2PConfig] = None,
+) -> Response:
     """Fetch an eepsite URL through the I2P proxy.
 
     Parameters
@@ -550,10 +565,12 @@ def fetch_i2p(url: str, via: str = "socks", timeout: float | None = None) -> Res
          Defaults to ``"socks"`` which automatically falls back to HTTP proxy.
     timeout: optional per-call timeout in seconds. If None, uses the client
              default (120s). Useful for overriding on a per-target basis.
+    config: optional ``I2PConfig`` with proxy endpoints.  When omitted,
+            a default ``I2PConfig()`` is created.
 
     Returns a ``Response`` object (always non-exception-raising).
     """
-    client = I2PProxyClient(timeout=timeout) if timeout is not None else I2PProxyClient()
+    client = I2PProxyClient(config=config, timeout=timeout) if timeout is not None else I2PProxyClient(config=config)
 
     if via == "socks":
         logger.info("Trying SOCKS5 for %s", url)
@@ -566,7 +583,7 @@ def fetch_i2p(url: str, via: str = "socks", timeout: float | None = None) -> Res
 
     elif via == "sam":
         logger.info("Trying SAM for %s", url)
-        sam = I2PSAMClient(timeout=timeout) if timeout is not None else I2PSAMClient()
+        sam = I2PSAMClient(config=config, timeout=timeout) if timeout is not None else I2PSAMClient(config=config)
         return sam.fetch(url)
 
     else:  # http-proxy

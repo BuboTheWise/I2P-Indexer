@@ -66,6 +66,11 @@ class HtmlExtractor(BaseExtractor):
         if "text/html" in ct:
             return True
 
+        # Reject known XML types that aren't HTML
+        if any(sub in ct for sub in ("application/xml", "application/rss", "application/atom",
+                                     "application/json", "application/xhtml")):
+            return False
+
         # Body starts with HTML markers
         if _HTML_START_RE.match(body_text.lstrip()):
             return True

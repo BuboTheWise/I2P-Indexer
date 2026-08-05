@@ -1212,12 +1212,14 @@ def probe_destination(
     ident_hash_hex: str,
     i2p_dns_name: str = "",
     db: DiscoveryDB | None = None,
+    config: I2PConfig | None = None,
     timeout: float = PROBE_TIMEOUT,
 ) -> DiscoveryResult:
     """Probe a single destination by BOTH its b32 key address and .i2p DNS name.
 
     Returns the best result (most data from fastest successful probe).
     If a DB is provided, records both attempts.
+    ``config`` is an optional I2PConfig override for proxy settings.
     ``timeout`` is the per-target deadline in seconds.
     """
     b32_addr = _hex_to_b32_addr(ident_hash_hex) if len(ident_hash_hex) == 40 else ""
@@ -1231,6 +1233,7 @@ def probe_destination(
             ident_hash_hex=ident_hash_hex,
             i2p_dns_name=i2p_dns_name,
             probe_mode="b32",
+            config=config,
             timeout=timeout,
         )
         results.append(res_b32)
@@ -1279,6 +1282,7 @@ def probe_destination(
                 ident_hash_hex=ident_hash_hex,
                 i2p_dns_name=i2p_dns_name,
                 probe_mode="dns",
+                config=config,
                 timeout=dns_timeout,
             )
             results.append(res_dns)
@@ -1310,6 +1314,7 @@ def probe_destination(
                 ident_hash_hex=ident_hash_hex,
                 i2p_dns_name=i2p_dns_name,
                 probe_mode="dns",
+                config=config,
                 timeout=timeout,
             )
             results.append(res_dns)
@@ -1385,16 +1390,18 @@ def _do_probe(
     ident_hash_hex: str,
     i2p_dns_name: str = "",
     probe_mode: str = "b32",
+    config: I2PConfig | None = None,
     timeout: float = PROBE_TIMEOUT,
 ) -> DiscoveryResult:
     """Single HTTP fetch through proxy. Returns reachable=0 on any failure.
     
+    ``config`` is an optional I2PConfig override for proxy settings.
     ``timeout`` is the per-target deadline in seconds (default 120).
     The underlying I2PProxyClient uses this as a socket timeout.
     """
     start = time.monotonic()
     try:
-        resp = fetch_i2p(url, via="http-proxy", timeout=timeout)
+        resp = fetch_i2p(url, via="http-proxy", config=config, timeout=timeout)
         elapsed = round(time.monotonic() - start, 2)
         body_text = resp.text if hasattr(resp, "text") else resp.body.decode("utf-8", errors="replace")
 
@@ -1629,6 +1636,7 @@ def discover_addresses(
                 ident_hash_hex=hash_hex,
                 i2p_dns_name=dns_name,
                 db=db,
+                config=config,
                 timeout=timeout,
             )
             results.append(res)

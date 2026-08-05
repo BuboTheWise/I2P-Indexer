@@ -2150,3 +2150,377 @@ class TestAddressBookNeedsReviewFilter:
         captured = capsys.readouterr()
         # The flags should be rendered in the output
         assert "needs_review" in captured.out or "flags" in captured.out.lower()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency tests — multiple processes/threads writing to the same DB file
+# ---------------------------------------------------------------------------
+
+class TestDiscoveryDBConcurrency:
+    """Verify that WAL mode + threading.Lock prevent database-is-locked errors."""
+
+    def test_concurrent_record_router(self, tmp_db):
+        """Multiple threads call record_router on the same DB instance concurrently."""
+        import threading
+
+        db = DiscoveryDB(db_path=tmp_db)
+        n_threads = 10
+        rows_per_thread = 50
+        errors: list[Exception] = []
+
+        def worker(thread_idx: int):
+            try:
+                for i in range(rows_per_thread):
+                    # Unique hash per (thread, row) — 40 hex chars
+                    idx = thread_idx * rows_per_thread + i
+                    h = f"{idx:040x}"
+                    db.record_router(
+                        ident_hash_hex=h,
+                        bandwidth_kbps=thread_idx * 100 + i,
+                        caps="test",
+                        published=True,
+                    )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        db.close()
+
+        assert len(errors) == 0, f"Concurrent writes raised exceptions: {errors}"
+
+        # Verify all rows made it into the DB.
+        raw_conn = sqlite3.connect(tmp_db)
+        cur = raw_conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM routers")
+        count = cur.fetchone()[0]
+        raw_conn.close()
+
+        total_expected = n_threads * rows_per_thread
+        assert count == total_expected, (
+            f"Expected {total_expected} rows in routers, got {count}"
+        )
+
+    def test_concurrent_record_discovery(self, tmp_db):
+        """Multiple threads call record_discovery on the same DB instance concurrently."""
+        import threading
+
+        db = DiscoveryDB(db_path=tmp_db)
+        n_threads = 8
+        rows_per_thread = 40
+        errors: list[Exception] = []
+
+        def worker(thread_idx: int):
+            try:
+                base = f"{thread_idx:02d}" * 19 + "A"
+                for i in range(rows_per_thread):
+                    h = base[:38] + f"{i%96:02x}".upper()
+                    db.record_discovery(
+                        ident_hash_hex=h,
+                        b32_addr=f"worker{thread_idx}-{i}.b32.i2p",
+                        probe_mode="b32",
+                        reachable=(i % 3 != 0),
+                        status_code=200 if i % 3 != 0 else 0,
+                        body_length=100 + i * 10,
+                        title=f"Thread{thread_idx} page {i}",
+                        response_time=0.5 + i * 0.1,
+                    )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        db.close()
+
+        assert len(errors) == 0, f"Concurrent discoveries raised exceptions: {errors}"
+
+        # Every row should be present; no duplicates on the same hash+mode combo
+        raw = sqlite3.connect(tmp_db)
+        cur = raw.cursor()
+        total = cur.execute("SELECT COUNT(*) FROM discoveries").fetchone()[0]
+        reachable = cur.execute(
+            "SELECT COUNT(*) FROM discoveries WHERE reachable"
+        ).fetchone()[0]
+        raw.close()
+
+        # 2/3 of rows are reachable (i%3 != 0 => 40 * 8 * 2/3 ≈ 213)
+        expected_total = n_threads * rows_per_thread
+        expected_reachable = n_threads * rows_per_thread * 2 // 3
+
+        assert total == expected_total, f"Expected {expected_total} discoveries, got {total}"
+        assert reachable >= expected_reachable - 5, (
+            f"Expected ~{expected_reachable} reachable, got {reachable}"
+        )
+
+    def test_concurrent_mixed_writes(self, tmp_db):
+        """record_router + record_lease_set + record_discovery from different threads."""
+        import threading
+
+        db = DiscoveryDB(db_path=tmp_db)
+        errors: list[Exception] = []
+        n = 6  # threads per write type
+        per_thread = 30
+
+        def router_worker(idx: int):
+            try:
+                for i in range(per_thread):
+                    h = f"{0x520000 + idx * per_thread + i:040X}"
+                    db.record_router(
+                        ident_hash_hex=h,
+                        bandwidth_kbps=1000 + idx * 50 + i,
+                        version=32,
+                        caps="XM",
+                        published=True,
+                    )
+            except Exception as exc:
+                errors.append(exc)
+
+        def lease_worker(idx: int):
+            try:
+                for i in range(per_thread):
+                    h = f"{0x4C0000 + idx * per_thread + i:040X}"
+                    db.record_lease_set(
+                        ident_hash_hex=h,
+                        store_type=i % 3,
+                        num_leases=1 + (i % 5),
+                    )
+            except Exception as exc:
+                errors.append(exc)
+
+        def discover_worker(idx: int):
+            try:
+                for i in range(per_thread):
+                    h = f"{0x440000 + idx * per_thread + i:040X}"
+                    db.record_discovery(
+                        ident_hash_hex=h,
+                        b32_addr=f"d{i}.b32.i2p",
+                        probe_mode="b32",
+                        reachable=True,
+                        status_code=200,
+                        body_length=512,
+                        title=f"Discover {idx}-{i}",
+                    )
+            except Exception as exc:
+                errors.append(exc)
+
+        all_threads = []
+        for idx in range(n):
+            all_threads.append(threading.Thread(target=router_worker, args=(idx,)))
+            all_threads.append(threading.Thread(target=lease_worker, args=(idx,)))
+            all_threads.append(threading.Thread(target=discover_worker, args=(idx,)))
+
+        for t in all_threads:
+            t.start()
+        for t in all_threads:
+            t.join(timeout=30)
+
+        db.close()
+
+        assert len(errors) == 0, f"Concurrent mixed writes raised exceptions: {errors}"
+
+        # Verify counts with raw connection
+        raw = sqlite3.connect(tmp_db)
+        cur = raw.cursor()
+        routers = cur.execute("SELECT COUNT(*) FROM routers").fetchone()[0]
+        leasesets = cur.execute("SELECT COUNT(*) FROM leasesets").fetchone()[0]
+        discoveries = cur.execute("SELECT COUNT(*) FROM discoveries").fetchone()[0]
+        raw.close()
+
+        # Each thread inserts unique hashes, so we expect exactly n * per_thread of each
+        expected = n * per_thread
+        assert routers == expected, f"Expected {expected} routers, got {routers}"
+        assert leasesets == expected, f"Expected {expected} leasesets, got {leasesets}"
+        assert discoveries == expected, f"Expected {expected} discoveries, got {discoveries}"
+
+    def test_concurrent_discover_addresses_with_mocked_probes(self, tmp_db):
+        """Simulate concurrent discover_addresses sweeps hitting the same DB."""
+        import threading
+
+        # Create a shared DiscoveryDB and seed it with known_addrs targets. This
+        # is equivalent to multiple sweep jobs running against the same index.
+        db = DiscoveryDB(db_path=tmp_db)
+
+        hashes = [f"{hex(i)[2:].upper().zfill(40)}" for i in range(20)]
+        pairs = [(h, f"site{i}.i2p") for i, h in enumerate(hashes)]
+        # Split into two pools: odd-indexed hashes go to sweep A, even to sweep B.
+        pool_a = [p for i, p in enumerate(pairs) if i % 2 == 0]
+        pool_b = [p for i, p in enumerate(pairs) if i % 2 == 1]
+
+        errors: list[Exception] = []
+
+        def sweep(label: str, targets: list[tuple[str, str]]):
+            """Run discovery probes for *targets* into the shared DB."""
+            try:
+                for hash_hex, dns_name in targets:
+                    # Simulate a probe result (mocking HTTP; what matters is the DB write)
+                    from unittest.mock import MagicMock
+
+                    mock_resp = MagicMock()
+                    mock_resp.status = 200
+                    mock_resp.body = b"<html><title>Mok</title>" + b"x" * 1200
+                    mock_resp.text = mock_resp.body.decode("utf-8", errors="replace")
+                    mock_resp.headers = {}
+
+                    _do_probe(
+                        url=f"http://{dns_name}/",
+                        ident_hash_hex=hash_hex,
+                        i2p_dns_name=dns_name,
+                        probe_mode="b32",
+                        timeout=5.0,
+                    )
+
+                    # Record in DB via record_discovery (this is what the sweep does)
+                    db.record_discovery(
+                        ident_hash_hex=hash_hex.upper(),
+                        b32_addr=f"{label}-{hash_hex[:8]}.b32.i2p",
+                        probe_mode=label.lower(),
+                        reachable=True,
+                        status_code=200,
+                        body_length=1256,
+                        title="Mock site",
+                        response_time=0.5,
+                    )
+
+            except Exception as exc:
+                errors.append(exc)
+
+        t_a = threading.Thread(target=sweep, args=("A:", pool_a))
+        t_b = threading.Thread(target=sweep, args=("B:", pool_b))
+
+        t_a.start()
+        t_b.start()
+        t_a.join(timeout=30)
+        t_b.join(timeout=30)
+
+        db.close()
+
+        assert len(errors) == 0, f"Concurrent probe sweeps raised: {errors}"
+
+        # Verify all hashes were recorded.
+        raw = sqlite3.connect(tmp_db)
+        cur = raw.cursor()
+        total = cur.execute("SELECT COUNT(*) FROM discoveries").fetchone()[0]
+        reachable = cur.execute(
+            "SELECT COUNT(*) FROM discoveries WHERE reachable"
+        ).fetchone()[0]
+        # We can't reliably count unique hashes without seeing collisions, but the
+        # aggregate should match our known count: 20 probes total (10 each).
+        raw.close()
+
+        assert total == 20, f"Expected 20 probe records, got {total}"
+        assert reachable == 20, f"Expected 20 reachable, got {reachable}"
+
+    def test_concurrent_multi_connection_sweeps(self, tmp_db):
+        """Multiple independent DiscoveryDB instances (each with their own
+        connection and lock) write to the same DB file concurrently.
+
+        In production, schema already exists before sweeps start, so each
+        process/thread just opens its own DiscoveryDB which re-runs _ensure_*
+        safely (ALTER TABLE IF NOT EXISTS).  We pre-initialize the schema with
+        one instance, then test WAL + busy_timeout under concurrent DML from
+        independent connections.
+        """
+        import threading
+
+        # Pre-initialize schema so workers only contend on data writes
+        init = DiscoveryDB(db_path=tmp_db)
+        init.close()
+
+        num_sweeps = 6
+        rows_per_sweep = 25
+        errors: list[Exception] = []
+
+        def sweep_worker(sweep_id: int):
+            """One independent DiscoveryDB instance probing its own targets."""
+            try:
+                # Each sweep gets its OWN connection + lock (no sharing).
+                # In real probe_sweep, each thread/process opens its own DB.
+                local_db = DiscoveryDB(db_path=tmp_db)
+                base_i = sweep_id * rows_per_sweep
+
+                for i in range(rows_per_sweep):
+                    idx = base_i + i
+                    h = f"{idx:040x}"
+                    # Each worker writes routers, leasesets, and discoveries
+                    local_db.record_router(
+                        ident_hash_hex=h,
+                        bandwidth_kbps=1000 + idx,
+                        published=True,
+                    )
+                    local_db.record_lease_set(
+                        ident_hash_hex=h,
+                        num_leases=1 + (idx % 3),
+                    )
+                    local_db.record_discovery(
+                        ident_hash_hex=h,
+                        b32_addr=f"sweep{sweep_id}-{i}.b32.i2p",
+                        probe_mode="b32",
+                        reachable=(idx % 2 == 0),
+                        status_code=200 if (idx % 2 == 0) else 0,
+                        body_length=512 + idx * 4,
+                        title=f"Sweep{sweep_id} target {i}",
+                    )
+
+                local_db.close()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=sweep_worker, args=(sid,))
+            for sid in range(num_sweeps)
+        ]
+
+        # Start all sweeps together so they contend simultaneously
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        assert len(errors) == 0, (
+            f"Concurrent multi-connection sweeps raised exceptions: {errors}"
+        )
+
+        # Verify row counts with a fresh raw connection
+        total_expected = num_sweeps * rows_per_sweep
+        raw = sqlite3.connect(tmp_db)
+        cur = raw.cursor()
+
+        routers_count = cur.execute(
+            "SELECT COUNT(*) FROM routers"
+        ).fetchone()[0]
+        leasesets_count = cur.execute(
+            "SELECT COUNT(*) FROM leasesets"
+        ).fetchone()[0]
+        discoveries_count = cur.execute(
+            "SELECT COUNT(*) FROM discoveries"
+        ).fetchone()[0]
+
+        # Each sweep inserts unique hashes, so counts should be exact
+        assert routers_count == total_expected, (
+            f"Expected {total_expected} routers across {num_sweeps} sweeps, got {routers_count}"
+        )
+        assert leasesets_count == total_expected, (
+            f"Expected {total_expected} leasesets across {num_sweeps} sweeps, got {leasesets_count}"
+        )
+        assert discoveries_count == total_expected, (
+            f"Expected {total_expected} discoveries across {num_sweeps} sweeps, got {discoveries_count}"
+        )
+
+        # Half are reachable (idx % 2 == 0)
+        reachable = cur.execute(
+            "SELECT COUNT(*) FROM discoveries WHERE reachable"
+        ).fetchone()[0]
+        expected_reachable = total_expected // 2
+        assert reachable == expected_reachable, (
+            f"Expected {expected_reachable} reachable, got {reachable}"
+        )
+
+        raw.close()

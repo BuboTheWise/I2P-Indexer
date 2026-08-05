@@ -43,6 +43,28 @@ Verify the proxy backend:
 >>> print(health)  # {'backend': 'http-proxy', 'status': 'ok', 'latency_ms': ...}
 ```
 
+### Configuration
+
+All I2P proxy endpoints are managed through `I2PConfig` in `src/config.py`. The defaults match a standard I2P router setup:
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `host` | `localhost` | Router bind address |
+| `socks_port` | `7656` | SOCKS5 proxy for outbound traffic |
+| `http_port` | `4444` | HTTP proxy (primary fetch path) |
+| `sam_port` | `9025` | SAM API for controlled tunnel creation |
+| `webconsole_port` | `7657` | Router web console (address book parsing) |
+
+Custom configuration:
+
+```python
+from src.config import I2PConfig
+
+cfg = I2PConfig(host="my-router", http_port=8080, socks_port=9050)
+```
+
+All probe paths — `fetch_i2p()`, `probe_destination()`, and `discover_addresses()` — accept the config parameter and route traffic through it. No hardcoded proxy strings remain in the codebase.
+
 ## Usage
 
 ### Quick start
@@ -232,9 +254,26 @@ scripts/                ← ad-hoc scripts (not version controlled)
 ## Testing
 
 ```bash
-pytest tests/           # full suite (~204 tests)
-pytest -v               # verbose mode with live proxy connectivity checks
+pytest tests/                          # full suite (~204 tests)
+pytest -v                              # verbose mode with live proxy connectivity checks
+pytest tests/smoke_test.py -v          # live I2P smoke test (requires running proxy)
 ```
+
+### Live Smoke Testing
+
+The `tests/smoke_test.py` suite probes historically reachable `.i2p` sites through the I2P proxy to verify the full pipeline (probe → extract → classify) works end-to-end:
+
+```bash
+# Run live smoke tests against 5 known targets
+python -m pytest tests/smoke_test.py -v --tb=short
+
+# Expected output:
+# tests/smoke_test.py::TestSmokeProbe::test_at_least_one_target_reachable PASSED
+# tests/smoke_test.py::TestSmokeProbe::test_successful_probe_produces_extraction PASSED
+# tests/smoke_test.py::TestSmokePipelineIntegration::test_extractors_dont_crash_on_html PASSED
+```
+
+Targets are in `tests/smoke_targets.json` and should be refreshed **monthly** as I2P eepsite availability changes. The smoke test accepts that some targets may be temporarily unreachable — it only requires at least 1 to verify the pipeline works without crashes.
 
 See [TESTING_STRATEGY.md](docs/TESTING_STRATEGY.md) for conventions and isolation guarantees.
 

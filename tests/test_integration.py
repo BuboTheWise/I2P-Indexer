@@ -2523,4 +2523,305 @@ class TestDiscoveryDBConcurrency:
             f"Expected {expected_reachable} reachable, got {reachable}"
         )
 
-        raw.close()
+
+# ---------------------------------------------------------------------------
+# Upsert deduplication & cleanup tests (data hygiene for high-volume sweeps)
+# ---------------------------------------------------------------------------
+
+class TestDiscoveryUpsert:
+    """record_discovery replaces existing rows on (ident_hash_hex, probe_mode)
+    conflict instead of appending duplicates.  Prevents discoveries table from
+    growing unboundedly across thousands of sweeps."""
+
+    def test_upsert_replaces_existing_row(self, db):
+        """Second probe of same hash+mode replaces the first row entirely."""
+        db.record_discovery(
+            ident_hash_hex="AA" * 20,
+            b32_addr="first.b32.i2p",
+            probe_mode="dns",
+            reachable=True,
+            status_code=200,
+            body_length=100,
+            title="First Title",
+        )
+
+        db.record_discovery(
+            ident_hash_hex="AA" * 20,
+            b32_addr="second.b32.i2p",
+            probe_mode="dns",
+            reachable=False,
+            status_code=503,
+            body_length=200,
+            title="Second Title",
+        )
+
+        cur = sqlite3.connect(db._path).cursor()
+        count = cur.execute(
+            "SELECT COUNT(*) FROM discoveries WHERE ident_hash_hex=? AND probe_mode=?",
+            ("A" * 40, "dns")
+        ).fetchone()[0]
+        assert count == 1
+
+        row = cur.execute("""
+            SELECT b32_addr, reachable, status_code, body_length, title 
+            FROM discoveries WHERE ident_hash_hex=? AND probe_mode=?
+        """, ("A" * 40, "dns")).fetchone()
+        assert row[0] == "second.b32.i2p"
+        assert row[1] == 0
+        assert row[2] == 503
+        assert row[3] == 200
+        assert row[4] == "Second Title"
+
+    def test_upsert_preserves_non_empty_fields(self, db):
+        """Empty i2p_dns_name and title in the upsert preserve existing values."""
+        db.record_discovery(
+            ident_hash_hex="BB" * 20,
+            b32_addr="first.b32.i2p",
+            probe_mode="b32",
+            reachable=True,
+            status_code=200,
+            body_length=100,
+            title="Original Title",
+            i2p_dns_name="originalsite.i2p",
+        )
+
+        # Second probe with empty dns_name and title (e.g., b32-only probe)
+        db.record_discovery(
+            ident_hash_hex="BB" * 20,
+            b32_addr="second.b32.i2p",
+            probe_mode="b32",
+            reachable=False,
+            i2p_dns_name="",
+            title="",
+        )
+
+        row = sqlite3.connect(db._path).cursor().execute("""
+            SELECT i2p_dns_name, title FROM discoveries 
+            WHERE ident_hash_hex=? AND probe_mode=?
+        """, ("B" * 40, "b32")).fetchone()
+        assert row[0] == "originalsite.i2p"
+        assert row[1] == "Original Title"
+
+    def test_upsert_different_modes_are_separate(self, db):
+        """Same hash with b32 and dns modes produces two rows."""
+        db.record_discovery(
+            ident_hash_hex="CC" * 20,
+            b32_addr="test.b32.i2p",
+            probe_mode="b32",
+            reachable=True,
+        )
+        db.record_discovery(
+            ident_hash_hex="CC" * 20,
+            b32_addr="test.b32.i2p",
+            probe_mode="dns",
+            reachable=False,
+        )
+
+        count = sqlite3.connect(db._path).cursor().execute(
+            "SELECT COUNT(*) FROM discoveries WHERE ident_hash_hex=?", ("C" * 40,)
+        ).fetchone()[0]
+        assert count == 2
+
+    def test_unique_index_enforces_dedup(self, db):
+        """The unique index on (ident_hash_hex, probe_mode) prevents duplicates."""
+        db.record_discovery(
+            ident_hash_hex="DD" * 20,
+            b32_addr="test.b32.i2p",
+            probe_mode="dns",
+            reachable=True,
+        )
+
+        # Direct INSERT with same key should fail — upsert is the only path
+        cur = sqlite3.connect(db._path).cursor()
+        try:
+            cur.execute("""
+                INSERT INTO discoveries 
+                (ident_hash_hex, probe_mode, reachable, probed_at)
+                VALUES (?, ?, 1, unixepoch())
+            """, ("D" * 40, "dns"))
+            cur.connection.commit()
+            assert False, "Expected IntegrityError for duplicate key"
+        except sqlite3.IntegrityError:
+            pass  # Expected
+
+    def test_dedup_migration_copies_correctly(self, tmp_db):
+        """Existing databases with pre-migration duplicates get deduped on open."""
+        import shutil
+
+        # Create a DB with explicit duplicates (bypass upsert via raw SQL)
+        raw = sqlite3.connect(tmp_db)
+        cur = raw.cursor()
+
+        # Manual table creation without unique index
+        cur.execute("""CREATE TABLE IF NOT EXISTS discoveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ident_hash_hex TEXT, b32_addr TEXT, i2p_dns_name TEXT DEFAULT '',
+            probe_mode TEXT, reachable INTEGER, status_code INTEGER DEFAULT 0,
+            body_length INTEGER DEFAULT 0, title TEXT DEFAULT '',
+            response_time REAL DEFAULT 0, via_method TEXT DEFAULT '',
+            content_type TEXT DEFAULT '', content_summary TEXT DEFAULT '',
+            content_hash TEXT DEFAULT '', last_modified TEXT DEFAULT '',
+            found_links TEXT DEFAULT '[]', flags TEXT DEFAULT '[email protected]',
+            needs_review INTEGER, error_msg TEXT DEFAULT '',
+            probed_at REAL)""")
+
+        # Insert 3 rows with the same hash+mode
+        for i in range(3):
+            cur.execute("""INSERT INTO discoveries 
+                (ident_hash_hex, b32_addr, probe_mode, reachable, body_length, title, probed_at)
+                VALUES (?, ?, ?, 1, ?, ?, ?)""",
+                ("AA" * 20, f"test{i}.b32.i2p", "dns", 100 + i * 100, f"Title {i}", 1000 + i))
+
+        raw.commit()
+
+        # Now open with DiscoveryDB — migration should dedup to 1 row
+        dedup_db = DiscoveryDB(db_path=tmp_db)
+        count = sqlite3.connect(tmp_db).cursor().execute(
+            "SELECT COUNT(*) FROM discoveries WHERE ident_hash_hex=?", ("A" * 40,)
+        ).fetchone()[0]
+        assert count == 1
+
+        # Keep the latest row (highest ID = highest body_length)
+        row = sqlite3.connect(tmp_db).cursor().execute("""
+            SELECT title, body_length FROM discoveries WHERE ident_hash_hex=?
+        """, ("A" * 40,)).fetchone()
+        assert row[0] == "Title 2"
+        assert row[1] == 300
+
+        dedup_db.close()
+
+
+class TestDiscoveryCleanup:
+    """cleanup_unreachable removes old unreachable records to prevent table bloat."""
+
+    def test_cleanup_removes_old_unreachable(self, db):
+        """Unreachable records older than threshold are deleted."""
+        import time
+        cutoff = 168 * 3600  # 7 days in seconds
+
+        old_time = time.time() - (cutoff + 3600)  # 8 days ago
+        recent_time = time.time() - 3600  # 1 hour ago
+
+        db.record_discovery(
+            ident_hash_hex="UU" * 20,
+            b32_addr="test.b32.i2p",
+            probe_mode="dns",
+            reachable=False,
+        )
+        db.record_discovery(
+            ident_hash_hex="VV" * 20,
+            b32_addr="test.b32.i2p",
+            probe_mode="dns",
+            reachable=False,
+        )
+
+        # Backdate the old one using db's own connection
+        cur = db._conn.cursor()
+        cur.execute(
+            "UPDATE discoveries SET probed_at = ? "
+            "WHERE ident_hash_hex=? AND probe_mode=?",
+            (old_time, "U" * 40, "dns"),
+        )
+        cur.execute(
+            "UPDATE discoveries SET probed_at = ? "
+            "WHERE ident_hash_hex=? AND probe_mode=?",
+            (recent_time, "V" * 40, "dns"),
+        )
+        db._conn.commit()
+
+        cleaned = db.cleanup_unreachable(max_age_hours=168)
+        assert cleaned == 1
+
+        # Old one gone, recent one remains
+        cur.execute(
+            "SELECT COUNT(*) FROM discoveries WHERE ident_hash_hex=?", ("U" * 40,)
+        )
+        old_exists = cur.fetchone()[0]
+        cur.execute(
+            "SELECT COUNT(*) FROM discoveries WHERE ident_hash_hex=?", ("V" * 40,)
+        )
+        recent_exists = cur.fetchone()[0]
+        assert old_exists == 0
+        assert recent_exists == 1
+
+    def test_cleanup_preserves_reachable(self, db):
+        """Reachable records are never cleaned, regardless of age."""
+        import time
+        very_old = time.time() - (90 * 86400)  # 90 days ago
+
+        db.record_discovery(
+            ident_hash_hex="WW" * 20,
+            b32_addr="test.b32.i2p",
+            probe_mode="dns",
+            reachable=True,
+        )
+
+        cur = db._conn.cursor()
+        cur.execute(
+            "UPDATE discoveries SET probed_at = ? "
+            "WHERE ident_hash_hex=? AND probe_mode=?",
+            (very_old, "W" * 40, "dns"),
+        )
+        db._conn.commit()
+
+        cleaned = db.cleanup_unreachable(max_age_hours=24)
+        assert cleaned == 0
+
+        # Still exists
+        cur.execute(
+            "SELECT COUNT(*) FROM discoveries WHERE ident_hash_hex=?", ("W" * 40,)
+        )
+        exists = cur.fetchone()[0]
+        assert exists == 1
+
+    def test_cleanup_returns_correct_count(self, db):
+        """cleanup_unreachable returns the number of rows deleted."""
+        cur = sqlite3.connect(db._path).cursor()
+        
+        # Initially empty → nothing to clean
+        cleaned = db.cleanup_unreachable(max_age_hours=1)
+        assert cleaned == 0
+
+    def test_cleanup_is_thread_safe(self, tmp_db):
+        """Multiple threads calling cleanup concurrently doesn't corrupt the DB."""
+        import time
+        import threading
+
+        # Pre-populate with old unreachable records
+        db = DiscoveryDB(db_path=tmp_db)
+        old_time = time.time() - (200 * 3600)  # 200 hours ago
+        for i in range(50):
+            db.record_discovery(
+                ident_hash_hex=f"{i:040x}",
+                b32_addr=f"test{i}.b32.i2p",
+                probe_mode="dns",
+                reachable=False,
+            )
+
+        # Backdate using db's own connection
+        for i in range(50):
+            h = f"{i:040x}"
+            db._conn.execute(
+                "UPDATE discoveries SET probed_at = ? WHERE ident_hash_hex=?",
+                (old_time, h)
+            )
+        db._conn.commit()
+
+        errors = []
+        def do_cleanup():
+            try:
+                local = DiscoveryDB(db_path=tmp_db)
+                local.cleanup_unreachable(max_age_hours=72)
+                local.close()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=do_cleanup) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert len(errors) == 0, f"Cleanup raised: {errors}"
+
+        db.close()

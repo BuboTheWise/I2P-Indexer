@@ -526,6 +526,62 @@ class DiscoveryDB:
                 "ALTER TABLE discoveries ADD COLUMN needs_review INTEGER DEFAULT 0"
             )
             self._conn.commit()
+        elif col_info["needs_review"] not in ("INTEGER", ""):
+            logger.warning(
+                "discoveries.needs_review has unexpected type '%s'; may cause issues.",
+                col_info["needs_review"],
+            )
+
+        # Ensure unique constraint for upsert-based dedup (ident_hash_hex + probe_mode).
+        # Existing databases will have duplicate rows from repeated sweeps, so we need
+        # to collapse them before adding the unique index. The strategy:
+        #   1. Create temp table with one row per (ident_hash_hex, probe_mode)
+        #      keeping only the most recent probe
+        #   2. Drop old discoveries, recreate from deduped data
+        #   3. Add unique index to prevent future duplicates
+        cur.execute("PRAGMA index_list(discoveries)")
+        idx_names = {row[1] for row in cur.fetchall()}
+        if "idx_disc_ident_probe" not in idx_names:
+            try:
+                # Step 1: Check how many duplicates exist
+                cur.execute("""
+                    SELECT COUNT(*) - COUNT(DISTINCT ident_hash_hex || '_' || probe_mode)
+                    FROM discoveries
+                """)
+                dup_count = cur.fetchone()[0] or 0
+
+                if dup_count > 0:
+                    logger.info(
+                        "Deduplicating %d discovery rows by (ident_hash_hex, probe_mode)...",
+                        dup_count,
+                    )
+                    # Create temp table with deduped data (keep latest per combo)
+                    cur.execute("""
+                        CREATE TEMPORARY TABLE disc_dedup AS
+                        SELECT * FROM discoveries WHERE id IN (
+                            SELECT MAX(id) FROM discoveries
+                            GROUP BY ident_hash_hex, probe_mode
+                        )
+                    """)
+
+                    # Clear and reload
+                    cur.execute("DELETE FROM discoveries")
+                    cur.execute("""
+                        INSERT INTO discoveries
+                        SELECT * FROM disc_dedup ORDER BY probed_at DESC
+                    """)
+                    cur.execute("DROP TABLE IF EXISTS disc_dedup")
+                    self._conn.commit()
+
+                # Step 2: Add unique index
+                cur.execute(
+                    "CREATE UNIQUE INDEX idx_disc_ident_probe "
+                    "ON discoveries(ident_hash_hex, probe_mode)"
+                )
+                self._conn.commit()
+
+            except Exception as e:
+                logger.warning("Failed to create dedup index on discoveries: %s", e)
 
     def _ensure_targets_columns(self) -> None:
         """Add new columns for SUSI export support."""
@@ -793,7 +849,25 @@ class DiscoveryDB:
                     status_code, body_length, title, response_time, via_method,
                     content_type, content_summary, content_hash, last_modified,
                     found_links, flags, needs_review, error_msg, probed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(ident_hash_hex, probe_mode) DO UPDATE SET
+                       b32_addr=excluded.b32_addr,
+                       i2p_dns_name=COALESCE(NULLIF(excluded.i2p_dns_name, ''), i2p_dns_name),
+                       reachable=excluded.reachable,
+                       status_code=excluded.status_code,
+                       body_length=excluded.body_length,
+                       title=COALESCE(NULLIF(excluded.title, ''), title),
+                       response_time=excluded.response_time,
+                       via_method=excluded.via_method,
+                       content_type=excluded.content_type,
+                       content_summary=excluded.content_summary,
+                       content_hash=excluded.content_hash,
+                       last_modified=excluded.last_modified,
+                       found_links=COALESCE(NULLIF(excluded.found_links, '[]'), found_links),
+                       flags=COALESCE(NULLIF(excluded.flags, '[]'), flags),
+                       needs_review=excluded.needs_review,
+                       error_msg=COALESCE(NULLIF(excluded.error_msg, ''), error_msg),
+                       probed_at=excluded.probed_at""",
                 (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, int(reachable),
                  status_code, body_length, title, response_time, via_method,
                  content_type, _truncate(content_summary, 4096), content_hash,
@@ -936,6 +1010,34 @@ class DiscoveryDB:
             )
             self._conn.commit()
         return cur.rowcount
+
+    def cleanup_unreachable(
+        self,
+        max_age_hours: int = 168,  # 7 days default
+    ) -> int:
+        """Remove unreachable discovery records older than max_age_hours.
+
+        Reachable records are kept indefinitely (they represent the current state
+        of destinations).  Unreachable records are transient failure states that
+        lose value over time.  This prevents the discoveries table from growing
+        unboundedly across thousands of sweeps.
+
+        Args:
+            max_age_hours: Hours threshold. Records older than this AND unreachable
+                will be removed. Default 168 (7 days).
+
+        Returns:
+            Number of rows deleted.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cutoff = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
+            cur.execute(
+                "DELETE FROM discoveries WHERE reachable = 0 AND probed_at < ?",
+                (cutoff,),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     def upsert_targets(
         self,
@@ -1671,6 +1773,12 @@ def discover_addresses(
 
         # Sort: reachable first, then fastest
         results.sort(key=lambda r: (not r.reachable, r.response_time_sec))
+
+        # ── Maintenance: prune stale unreachable records ───────────────
+        cleaned = db.cleanup_unreachable()
+        if cleaned:
+            logger.info("Cleaned up %d stale unreachable records", cleaned)
+
         summary = db.summary()
         logger.info("Discovery DB — %s", summary)
         return results

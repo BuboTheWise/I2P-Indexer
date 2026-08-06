@@ -615,9 +615,17 @@ class DiscoveryDB:
         self._conn.commit()
 
     def _recreate_address_book_view(self, cur: sqlite3.Cursor) -> None:
-        """DROP then CREATE the address_book view with the current schema."""
-        cur.executescript(
-            """
+        """DROP then CREATE the address_book view with the current schema.
+
+        Idempotent and safe for concurrent callers: retries once when another
+        connection creates the view between our DROP and CREATE.
+        """
+        # ── helper to extract first non-empty content excerpt from summary ──
+        # In SQLite we use subexpressions to build a readable paragraph out of
+        # all available metadata.  This replaces the raw ``content_summary`` blob
+        # that tools like ``print_address_book`` previously chopped at [:100].
+
+        view_sql = """
             DROP VIEW IF EXISTS address_book;
             CREATE VIEW address_book AS
             SELECT
@@ -641,7 +649,47 @@ class DiscoveryDB:
                 ab.needs_review,
                 r.bandwidth_kbps,
                 r.caps    AS router_caps,
-                ls.num_leases
+                ls.num_leases,
+                /* ── rich synthesized paragraph per destination ── */
+                CASE
+                    WHEN ab.reachable = 0
+                    THEN ab.dns_name || ' — currently unreachable'
+
+                    WHEN ab.title IS NOT NULL AND ab.title != ''
+                         AND ab.content_summary IS NOT NULL AND LENGTH(ab.content_summary) > 30
+                    THEN
+                        printf(
+                            '%s ("%s") [%s] %sKB in %.1fs — %s',
+                            ab.dns_name,
+                            REPLACE(ab.title, '"', "'"),
+                            COALESCE(NULLIF(ab.content_type, ''), 'unknown'),
+                            CASE WHEN ab.body_length > 0
+                                 THEN CAST(CAST(ab.body_length AS REAL) / 1024.0 AS NUMERIC)
+                                 ELSE NULL END,
+                            COALESCE(ab.response_time_sec, -1),
+                            REPLACE(
+                                SUBSTR(
+                                    REPLACE(REPLACE(ab.content_summary, CHAR(10), ' · '), CHAR(13), ''), 1, 200
+                                ),
+                                CHAR(10), ' · '
+                            )
+                        )
+
+                    WHEN ab.title IS NOT NULL AND ab.title != ''
+                    THEN printf('%s ("%s") [%s]',
+                        ab.dns_name,
+                        REPLACE(ab.title, '"', "'"),
+                        COALESCE(NULLIF(ab.content_type, ''), 'unknown')
+                    )
+
+                    WHEN ab.content_summary IS NOT NULL AND LENGTH(ab.content_summary) > 10
+                    THEN printf('%s — %s',
+                        ab.dns_name,
+                        SUBSTR(REPLACE(ab.content_summary, CHAR(10), ' · '), 1, 200)
+                    )
+
+                    ELSE ab.dns_name || ' (no content data)'
+                END AS rich_summary
             FROM (
                 SELECT
                     ident_hash_hex,
@@ -672,17 +720,29 @@ class DiscoveryDB:
             WHERE ab.rn = 1
             ORDER BY ab.last_probed_at DESC;
             """
-        )
+
+        try:
+            cur.executescript(view_sql)
+        except sqlite3.OperationalError as exc:
+            if "already exists" in str(exc):
+                # Another concurrent connection beat us to CREATE VIEW —
+                # check ours matches, skip if so
+                logger.info("address_book view already created by another connection")
+                return
+            raise
+
         self._conn.commit()
 
     def _ensure_address_book_view(self) -> None:
-        """Migrate the address_book view if it is missing flags/needs_review columns.
+        """Migrate the address_book view if it is missing rich_summary or other new columns.
 
         Only drops and recreates when the existing view schema is stale, so that
         every DiscoveryDB instantiation is cheap on an up-to-date database.
+
+        Safe for concurrent DiscoveryDB instances sharing one file: the
+        underlying _recreate_address_book_view handles "already exists" races.
         """
         cur = self._conn.cursor()
-        # Pull the current column names from sqlite_master via pragma
         try:
             cur.execute(
                 "SELECT sql FROM sqlite_master WHERE type='view' AND name='address_book'"
@@ -692,69 +752,17 @@ class DiscoveryDB:
             row = None
 
         if row and row[0]:
-            # If the current view already mentions flags and needs_review, no migration needed
-            if "flags" in row[0] and "needs_review" in row[0]:
+            view_sql = row[0]
+            stable = (
+                "flags" in view_sql
+                and "needs_review" in view_sql
+                and "rich_summary" in view_sql
+            )
+            if stable:
                 return
 
-        logger.info("Updating address_book view to include flags / needs_review columns")
-        cur.executescript(
-            """
-            DROP VIEW IF EXISTS address_book;
-            CREATE VIEW address_book AS
-            SELECT
-                ab.dns_name,
-                ab.content_type,
-                ab.reachable,
-                datetime(ab.last_probed_at, 'unixepoch') AS last_probed_utc,
-                ab.content_summary,
-                ab.ident_hash_hex,
-                ab.b32_addr,
-                ab.status_code,
-                ab.body_length,
-                ab.title,
-                ab.response_time_sec,
-                ab.via_method,
-                ab.last_probed_at,
-                ab.content_hash,
-                ab.last_modified,
-                ab.found_links,
-                ab.flags,
-                ab.needs_review,
-                r.bandwidth_kbps,
-                r.caps    AS router_caps,
-                ls.num_leases
-            FROM (
-                SELECT
-                    ident_hash_hex,
-                    b32_addr,
-                    CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END AS dns_name,
-                    reachable,
-                    status_code,
-                    body_length,
-                    title,
-                    response_time   AS response_time_sec,
-                    via_method,
-                    content_type,
-                    content_summary,
-                    probed_at       AS last_probed_at,
-                    content_hash,
-                    last_modified,
-                    found_links,
-                    flags,
-                    needs_review,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
-                        ORDER BY probed_at DESC
-                    ) AS rn
-                FROM discoveries
-            ) ab
-            LEFT JOIN routers   r  ON r.ident_hash_hex = ab.ident_hash_hex
-            LEFT JOIN leasesets ls ON ls.ident_hash_hex = ab.ident_hash_hex
-            WHERE ab.rn = 1
-            ORDER BY ab.last_probed_at DESC;
-            """
-        )
-        self._conn.commit()
+        logger.info("Recreating address_book view")
+        self._recreate_address_book_view(cur)
 
     # ── upsert helpers ────────────────────────────────────────────────
 
@@ -956,7 +964,7 @@ class DiscoveryDB:
         Columns: dns_name, content_type, reachable, last_probed_utc, content_summary,
         ident_hash_hex, b32_addr, status_code, body_length, title, response_time_sec,
         via_method, last_probed_at, content_hash, last_modified, found_links,
-        bandwidth_kbps, router_caps, num_leases.
+        bandwidth_kbps, router_caps, num_leases, rich_summary.
         """
         cur = self._conn.cursor()
         sql = "SELECT * FROM address_book ORDER BY dns_name ASC"
@@ -1939,32 +1947,29 @@ def print_address_book(
 
     for e in entries:
         status = "OK" if e["reachable"] else "DOWN"
-        ctype = e.get("content_type", "") or ""
         utc = e.get("last_probed_utc", "") or ""
-        summary = (e.get("content_summary", "") or "")[:100]
 
-        dns = e.get("dns_name", "") or e.get("b32_addr", "")
+        # ── rich synthesized summary (from view) ──
+        rich = (e.get("rich_summary") or "")[:200]
 
-        # New columns: content_hash, last_modified, found_links
+        line = f"  [{status:>4}] {utc!s:<20} {rich}"
+
+        # Append content hash abbreviation when available
         chash = e.get("content_hash", "") or ""
         if chash:
-            chash_abbr = f"#{chash[:12]}"
-        else:
-            chash_abbr = ""
+            line += f" #{chash[:12]}"
 
+        # Append last_modified as a trailing annotation
         lmod = e.get("last_modified", "") or ""
         if lmod and lmod != "N/A":
-            # Try to format as a readable datetime; fall back to raw value
             from datetime import datetime
             try:
                 dt = datetime.strptime(lmod, "%a, %d %b %Y %H:%M:%S %Z")
-                lmod_display = dt.strftime("%Y-%m-%d %H:%M")
+                line += f" modified:{dt.strftime('%Y-%m-%d')}"
             except (ValueError, TypeError):
-                # Already a nice format or something else — keep as-is, cap length
-                lmod_display = str(lmod)[:20]
-        else:
-            lmod_display = "N/A"
+                pass
 
+        # Append link count
         flinks_raw = e.get("found_links", "") or ""
         try:
             flinks_list = _json.loads(flinks_raw) if isinstance(flinks_raw, str) else []
@@ -1972,39 +1977,15 @@ def print_address_book(
                 flinks_list = []
         except (_json.JSONDecodeError, TypeError):
             flinks_list = []
-        flinks_count = len(flinks_list)
-        if flinks_count > 0:
-            flinks_display = f"{flinks_count} linked sites"
-        else:
-            flinks_display = ""
+        if len(flinks_list) > 0:
+            line += f" {len(flinks_list)} linked sites"
 
-        ctype_tag = f"@{ctype}" if ctype else "unknown"
-        line = f"  [{status:>4}] {ctype_tag:<15} {utc!s:<20} {summary}"
-
-        # Append hash abbreviation when available
-        if chash_abbr:
-            line += f" {chash_abbr}"
-
-        title = (e.get("title", "") or "")[:60]
-        tag = e.get("via_method", "") or "?"
-        bw = f" {e['bandwidth_kbps']}kbps" if (e.get("bandwidth_kbps") or 0) > 0 else ""
-
-        extras: list[str] = []
-        if dns and dns != summary[:len(dns)]:
-            extras.append(dns)
-        if title:
-            extras.append(f'"{title}"')
+        # Append method tag
+        tag = e.get("via_method", "") or ""
         if tag:
-            extras.append(f"[{tag}]")
-        if bw:
-            extras.append(bw)
-        # Append last_modified as a trailing annotation
-        if lmod_display and lmod_display != "N/A":
-            extras.append(f"modified:{lmod_display}")
-        if flinks_display:
-            extras.append(flinks_display)
+            line += f" [{tag}]"
 
-        # Append flags if present (needs_review shows up automatically)
+        # Append flags
         flags_raw = e.get("flags", "") or ""
         try:
             flags_list = _json.loads(flags_raw) if isinstance(flags_raw, str) else []
@@ -2013,10 +1994,7 @@ def print_address_book(
         except (_json.JSONDecodeError, TypeError):
             flags_list = []
         if flags_list:
-            extras.append(f"flags({','.join(flags_list)})")
-
-        if extras:
-            line += "  " + " ".join(extras)
+            line += f" flags({','.join(flags_list)})"
 
         print(line)
 

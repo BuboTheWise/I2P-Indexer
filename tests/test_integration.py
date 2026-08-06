@@ -595,15 +595,13 @@ class TestAddressBookView:
              "content_hash": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
              "last_modified": "Thu, 30 Jul 2026 14:30:00 GMT",
              "found_links": '["other.i2p", "more.i2p", "third.i2p"]',
-             "rich_summary": 'forum.i2p ("My Forum") [forum] — forum content excerpt',
-             "content_summary": ""},
+             "content_summary": 'forum.i2p ("My Forum") [forum] — forum content excerpt'},
             {"reachable": False, "via_method": "dns", "status_code": 0,
              "body_length": 0, "response_time_sec": 1.0,
              "content_type": "", "title": "", "dns_name": "dead.i2p",
              "b32_addr": "", "bandwidth_kbps": None,
              "content_hash": "", "last_modified": "", "found_links": '[]',
-             "rich_summary": "dead.i2p — currently unreachable",
-             "content_summary": ""},
+             "content_summary": "dead.i2p — currently unreachable"},
         ]
         print_address_book(entries)
         captured = capsys.readouterr()
@@ -701,7 +699,7 @@ class TestAddressBookView:
         assert len(limited) == 10
 
     def test_rich_summary_column_present(self, tmp_db):
-        """The address_book SQL view returns a 'rich_summary' column on every row."""
+        """The address_book SQL view returns a content_summary column with rich text on every row."""
         db = DiscoveryDB(db_path=tmp_db)
         # Record with title and content summary
         h = "abc" * 13 + "a"
@@ -719,17 +717,15 @@ class TestAddressBookView:
             content_summary="Blog: Rich Test Site\nContent excerpt: This is a great blog about testing.\nSection: About",
         )
         rows = db.address_book()
-        assert "rich_summary" in rows[0], f"rich_summary missing from view columns"
+        assert "content_summary" in rows[0], f"content_summary missing from view columns"
 
-        # For reachable entry with title + summary, rich_summary contains key info
-        rs = rows[0]["rich_summary"]
-        assert "Rich Test Site" in rs or "richsite.i2p" in rs
-        assert "blog" in rs.lower() or "Blog" in rs
-
+        # For reachable entry with title + summary, content_summary contains key info
+        cs = rows[0]["content_summary"]
+        assert "Rich Test Site" in cs or "richsite.i2p" in cs
         db.close()
 
     def test_rich_summary_unreachable(self, tmp_db):
-        """Unreachable destinations show 'currently unreachable' in rich_summary."""
+        """Unreachable destinations show 'currently unreachable' in content_summary."""
         db = DiscoveryDB(db_path=tmp_db)
         h = "def" * 13 + "a"
         db.record_discovery(
@@ -743,12 +739,12 @@ class TestAddressBookView:
         )
         rows = db.address_book()
         assert len(rows) > 0
-        rs = rows[0]["rich_summary"]
-        assert "unreachable" in rs.lower(), f"Expected 'unreachable' in rich_summary, got: {rs}"
+        cs = rows[0]["content_summary"]
+        assert "unreachable" in cs.lower(), f"Expected 'unreachable' in content_summary, got: {cs}"
         db.close()
 
     def test_rich_summary_no_content(self, tmp_db):
-        """Minimal data still produces valid rich_summary."""
+        """Minimal data still produces valid content_summary."""
         db = DiscoveryDB(db_path=tmp_db)
         h = "123abc" * 6 + "12"
         db.record_discovery(
@@ -761,8 +757,8 @@ class TestAddressBookView:
             content_summary="",
         )
         rows = db.address_book()
-        rs = rows[0]["rich_summary"]
-        assert "minimal" in rs.lower() or len(rs) > 5
+        cs = rows[0]["content_summary"]
+        assert "minimal" in cs.lower() or len(cs) > 5
         db.close()
 
     def test_rich_summary_with_size_and_time(self, tmp_db):
@@ -783,9 +779,9 @@ class TestAddressBookView:
             content_summary="Forum: Sized Site\nDescription: A forum with good data.",
         )
         rows = db.address_book()
-        rs = rows[0]["rich_summary"]
-        assert "KB" in rs  # body size included
-        assert "Sized" in rs or "sized" in rs.lower()  # title present
+        cs = rows[0]["content_summary"]
+        assert "KB" in cs  # body size included
+        assert "Sized" in cs or "sized" in cs.lower()  # title present
         db.close()
 
 

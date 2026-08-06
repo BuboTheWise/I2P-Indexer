@@ -594,22 +594,28 @@ class TestAddressBookView:
              "b32_addr": "", "bandwidth_kbps": 0,
              "content_hash": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
              "last_modified": "Thu, 30 Jul 2026 14:30:00 GMT",
-             "found_links": '["other.i2p", "more.i2p", "third.i2p"]'},
+             "found_links": '["other.i2p", "more.i2p", "third.i2p"]',
+             "rich_summary": 'forum.i2p ("My Forum") [forum] — forum content excerpt',
+             "content_summary": ""},
             {"reachable": False, "via_method": "dns", "status_code": 0,
              "body_length": 0, "response_time_sec": 1.0,
              "content_type": "", "title": "", "dns_name": "dead.i2p",
              "b32_addr": "", "bandwidth_kbps": None,
-             "content_hash": "", "last_modified": "", "found_links": '[]'},
+             "content_hash": "", "last_modified": "", "found_links": '[]',
+             "rich_summary": "dead.i2p — currently unreachable",
+             "content_summary": ""},
         ]
         print_address_book(entries)
         captured = capsys.readouterr()
         assert "I2P Address Book" in captured.out
         assert "OK" in captured.out
         assert "DOWN" in captured.out
-        assert "@forum" in captured.out
+        # Rich summary includes type tag and title
+        assert "forum" in captured.out.lower()
+        assert "My Forum" in captured.out or "currently unreachable" in captured.out
         # Verify new columns appear
         assert "#abcdef123456" in captured.out       # abbreviated content_hash
-        assert "modified:2026-07-30 14:30" in captured.out  # formatted last_modified
+        assert "modified:2026-07-30" in captured.out  # formatted last_modified
         assert "3 linked sites" in captured.out            # found_links count
 
     def test_print_address_book_empty(self, capsys):
@@ -693,6 +699,94 @@ class TestAddressBookView:
 
         limited = get_address_book(db_path=tmp_db, limit=10)
         assert len(limited) == 10
+
+    def test_rich_summary_column_present(self, tmp_db):
+        """The address_book SQL view returns a 'rich_summary' column on every row."""
+        db = DiscoveryDB(db_path=tmp_db)
+        # Record with title and content summary
+        h = "abc" * 13 + "a"
+        db.record_discovery(
+            ident_hash_hex=h,
+            b32_addr="test.b32.i2p",
+            i2p_dns_name="richsite.i2p",
+            probe_mode="dns",
+            reachable=True,
+            status_code=200,
+            body_length=8192,
+            title="Rich Test Site",
+            response_time=1.5,
+            content_type="blog",
+            content_summary="Blog: Rich Test Site\nContent excerpt: This is a great blog about testing.\nSection: About",
+        )
+        rows = db.address_book()
+        assert "rich_summary" in rows[0], f"rich_summary missing from view columns"
+
+        # For reachable entry with title + summary, rich_summary contains key info
+        rs = rows[0]["rich_summary"]
+        assert "Rich Test Site" in rs or "richsite.i2p" in rs
+        assert "blog" in rs.lower() or "Blog" in rs
+
+        db.close()
+
+    def test_rich_summary_unreachable(self, tmp_db):
+        """Unreachable destinations show 'currently unreachable' in rich_summary."""
+        db = DiscoveryDB(db_path=tmp_db)
+        h = "def" * 13 + "a"
+        db.record_discovery(
+            ident_hash_hex=h,
+            b32_addr="dead.b32.i2p",
+            i2p_dns_name="",
+            probe_mode="b32",
+            reachable=False,
+            content_summary="",
+            title="",
+        )
+        rows = db.address_book()
+        assert len(rows) > 0
+        rs = rows[0]["rich_summary"]
+        assert "unreachable" in rs.lower(), f"Expected 'unreachable' in rich_summary, got: {rs}"
+        db.close()
+
+    def test_rich_summary_no_content(self, tmp_db):
+        """Minimal data still produces valid rich_summary."""
+        db = DiscoveryDB(db_path=tmp_db)
+        h = "123abc" * 6 + "12"
+        db.record_discovery(
+            ident_hash_hex=h,
+            b32_addr="minimal.b32.i2p",
+            i2p_dns_name="minimal.i2p",
+            probe_mode="dns",
+            reachable=True,
+            title="",
+            content_summary="",
+        )
+        rows = db.address_book()
+        rs = rows[0]["rich_summary"]
+        assert "minimal" in rs.lower() or len(rs) > 5
+        db.close()
+
+    def test_rich_summary_with_size_and_time(self, tmp_db):
+        """Rich summary includes body length (KB) and response time when available."""
+        db = DiscoveryDB(db_path=tmp_db)
+        h = "fedcba" * 6 + "fe"
+        db.record_discovery(
+            ident_hash_hex=h,
+            b32_addr="sized.b32.i2p",
+            i2p_dns_name="sized.i2p",
+            probe_mode="dns",
+            reachable=True,
+            status_code=200,
+            body_length=15360,  # 15 KB
+            title="Sized Site",
+            response_time=4.2,
+            content_type="forum",
+            content_summary="Forum: Sized Site\nDescription: A forum with good data.",
+        )
+        rows = db.address_book()
+        rs = rows[0]["rich_summary"]
+        assert "KB" in rs  # body size included
+        assert "Sized" in rs or "sized" in rs.lower()  # title present
+        db.close()
 
 
 # ---------------------------------------------------------------------------

@@ -633,24 +633,7 @@ class DiscoveryDB:
                 ab.content_type,
                 ab.reachable,
                 datetime(ab.last_probed_at, 'unixepoch') AS last_probed_utc,
-                ab.content_summary,
-                ab.ident_hash_hex,
-                ab.b32_addr,
-                ab.status_code,
-                ab.body_length,
-                ab.title,
-                ab.response_time_sec,
-                ab.via_method,
-                ab.last_probed_at,
-                ab.content_hash,
-                ab.last_modified,
-                ab.found_links,
-                ab.flags,
-                ab.needs_review,
-                r.bandwidth_kbps,
-                r.caps    AS router_caps,
-                ls.num_leases,
-                /* ── rich synthesized paragraph per destination ── */
+                /* ── rich synthesized paragraph replaces raw content_summary ── */
                 CASE
                     WHEN ab.reachable = 0
                     THEN ab.dns_name || ' — currently unreachable'
@@ -689,7 +672,23 @@ class DiscoveryDB:
                     )
 
                     ELSE ab.dns_name || ' (no content data)'
-                END AS rich_summary
+                END AS content_summary,
+                ab.ident_hash_hex,
+                ab.b32_addr,
+                ab.status_code,
+                ab.body_length,
+                ab.title,
+                ab.response_time_sec,
+                ab.via_method,
+                ab.last_probed_at,
+                ab.content_hash,
+                ab.last_modified,
+                ab.found_links,
+                ab.flags,
+                ab.needs_review,
+                r.bandwidth_kbps,
+                r.caps    AS router_caps,
+                ls.num_leases
             FROM (
                 SELECT
                     ident_hash_hex,
@@ -734,7 +733,7 @@ class DiscoveryDB:
         self._conn.commit()
 
     def _ensure_address_book_view(self) -> None:
-        """Migrate the address_book view if it is missing rich_summary or other new columns.
+        """Migrate the address_book view if content_summary lacks the rich synthesized paragraph or other new columns.
 
         Only drops and recreates when the existing view schema is stale, so that
         every DiscoveryDB instantiation is cheap on an up-to-date database.
@@ -756,7 +755,7 @@ class DiscoveryDB:
             stable = (
                 "flags" in view_sql
                 and "needs_review" in view_sql
-                and "rich_summary" in view_sql
+                and "currently unreachable" in view_sql
             )
             if stable:
                 return
@@ -964,7 +963,7 @@ class DiscoveryDB:
         Columns: dns_name, content_type, reachable, last_probed_utc, content_summary,
         ident_hash_hex, b32_addr, status_code, body_length, title, response_time_sec,
         via_method, last_probed_at, content_hash, last_modified, found_links,
-        bandwidth_kbps, router_caps, num_leases, rich_summary.
+        bandwidth_kbps, router_caps, num_leases.
         """
         cur = self._conn.cursor()
         sql = "SELECT * FROM address_book ORDER BY dns_name ASC"
@@ -1949,8 +1948,8 @@ def print_address_book(
         status = "OK" if e["reachable"] else "DOWN"
         utc = e.get("last_probed_utc", "") or ""
 
-        # ── rich synthesized summary (from view) ──
-        rich = (e.get("rich_summary") or "")[:200]
+        # ── rich synthesized summary (from view, replaces raw content_summary) ──
+        rich = (e.get("content_summary") or "")[:200]
 
         line = f"  [{status:>4}] {utc!s:<20} {rich}"
 

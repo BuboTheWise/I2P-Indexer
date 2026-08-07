@@ -1,11 +1,13 @@
-"""Tests for src/translation.py — language detection and translation pipeline.
+"""Tests for src/translation.py — language detection and tagging pipeline.
 
 Covers:
 - Language detection with langid (various languages, confidence)
-- Translation of non-English content to English via deep-translator
-- The process_content_for_language integration entry point
-- Graceful fallback when libraries are unavailable or APIs fail
+- The process_content_for_language integration entry point (detection + tagging only)
+- Graceful fallback when libraries are unavailable
 - Detected_lang column in DB schema and migrations
+
+Translation via deep-translator was removed (NFR-07 privacy mandate).
+Non-English content is tagged with language code for identification.
 """
 import sys
 import os
@@ -14,9 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.translation import (
     detect_language,
-    translate_to_english,
     process_content_for_language,
-    disable_translation,
     reset_state,
 )
 
@@ -76,8 +76,8 @@ class TestLanguageDetection:
         assert isinstance(conf, float)
 
 
-class TestTranslationEntry:
-    """Test process_content_for_language integration endpoint."""
+class TestLanguageTaggingEntry:
+    """Test process_content_for_language — detection + tagging only."""
 
     def setup_method(self):
         reset_state()
@@ -89,14 +89,14 @@ class TestTranslationEntry:
             "Community discussion platform",
             "Active user base, regular content updates",
         ]
-        translated, lang = process_content_for_language(
+        tagged, lang = process_content_for_language(
             title=title,
             summary_lines=summary_lines,
         )
         assert lang == "en"
         # Should not have language tag prefix
-        assert not any("[detected_language:" in line for line in translated)
-        assert len(translated) == 2
+        assert not any("[detected_language:" in line for line in tagged)
+        assert len(tagged) == 2
 
     def test_non_english_gets_language_tag(self):
         """Non-English content should get a language detection tag."""
@@ -105,18 +105,29 @@ class TestTranslationEntry:
             "Community-Diskussionsplattform",
             "Aktive Benutzerbasis, regelmäßige Inhaltsaktualisierungen",
         ]
-        translated, lang = process_content_for_language(
+        tagged, lang = process_content_for_language(
             title=title,
             summary_lines=summary_lines,
         )
         # Should have detected German or a fallback language tag
         assert len(lang) == 2
-        first_line = translated[0]
+        first_line = tagged[0]
         assert "[detected_language:" in first_line
+
+    def test_non_english_content_preserved(self):
+        """Non-English content should be preserved as-is (no translation)."""
+        title = "Willkommen im Forum"
+        summary_lines = ["Community-Diskussionsplattform"]
+        tagged, lang = process_content_for_language(
+            title=title,
+            summary_lines=summary_lines,
+        )
+        # Original text unchanged — only a tag was prepended
+        assert "Community-Diskussionsplattform" in "\n".join(tagged)
 
     def test_empty_summary_returns_english(self):
         """Empty summary should default to English without processing."""
-        translated, lang = process_content_for_language(
+        tagged, lang = process_content_for_language(
             title="",
             summary_lines=[],
         )
@@ -126,54 +137,44 @@ class TestTranslationEntry:
         """Single line summary should be handled correctly."""
         title = "My Blog"
         summary_lines = ["Personal blog about technology and programming."]
-        translated, lang = process_content_for_language(
+        tagged, lang = process_content_for_language(
             title=title,
             summary_lines=summary_lines,
         )
         assert lang == "en"
-        assert len(translated) == 1
+        assert len(tagged) == 1
 
 
-class TestTranslationFallbacks:
-    """Test graceful degradation when translation infrastructure fails."""
+class TestTaggingFallbacks:
+    """Test graceful degradation when detection fails."""
 
     def setup_method(self):
         reset_state()
 
-    def test_disable_translation_prevents_api_calls(self):
-        """disable_translation should prevent any API calls."""
-        disable_translation()
-        translated, lang = process_content_for_language(
-            title="Willkommen im Forum",
-            summary_lines=["Community-Diskussionsplattform"],
-        )
-        # Content not modified (no translation attempted)
-        assert "Community-Diskussionsplattform" in "\n".join(translated)
-
     def test_short_url_summary_skipped(self):
-        """URLs and short text should be skipped during translation."""
+        """URLs and short text should be passed through unchanged."""
         title = ""
         summary_lines = [
             "https://example.i2p/forum",
             "#1",
             "abc",
         ]
-        translated, lang = process_content_for_language(
+        tagged, lang = process_content_for_language(
             title=title,
             summary_lines=summary_lines,
         )
         # URLs and short strings passed through unchanged
-        assert any("https://" in line for line in translated)
+        assert any("https://" in line for line in tagged)
 
     def test_mixed_summary_with_urls_preserves_them(self):
-        """Mixed content (text + URLs) should preserve URLs while translating text."""
+        """Mixed content (text + URLs) should preserve URLs while tagging text."""
         title = "Site"
         summary_lines = [
             "https://site.i2p/links",
             "Some English description here",
         ]
-        translated, lang = process_content_for_language(
+        tagged, lang = process_content_for_language(
             title=title,
             summary_lines=summary_lines,
         )
-        assert any("https://" in line for line in translated)
+        assert any("https://" in line for line in tagged)

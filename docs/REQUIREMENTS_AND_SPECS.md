@@ -22,8 +22,8 @@ When both a hash and a DNS name are known, the system shall probe via both paths
 ### FR-04: Persistent Storage
 All probe results shall be stored in a SQLite database (`indexer.db`) with WAL journal mode. The schema supports unlimited re-probes of the same destination — each attempt becomes a new row in `discoveries`.
 
-### FR-05: Content Classification
-On successful fetch, the system shall classify page content into a bucket (forum, wiki, blog, etc.) via offline keyword matching and generate a sentence-length summary. No external API or LLM call is made at probe time.
+### FR-05: Content Classification and Language Detection
+On successful fetch, the system shall classify page content into a bucket (forum, wiki, blog, etc.) via offline keyword matching and generate a sentence-length summary. The system detects non-English content using `langid` (local, ~1 MB model) and stores ISO 639-1 language codes in the `detected_lang` column for structured filtering. **No external API or LLM call is made at probe time** — all processing is local per NFR-07.
 
 ### FR-06: Addressbook Parsing
 The system shall scan the I2P `netdb/` directory for `.rtr` and `.ls64` binary files, parse them into `RouterInfo` and `LeaseSetInfo` dataclasses, and persist metadata to `routers` and `leasesets` tables.
@@ -57,6 +57,27 @@ The canonical identity of every destination is its 40-character `ident_hash_hex`
 ### NFR-06: Graceful Degradation
 Network failures shall be logged but never crash the probe loop. The indexer continues probing subsequent targets after any individual fetch timeout or connection error.
 
+### NFR-07: Strict Offline Processing — Zero External Telemetry (**MANDATORY**)
+
+All content processing — including language detection, classification, summarization, and translation — **must execute entirely on the local host machine**. Under no circumstances shall crawled I2P destination content (titles, summaries, body text, metadata) be sent to third-party services, cloud APIs, or any network endpoint outside the configured I2P tunnel.
+
+**Rationale:** The I2P Indexer crawls destinations on anonymized overlay networks. Sending their content to external services (Google Translate, OpenAI APIs, language model inference endpoints, analytics trackers) constitutes an **extreme privacy violation** — it deanonymizes crawled sites, creates surveillance vectors, and defeats the core security model of the project.
+
+**Specifically prohibited:**
+- Cloud translation APIs (Google Translate, DeepL, Microsoft Translator, LibreTranslate hosted instances)
+- LLM inference endpoints (OpenAI, Anthropic, Cohere, any hosted model API)
+- Language detection services that phone home (`langdetect` with online fallbacks, `fasttext` with remote model downloads at runtime)
+- Any library that makes HTTP requests as part of its normal operation
+- Telemetry, usage tracking, or update-checking embedded in dependencies
+
+**Permitted local-only tools:**
+- `langid` — lightweight (~1 MB), CPU-only language detection, no network calls
+- Bundled dictionaries, static phrase tables, rule-based transliteration packages
+- Locally hosted quantized models (GGUF, ONNX) that run entirely on-CPU with update checking disabled
+- Any library whose dependency tree contains zero outbound HTTP clients
+
+**Enforcement:** All new dependencies must pass `external-package-audit` before being added to `requirements.txt`. Any library discovered to make external network calls must be replaced or sandboxed. This requirement **cannot be overridden** by convenience, speed, or accuracy trade-offs.
+
 ## 5. Constraints
 
 | Constraint | Detail |
@@ -69,7 +90,8 @@ Network failures shall be logged but never crash the probe loop. The indexer con
 
 ## 6. Future Work (Out of Scope for MVP)
 
-- LLM-powered re-classification of `content_summary` fields post-probe
+- LLM-powered re-classification of `content_summary` fields post-probe (**only using local models — NFR-07**)
+- Local offline translation engine (**strictly on-device** — cloud translation is prohibited by NFR-07; viable options: quantized MarianMT, `transformers` with GGUF/ONNX backends, or bundled dictionary-based systems)
 - Parallel probe execution (current design is sequential for reliability)
 - Automatic destination discovery beyond the known list (crawling new links from fetched pages)
 - Web UI for browsing the SQLite database contents

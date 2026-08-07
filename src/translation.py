@@ -1,13 +1,11 @@
-"""Language detection and translation for I2P site content.
+"""Language detection and tagging for I2P site content.
 
-Detects the language of extracted title/summary text and translates
-non-English content to English. Designed as a thin wrapper around
-``langid`` (detection) and ``deep-translator`` (translation), with
-graceful fallbacks when external APIs fail or timeouts occur during
-probe sweeps.
-
-The goal is: every site gets an English-language summary in the UI,
-and a ``detected_lang`` ISO code is stored for provenance.
+Detects the language of extracted title/summary text using ``langid``
+(a lightweight, CPU-only library with no network calls). Non-English
+content is tagged with a ``[detected_language: XX (LanguageName)]``
+preamble so auditors can see provenance. No translation — crawled I2P
+content must never leave the host machine over non-I2P channels
+(NFR-07 privacy mandate).
 """
 from __future__ import annotations
 
@@ -83,79 +81,6 @@ def detect_language(
 
 
 # ---------------------------------------------------------------------------
-# Translation (deep-translator — free Google Translate wrapper)
-# ---------------------------------------------------------------------------
-
-_translate_enabled: bool = True
-_translate_error: bool = False
-
-
-def translate_to_english(
-    text: str,
-    source_lang: str = "",
-    timeout_secs: int = 8,
-) -> str:
-    """Translate ``text`` to English using deep-translator.
-
-    Returns the translated text on success, or the original text on any
-    failure (network error, rate limit, timeout). The sweeper should
-    never hang on a single site.
-
-    If the source is already English, returns immediately without calling
-    any external API.
-    """
-    global _translate_error
-
-    if not _translate_enabled or _translate_error:
-        return text
-
-    # Skip obvious non-translatable content (empty, pure whitespace, URLs)
-    cleaned = " ".join(text.split())
-    if len(cleaned) < 20:
-        return text
-
-    if source_lang == "en":
-        return text
-
-    try:
-        from deep_translator import GoogleTranslator  # type: ignore[import-untyped]
-
-        translator = GoogleTranslator(
-            source=source_lang,
-            target="en",
-        )
-
-        # Truncate to avoid API limits on very long bodies — the summary
-        # lines are what matters, not full page dumps
-        if len(cleaned) > 4000:
-            cleaned = cleaned[:4000]
-
-        import socket as _socket
-        old_timeout = _socket.getdefaulttimeout()
-        _socket.setdefaulttimeout(timeout_secs)
-        try:
-            translated = translator.translate(cleaned)
-        finally:
-            _socket.setdefaulttimeout(old_timeout)
-
-        if translated and len(translated) > 0:
-            return translated.strip()
-
-        logger.warning(
-            f"Translator returned empty string for {len(cleaned)} chars, "
-            f"keeping original ({source_lang})"
-        )
-        return text
-    except Exception:
-        logger.info(
-            "Translation failed (likely network/rate-limit), keeping original. "
-            "Subsequent translation attempts will also skip."
-        )
-        _translate_error = True
-        return text
-
-
-# ---------------------------------------------------------------------------
 # Public entry point for the extractor pipeline
 # ---------------------------------------------------------------------------
 
@@ -165,14 +90,16 @@ def process_content_for_language(
     detected_lang: str = "",
     confidence: float = 1.0,
 ) -> tuple[list[str], str]:
-    """Detect language and translate summary lines if non-English.
+    """Detect language and prepend language tags for non-English content.
 
-    Called after extraction but before storing in DB.
+    Called after extraction but before storing in DB. Does **not** translate
+    — it only detects language and adds a ``[detected_language: XX]`` tag
+    so auditors know the original language.
 
-    Returns ``(translated_summary_lines, language_code)``. The returned
+    Returns ``(tagged_summary_lines, language_code)``. The returned
     list includes a preamble like ``"[detected_language: de (German)]"``
-    when translation was applied, so humans auditing the address book can
-    see that this wasn't native English content.
+    when the content is non-English, so humans auditing the address book
+    can see that this wasn't native English content.
     """
     if detected_lang and detected_lang != "en":
         lang = detected_lang
@@ -183,12 +110,6 @@ def process_content_for_language(
 
     if not summary_lines or lang == "en":
         return summary_lines, "en"
-
-    # Translate title
-    translated_title = translate_to_english(title, source_lang=lang)
-
-    # Translate each summary line
-    translated_lines: list[str] = []
 
     # Build language label (ISO code + English name via langname mapping)
     _LANG_NAMES = {
@@ -203,35 +124,28 @@ def process_content_for_language(
     lang_name = _LANG_NAMES.get(lang, "")
 
     preamble = f"[detected_language: {lang}{f' ({lang_name})' if lang_name else ''}]"
-    translated_lines.append(preamble)
+    tagged_lines: list[str] = []
+    tagged_lines.append(preamble)
 
     for line in summary_lines:
         stripped = line.strip()
         if not stripped:
             continue
-        # Skip things that aren't meant for translation (URLs, hashes, pure data)
+        # Skip things that aren't translatable text (URLs, hashes, pure data)
         if stripped.startswith("http") or len(stripped) < 10:
-            translated_lines.append(stripped)
+            tagged_lines.append(stripped)
             continue
-        translated = translate_to_english(stripped, source_lang=lang)
-        translated_lines.append(translated if translated else stripped)
+        # Keep the original line as-is — no translation
+        tagged_lines.append(stripped)
 
-    return translated_lines, lang
+    return tagged_lines, lang
 
 
 # ---------------------------------------------------------------------------
-# Disable translation (for testing or when network unavailable)
+# State reset (for test isolation)
 # ---------------------------------------------------------------------------
-
-def disable_translation() -> None:
-    """Disable all translation attempts. Useful when the project is run
-    in environments without internet access for external APIs."""
-    global _translate_enabled
-    _translate_enabled = False
-
 
 def reset_state() -> None:
     """Reset global state for test isolation."""
-    global _detect_error, _translate_error
+    global _detect_error
     _detect_error = False
-    _translate_error = False

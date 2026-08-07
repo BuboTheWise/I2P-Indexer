@@ -1614,19 +1614,19 @@ def _do_probe(
         if extractor_result.needs_review:
             flags.append(f"needs_review: {extractor_result.reason}")
 
-        # ── Language detection + translation ─────────────────────────────
+        # ── Language detection + tagging (no translation — NFR-07) ────────
         detected_lang = "en"  # default assumption
-        translated_summary_lines = list(extractor_result.summary_lines)
+        tagged_summary_lines: list[str] = list(extractor_result.summary_lines)
         try:
-            from src.translation import detect_language, translate_to_english
+            from src.translation import detect_language
             from src.translation import process_content_for_language
 
             # Detect language from title + body sample
             det_lang, conf = detect_language(title_text, body_text)
 
             if det_lang != "en" and conf >= 0.4:
-                # Translate summary lines to English with language tag
-                translated_summary_lines, detected_lang = process_content_for_language(
+                # Tag summary lines with detected language (no translation)
+                tagged_summary_lines, detected_lang = process_content_for_language(
                     title=title_text,
                     summary_lines=list(extractor_result.summary_lines),
                     detected_lang=det_lang,
@@ -1634,13 +1634,13 @@ def _do_probe(
                 )
                 logger.info(
                     f"  [lang] Detected {det_lang} (conf={conf:.2f}), "
-                    f"translated summary for {url}"
+                    f"tagged summary for {url}"
                 )
             else:
                 detected_lang = det_lang if conf >= 0.4 else "en"
         except Exception:
-            # Translation is best-effort; never fail a probe for it
-            logger.debug("Language detection/translation skipped")
+            # Language detection is best-effort; never fail a probe for it
+            logger.debug("Language detection skipped")
             pass
 
         result = DiscoveryResult(
@@ -1655,7 +1655,7 @@ def _do_probe(
             probe_mode=probe_mode,
             content_type=extractor_result.content_type,
             detected_lang=detected_lang,
-            content_summary="\n".join(translated_summary_lines),
+            content_summary="\n".join(tagged_summary_lines),
             found_links=extractor_result.links,
             flags=flags,
             needs_review=extractor_result.needs_review,

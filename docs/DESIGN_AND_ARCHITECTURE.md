@@ -58,20 +58,27 @@ The I2P Indexer is a **client-side discovery engine**. Its purpose is to systema
 
 For auditing, the `address_book` SQL view collapses all probe history into one row per "human identity." DNS name is primary (preferred for readability); b32 address is fallback when no DNS exists. Joined with `routers`/`leasesets` metadata. Access via `get_address_book()`  → `list[dict]`, or `print_address_book(entries)` for terminal output.
 
-### Content classification pipeline
+### Content classification and language detection pipeline
 
 ```
 fetch_i2p() → Response.text
     │
-    ├─► _TAG_RE.sub()          ← strip HTML tags
-    ├─► type_keywords match    ← bucket detection (forum, wiki, blog...)
-    └─► title extraction       ← summary string construction
-           │
-           ▼
-    DiscoveryDB.record_discovery(content_type=..., content_summary=...)
+    ├─► run_extractors()          ← plugin registry, BaseExtractor chain
+    │   · can_handle()            ← first match wins
+    │   · extract()               → (content_type, summary_lines, found_links)
+    │
+    ├─► detect_language(title_text, body_text[:8192])  ← langid (local, no network)
+    │   → (detected_lang, confidence)                   # e.g. ("de", 1.0)
+    │
+    └─► process_content_for_language(                      title=title_text,
+           summary_lines=extractor_result.summary_lines,
+           detected_lang=det_lang)
+           → (tagged_summary_lines, lang_code)            # [detected_language: XX] tag added
+
+    DiscoveryDB.record_discovery(content_type=..., content_summary=..., detected_lang=...)
 ```
 
-Classification is intentionally **offline and heuristic-only**. No LLM or network call is made at probe time. The `content_type` and `content_summary` fields are designed for later re-classification by an LLM pass that reads from the SQLite store directly.
+Classification is intentionally **offline and heuristic-only**. No LLM call is made at probe time. Language detection uses `langid` (~1 MB model, CPU-only, zero network traffic). Non-English content is tagged with `[detected_language: XX (LanguageName)]` for auditability. Per NFR-07, no crawled I2P content leaves the host machine — translation to English is disabled pending an offline engine.
 
 ## Design Decisions and Rationale
 
@@ -83,7 +90,77 @@ Classification is intentionally **offline and heuristic-only**. No LLM or networ
 | No Selenium/Playwright | I2P eepsites don't require JavaScript rendering for basic reachability checks. Pure HTTP is sufficient and dramatically faster/cheaper. |
 | Keyword-based classification first | Keeps probe runtime predictable; avoids adding an LLM dependency to every fetch cycle. Post-hoc re-classification can batch-process the DB. |
 | Separate `routers` / `leasesets` tables | Addressbook data (from `.rtr`/`.ls64` files) describes network topology, not endpoint behavior. Disjoint concerns warrant disjoint stores. |
-| DNS-first dedup in `address_book` view | Humans think in DNS names, not hashes. A site probed via two DNS names appears as two rows (separate entry points); b32-only probes fall back to the b32 address. Pivot to hash-based dedup if alias tracking proves unnecessary. |
+|| DNS-first dedup in `address_book` view | Humans think in DNS names, not hashes. A site probed via two DNS names appears as two rows (separate entry points); b32-only probes fall back to the b32 address. Pivot to hash-based dedup if alias tracking proves unnecessary. |
+|| Local language detection (`langid`) | No network dependency for detection. ~1 MB model, fast inference, reliable on HTML content that survives tag stripping. Confidence thresholds prevent false positives on short/mixed text. |
+|| Translation disabled — privacy-first | Per NFR-07: crawled I2P content must never leave the host over non-I2P channels. Original `deep-translator` (Google Translate) sent data to external servers — an extreme privacy violation for darknet data. Offline translation is future work pending local engine (quantized MarianMT, ONNX backends). |
+|| Persistent `detected_lang` column | Structured language metadata enables filtering (e.g., "show all German sites"). Summary text gets `[detected_language: XX (LanguageName)]` prefix for auditability. |
+
+## Language Detection Pipeline
+
+### Module: `src/translation.py`
+
+A post-extraction pipeline that detects the language of scraped page content using `langid` and **annotates** non-English summaries with a language tag. No translation occurs — crawled I2P content must never leave the host machine (NFR-07). Runs in `_do_probe()` between content extraction and SQLite persistence.
+
+| Entrypoint | Purpose | Depends On |
+|---|---|---|
+| `detect_language(title, body_text)` | Detect language from title + first 8192 chars of body text. Returns `(iso_code, confidence)`. Uses `langid.classify()` with negative-log-probability scoring normalized to thresholds (≤-50 → 1.0, ≤-20 → 0.7, else fallback). | `langid` (local, no network) |
+| `process_content_for_language(title, summary_lines, detected_lang, confidence)` | Main pipeline: accepts pre-detected lang or detects itself → prepends `[detected_language: XX (LanguageName)]` tag to non-English summaries → returns `(tagged_lines, lang_code)`. Does **not** translate. Covers 29 languages via built-in `_LANG_NAMES`. | `detect_language` only |
+| `reset_state()` | Clear global error flags for test isolation. | — |
+
+### Integration in `_do_probe()` (line ~1640 of `src/integration.py`)
+
+```
+run_extractors() → ExtractorResult
+       │
+       ├─► detect_language(title_text, body_text)        # full page body
+       │   → (det_lang, confidence)                       # e.g. ("de", 1.0)
+       │
+       └─► process_content_for_language(                     title=title_text,
+           summary_lines=list(extractor_result.summary_lines),
+           detected_lang=det_lang)
+           → (tagged_summary_lines, final_lang_code)      # annotated, not translated
+```
+
+The tagged summary lines are joined with `"\n"` and stored in `content_summary`. The `detected_lang` ISO code is stored separately. Both are passed to `DiscoveryResult()` → `record_discovery()`.
+
+#### SQL view annotation
+
+The `address_book` view exposes `detected_lang_direct` (the latest non-null `detected_lang`) as a standalone column for programmatic filtering. Human-readable summaries include `(originally XX)` annotations — e.g., `... [forum] (originally de) 20.5KB in 5.4s — ...`.
+
+### Configuration and thresholds
+
+| Setting | Source | Value | Purpose |
+|---|---|---|---|
+| Error suppression (detection) | Global `_detect_error` | `False` default | After first langid failure, all subsequent calls return `('en', 1.0)` — prevents repeated library failures |
+| Confidence threshold | `min_confidence=0.4` param | 0.4 | Below this, detection defaults to English to avoid noisy false positives on sparse content |
+| Short text skip (detection) | Hardcoded in `detect_language()` | `< 30 chars` | Combined title+body shorter than 30 chars is too unreliable — assume English |
+
+### Graceful degradation
+
+Detection failures never break probing:
+
+- **Library unavailable** (e.g., import fails) → `('en', 1.0)` returned, detection suppressed entirely
+- **Short strings (<30 chars)** → skipped entirely, treated as English
+- **Low-confidence detection** → treated as English (`conf < 0.4`)
+- **Exception in `_do_probe()` detection block** → probe still succeeds, `detected_lang` defaults to `"en"`, original summary preserved
+
+### Design rationale
+
+| Choice | Reason |
+|---|---|
+| Detection only, no translation | Cloud translation sends I2P content to third parties — privacy violation. Offline translation is future work pending local engine. |
+| Full body for detection, not just summary | Title + 8KB of raw page text gives `langid` far more signal than summary lines alone — reduces false positives on mixed-language or short extracted summaries. |
+| Language tag in summary text | Humans auditing address_book can immediately see which entries are non-English without querying the DB directly. |
+| 29-language name mapping | Covers most languages likely encountered on I2P. Unknown codes still show ISO code without English name — graceful fallback. |
+| Persistent `detected_lang` column | Enables structured queries (e.g., "show all non-English destinations") without parsing summary text. Supports future features like per-language probe prioritization. |
+| Fallback to English on low confidence | Prevents false positives on short/mixed-language content that `langid` can't reliably classify. Safer than tagging uncertain content as foreign. |
+
+### Future: offline translation (post-MVP)
+
+When a fully local translation engine is integrated, it must satisfy NFR-07:
+- Runs entirely on-CPU with zero outbound network traffic
+- No runtime model downloads, update checks, or telemetry
+- Viable candidates: quantized MarianMT via `transformers` library (with updates disabled), ONNX-based sentencepiece models, or bundled dictionary-based systems
 
 ## Configuration
 

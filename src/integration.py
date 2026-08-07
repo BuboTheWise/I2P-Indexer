@@ -317,6 +317,7 @@ class DiscoveryResult:
     error: str = ""
     content_type: str = ""     # short bucket label (e.g. "forum", "news site")
     content_summary: str = ""  # sentence-length description of page content
+    detected_lang: str = ""    # ISO 639-1 code from langid (e.g. "de", "ja")
     found_links: list[str] = field(default_factory=list)
     content_hash: str = ""     # SHA-256 of body for change detection
     last_modified: str = ""    # HTTP Last-Modified header value
@@ -406,6 +407,7 @@ class DiscoveryDB:
                 response_time   REAL    DEFAULT 0.0,
                 via_method      TEXT    DEFAULT '',
                 content_type    TEXT    DEFAULT '',  -- short bucket label (e.g. 'forum')
+                detected_lang   TEXT    DEFAULT '',  -- ISO 639-1 language code (e.g. 'de', 'ja')
                 content_summary TEXT    DEFAULT '',  -- sentence-length page description
                 content_hash    TEXT    DEFAULT '',  -- SHA-256 of body for change detection
                 last_modified   TEXT    DEFAULT '',  -- HTTP Last-Modified header value
@@ -443,6 +445,7 @@ class DiscoveryDB:
                 ab.reachable,
                 datetime(ab.last_probed_at, 'unixepoch') AS last_probed_utc,
                 ab.content_summary,
+                ab.detected_lang,
                 ab.ident_hash_hex,
                 ab.b32_addr,
                 ab.status_code,
@@ -471,6 +474,7 @@ class DiscoveryDB:
                     response_time   AS response_time_sec,
                     via_method,
                     content_type,
+                    detected_lang,
                     content_summary,
                     probed_at       AS last_probed_at,
                     content_hash,
@@ -531,6 +535,13 @@ class DiscoveryDB:
                 "discoveries.needs_review has unexpected type '%s'; may cause issues.",
                 col_info["needs_review"],
             )
+
+        if "detected_lang" not in col_info:
+            cur.execute(
+                "ALTER TABLE discoveries ADD COLUMN detected_lang TEXT DEFAULT ''"
+            )
+            self._conn.commit()
+            logger.info("Added detected_lang column to discoveries table")
 
         # Ensure unique constraint for upsert-based dedup (ident_hash_hex + probe_mode).
         # Existing databases will have duplicate rows from repeated sweeps, so we need
@@ -642,10 +653,14 @@ class DiscoveryDB:
                          AND ab.content_summary IS NOT NULL AND LENGTH(ab.content_summary) > 30
                     THEN
                         printf(
-                            '%s ("%s") [%s] %sKB in %.1fs — %s',
+                            '%s ("%s") [%s]%s %sKB in %.1fs — %s',
                             ab.dns_name,
                             REPLACE(ab.title, '"', "'"),
                             COALESCE(NULLIF(ab.content_type, ''), 'unknown'),
+                            CASE WHEN ab.detected_lang IS NOT NULL AND LENGTH(ab.detected_lang) = 2
+                                     AND ab.detected_lang != 'en'
+                                 THEN printf(' (originally %s)', ab.detected_lang)
+                                 ELSE '' END,
                             CASE WHEN ab.body_length > 0
                                  THEN CAST(CAST(ab.body_length AS REAL) / 1024.0 AS NUMERIC)
                                  ELSE NULL END,
@@ -701,6 +716,7 @@ class DiscoveryDB:
                     response_time   AS response_time_sec,
                     via_method,
                     content_type,
+                    detected_lang,
                     content_summary,
                     probed_at       AS last_probed_at,
                     content_hash,
@@ -756,6 +772,7 @@ class DiscoveryDB:
                 "flags" in view_sql
                 and "needs_review" in view_sql
                 and "currently unreachable" in view_sql
+                and "(originally %s)" in view_sql
             )
             if stable:
                 return
@@ -836,6 +853,7 @@ class DiscoveryDB:
         i2p_dns_name: str = "",
         via_method: str = "",
         content_type: str = "",
+        detected_lang: str = "",
         content_summary: str = "",
         content_hash: str = "",
         last_modified: str = "",
@@ -854,9 +872,9 @@ class DiscoveryDB:
                 """INSERT INTO discoveries
                    (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, reachable,
                     status_code, body_length, title, response_time, via_method,
-                    content_type, content_summary, content_hash, last_modified,
+                    content_type, detected_lang, content_summary, content_hash, last_modified,
                     found_links, flags, needs_review, error_msg, probed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(ident_hash_hex, probe_mode) DO UPDATE SET
                        b32_addr=excluded.b32_addr,
                        i2p_dns_name=COALESCE(NULLIF(excluded.i2p_dns_name, ''), i2p_dns_name),
@@ -867,6 +885,7 @@ class DiscoveryDB:
                        response_time=excluded.response_time,
                        via_method=excluded.via_method,
                        content_type=excluded.content_type,
+                       detected_lang=COALESCE(NULLIF(excluded.detected_lang, ''), detected_lang),
                        content_summary=excluded.content_summary,
                        content_hash=excluded.content_hash,
                        last_modified=excluded.last_modified,
@@ -877,8 +896,8 @@ class DiscoveryDB:
                        probed_at=excluded.probed_at""",
                 (ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, int(reachable),
                  status_code, body_length, title, response_time, via_method,
-                 content_type, _truncate(content_summary, 4096), content_hash,
-                 last_modified, _json.dumps(found_links or []),
+                 content_type, detected_lang, _truncate(content_summary, 4096),
+                 content_hash, last_modified, _json.dumps(found_links or []),
                  _json.dumps(flags or []), int(needs_review), error_msg, now),
             )
             self._conn.commit()
@@ -1595,6 +1614,35 @@ def _do_probe(
         if extractor_result.needs_review:
             flags.append(f"needs_review: {extractor_result.reason}")
 
+        # ── Language detection + translation ─────────────────────────────
+        detected_lang = "en"  # default assumption
+        translated_summary_lines = list(extractor_result.summary_lines)
+        try:
+            from src.translation import detect_language, translate_to_english
+            from src.translation import process_content_for_language
+
+            # Detect language from title + body sample
+            det_lang, conf = detect_language(title_text, body_text)
+
+            if det_lang != "en" and conf >= 0.4:
+                # Translate summary lines to English with language tag
+                translated_summary_lines, detected_lang = process_content_for_language(
+                    title=title_text,
+                    summary_lines=list(extractor_result.summary_lines),
+                    detected_lang=det_lang,
+                    confidence=conf,
+                )
+                logger.info(
+                    f"  [lang] Detected {det_lang} (conf={conf:.2f}), "
+                    f"translated summary for {url}"
+                )
+            else:
+                detected_lang = det_lang if conf >= 0.4 else "en"
+        except Exception:
+            # Translation is best-effort; never fail a probe for it
+            logger.debug("Language detection/translation skipped")
+            pass
+
         result = DiscoveryResult(
             b32_addr=url.split("/")[2] if "/" in url else "",
             ident_hash_hex=ident_hash_hex,
@@ -1606,7 +1654,8 @@ def _do_probe(
             via_method=probe_mode,
             probe_mode=probe_mode,
             content_type=extractor_result.content_type,
-            content_summary=extractor_result.content_summary,
+            detected_lang=detected_lang,
+            content_summary="\n".join(translated_summary_lines),
             found_links=extractor_result.links,
             flags=flags,
             needs_review=extractor_result.needs_review,

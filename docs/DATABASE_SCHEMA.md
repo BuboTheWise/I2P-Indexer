@@ -20,7 +20,8 @@ Stores the result of each probe attempt. One row per fetch — retries over time
 | `response_time` | REAL | Yes | `0.0` | Fetch latency in seconds |
 | `via_method` | TEXT | Yes | `''` | Path that succeeded: `'b32'`, `'dns'`, or `'b32+dns'` |
 | `content_type` | TEXT | Yes | `''` | Content bucket label (e.g., `"forum"`, `"news site"`) |
-| `content_summary` | TEXT | Yes | `''` | Sentence-length description of page content |
+| `content_summary` | TEXT | Yes | `''` | Sentence-length description of page content. Non-English summaries are annotated with `[detected_language: XX (LanguageName)]` prefix for auditability. |
+| `detected_lang` | TEXT | Yes | `'en'` | ISO 639-1 language code detected by `langid` (e.g., `de`, `ja`, `ru`). Defaults to `en` when detection fails or text is too short. Enables structured filtering of non-English destinations. |
 | `content_hash` | TEXT | Yes | `''` | SHA-256 hash of response body for change detection |
 | `last_modified` | TEXT | Yes | `''` | HTTP `Last-Modified` header value (if present) |
 | `found_links` | TEXT | Yes | `'[]'` | JSON array of `.i2p` hostnames found in page content |
@@ -181,7 +182,7 @@ The view uses a two-tier dedup strategy:
 
 A site probed via both `test.i2p` and its raw b32 address appears as two rows — they represent distinct entry points. Two probes for the same DNS name collapse into one (the latest).
 
-### Columns (18 total) — human-readable first, technical at end
+### Columns (19 total) — human-readable first, technical at end
 
 | Column | Source | Description |
 |---|---|---|
@@ -189,7 +190,8 @@ A site probed via both `test.i2p` and its raw b32 address appears as two rows �
 | `content_type` | computations | Computed content classification |
 | `reachable` | discoveries (latest) | 1 = UP, 0 = DOWN |
 | `last_probed_utc` | computed (`datetime()`) | Human-readable UTC timestamp |
-| `content_summary` | computations | Natural-language summary |
+| `content_summary` | computations | Natural-language summary (may include `[detected_language: XX]` prefix) |
+| `detected_lang` | discoveries (latest) | ISO 639-1 language code — empty string for English/undetermined |
 | `ident_hash_hex` | discoveries → routers/leasesets join | SHA-1 destination hash |
 | `b32_addr` | discoveries | Base32 address |
 | `status_code` | discoveries (latest) | HTTP status code or 0 |

@@ -62,6 +62,11 @@ The authoritative target list for discovery sweeps. All probing sources (well-kn
 | `last_probed_at` | REAL | No | `0` | Unix timestamp of last probe |
 | `source` | TEXT | No | `'manual'` | Origin: `'manual'`, `'addressbook'`, `'linked'` (auto-seeded) |
 | `source_site` | TEXT | No | `''` | When `source='linked'`, the `.i2p` hostname of the parent site that discovered this target |
+| `susi_active` | INTEGER | No | `0` | Whether destination appears active in SUSI DNS export |
+| `first_seen_at` | REAL | No | `0` | Unix timestamp when target was first inserted |
+| `last_updated_at` | REAL | No | `0` | Unix timestamp of last upsert / refresh |
+| `consecutive_failures` | INTEGER | No | `0` | Count of consecutive probe failures — resets to 0 on success |
+| `backoff_until` | REAL | No | `0` | Unix timestamp until which this target is excluded from sweeps. Uses exponential backoff: 60s → 300s → 1800s → 7200s → 43200s → capped at 604800s (7 days) |
 
 ### Auto-seeding flow
 
@@ -80,6 +85,21 @@ When a probe succeeds and extracts `.i2p` links from page content:
 3. **Oldest probes first** — within same tier, targets with earlier `last_probed_at` get refreshed sooner
 
 This means each sweep re-probes previously reachable sites first (highest success rate), then moves to unprobed territory.
+
+#### Adaptive backoff
+
+After every probe, `consecutive_failures` and `backoff_until` are updated via `DiscoveryDB.update_backoff_state()`. On failure the counter increments and the target is excluded from the next sweep for an exponentially growing interval:
+
+| Consecutive failures | Backoff interval |
+|---|---|
+| 1 | 60 seconds |
+| 2 | 5 minutes |
+| 3 | 30 minutes |
+| 4 | 2 hours |
+| 5 | 12 hours |
+| ≥6 | 7 days (hard cap) |
+
+On success, `consecutive_failures` resets to 0 and `backoff_until` clears to 0. Target ordering (`get_targets()`) applies the backoff filter by default so sweep runs skip targets in their cooldown window. Use `--no-backoff` on the CLI or `skip_backoff=False` in code to force-probe everything regardless of backoff state.
 
 ```python
 # Manual seeding

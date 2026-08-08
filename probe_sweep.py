@@ -250,7 +250,10 @@ def generate_report(db_path: str, output_path: str) -> None:
             if flags_list:
                 f.write(f"- **Flags ({len(flags_list)}):**\n")
                 for flag in flags_list:
-                    f.write(f"  - {flag}\n")
+                    if isinstance(flag, dict):
+                        f.write(f"  - {flag.get('type', '')}: {flag.get('value', '')}\n")
+                    else:
+                        f.write(f"  - {flag}\n")
 
             # Error info if present even on reachable
             err = entry.get("error_msg", "") or ""
@@ -402,6 +405,18 @@ def main():
             "Prevents a single directory site from flooding the target queue with hundreds of links."
         ),
     )
+    p.add_argument(
+        "--respect-robots",
+        action="store_true",
+        default=False,
+        help="Fetch robots.txt from each destination and skip Disallow paths during link extraction (default: off — probe everything)",
+    )
+    p.add_argument(
+        "--no-backoff",
+        action="store_true",
+        default=False,
+        help="Disable adaptive backoff — probe targets even when they are in their backoff window (default: respect backoff)",
+    )
     args = p.parse_args()
 
     # ── Validate crawl args ───────────────────────────────────────
@@ -477,7 +492,7 @@ def main():
     # ── Dry run — show what would be probed ────────────────────────
     if args.dry_run:
         db = DiscoveryDB(args.db)
-        targets = db.get_targets(filter_mode=args.sweep_filter or "all", min_age_hours=args.min_age_hours)
+        targets = db.get_targets(filter_mode=args.sweep_filter or "all", min_age_hours=args.min_age_hours, skip_backoff=not args.no_backoff)
         if args.count:
             targets = targets[:args.count]
         print(f"Database: {args.db}")
@@ -494,6 +509,9 @@ def main():
     from src.config import I2PConfig
 
     effective_timeout = integration_module.PROBE_TIMEOUT
+    if args.respect_robots:
+        print("  robots.txt filtering enabled — skipping Disallow paths")
+
     results = discover_addresses(
         known_addrs=None,
         config=I2PConfig(),
@@ -502,6 +520,8 @@ def main():
         timeout=effective_timeout,
         filter_mode=args.sweep_filter or "all",
         min_age_hours=args.min_age_hours,
+        skip_backoff=not args.no_backoff,
+        respect_robots=args.respect_robots,
     )
 
     # Slice to --count if requested

@@ -5,10 +5,17 @@ from __future__ import annotations
 import json
 import math
 import pathlib
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
 from .integration import get_address_book
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+_TEMPLATE_DIR = pathlib.Path(__file__).parent / "browse_template.html"
 
 
 def _humanize_bytes(value: int | None) -> str:
@@ -44,6 +51,7 @@ def _transform_row(row: dict[str, Any]) -> dict[str, Any]:
         "title": row.get("title", "") or "",
         "content_type": row.get("content_type", "") or "",
         "content_summary": (summary if summary else "Unidentified").replace("\n", " "),
+        "detected_lang": row.get("detected_lang", "") or "",
         "reachable": bool(row.get("reachable", False)),
         "last_probed_utc": row.get("last_probed_utc", "") or "",
         "_rt": _format_response_time(rt),
@@ -94,7 +102,7 @@ thead .sort-asc::after{{content:' ▲'}} thead .sort-desc::after{{content:' ▼'
 /* Column widths (fixed, predictable) */
   col.c-status{{width:64px;}} col.c-type{{width:90px;}}
   col.c-site{{width:auto;}} col.c-title{{width:120px;}}
-  col.c-rt{{width:64px;}} col.c-size{{width:64px;}}
+  col.c-rt{{width:64px;}} col.c-size{{width:64px;}} col.c-lang{{width:50px;}}
   col.c-time{{width:150px;}} col.c-bw{{width:70px;}} col.c-probe{{width:30px;}}
 
 tbody tr:nth-child(even){{background:#0e0e14}}
@@ -139,6 +147,7 @@ td.unreachable{{color:#666;opacity:.55}}
     <col class="c-title">
     <col class="c-rt">
     <col class="c-size">
+    <col class="c-lang">
     <col class="c-time">
     <col class="c-bw">
     <col class="c-probe">
@@ -164,6 +173,7 @@ const COLS = [
   {{key:'title',       label:'Title',     width:120}},
   {{key:'_rt',         label:'Resp T',    width:64}},
   {{key:'_size',       label:'Size',      width:64}},
+  {{key:'detected_lang',label:'Lang',    width:50}},
   {{key:'last_probed_utc',label:'Last Probed',width:150}},
   {{key:'_bw',         label:'Bandwidth',width:70}},
   {{key:'_probe',      label:'#L',        width:30}},
@@ -234,6 +244,8 @@ function render(){{
     b += `<td title="${{esc((r.content_summary||'').replace(/"/g,'&quot;'))}}">${{esc(r.title||'')}}</td>`;
     b += `<td>${{esc(r._rt||'')}}</td>`;
     b += `<td>${{esc(r._size||'')}}</td>`;
+    const langLabel = r.detected_lang && r.detected_lang !== 'en' ? r.detected_lang.toUpperCase() : '';
+    b += `<td title="ISO 639-1">${{esc(langLabel)}}</td>`;
     b += `<td title="${{esc((r.content_summary||'').replace(/"/g,'&quot;'))}}">${{esc(r.last_probed_utc||'')}}</td>`;
     b += `<td>${{esc(r._bw||'')}}</td>`;
     const linkCount = r.found_links && typeof r.found_links === 'string' ? JSON.parse(r.found_links+'').length : 0;
@@ -414,4 +426,174 @@ def generate_address_book_txt(db_path: str, output_dir: str) -> pathlib.Path:
     out_path.mkdir(parents=True, exist_ok=True)
     target = out_path / "address_book_hosts.txt"
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return target.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Enhanced browse UI (tabs, timeline, filters, language detection)
+# ---------------------------------------------------------------------------
+
+def _query_entries(db_path: str) -> list[dict]:
+    """Fetch address_book rows and shape them for the enhanced browse UI JSON.
+
+    Includes ``detected_lang`` and ``flags`` which the enhanced template consumes
+    for filter dropdowns and row detail panels.  Since the ``address_book`` view
+    does not expose these as top-level columns, we query the underlying
+    discoveries table directly to get the latest probe per destination.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        # Get all rows from address_book view for base data
+        ab_rows = get_address_book(db_path)
+
+        # Build a mapping from ident_hash_hex to the actual detected_lang/flags
+        # by querying discoveries for the latest probe per destination
+        entries: list[dict] = []
+        for r in ab_rows:
+            # Parse flags JSON safely (DB stores it as a JSON string)
+            flags_raw = r.get("flags")
+            if isinstance(flags_raw, str):
+                try:
+                    flags_val = json.loads(flags_raw)
+                except (json.JSONDecodeError, TypeError):
+                    flags_val = []
+            else:
+                flags_val = flags_raw or []
+
+            detected_lang = r.get("detected_lang", "") or ""
+            # If the view didn't carry detected_lang as a column, we need to
+            # fetch it from discoveries.  Try direct lookup first; if None/empty
+            # then do a per-hash lookup.
+            if not detected_lang:
+                ident = r.get("ident_hash_hex", "")
+                if ident:
+                    cur2 = conn.cursor()
+                    cur2.execute(
+                        "SELECT detected_lang FROM discoveries "
+                        "WHERE ident_hash_hex = ? ORDER BY probed_at DESC LIMIT 1",
+                        (ident,),
+                    )
+                    hit = cur2.fetchone()
+                    if hit and hit[0]:
+                        detected_lang = hit[0]
+
+            entries.append({
+                "dns_name": r.get("dns_name", "") or "",
+                "title": r.get("title", "") or "",
+                "content_type": r.get("content_type", "") or "",
+                "content_summary": (r.get("content_summary") or "").replace("\n", " "),
+                "reachable": bool(r.get("reachable", False)),
+                "last_probed_utc": r.get("last_probed_utc", "") or "",
+                "response_time_sec": r.get("response_time_sec") or 0,
+                "body_length": r.get("body_length") or 0,
+                "bandwidth_kbps": r.get("bandwidth_kbps"),
+                "detected_lang": detected_lang,
+                "found_links": (r.get("found_links") or "[]"),
+                "flags": flags_val,
+            })
+
+        return entries
+    finally:
+        conn.close()
+
+
+def _query_timeline(db_path: str) -> list[dict]:
+    """Fetch the latest discovery per destination for the timeline tab.
+
+    Returns one row per *ident_hash_hex* showing when it was last probed,
+    whether it was reachable, and the HTTP status code — exactly what the
+    enhanced template's timeline column expects.  Uses ``b32_addr`` as a
+    readable fallback when ``i2p_dns_name`` is empty.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT d.i2p_dns_name,
+                   CASE WHEN d.reachable THEN 1 ELSE 0 END AS reachable,
+                   d.status_code,
+                   datetime(d.probed_at, 'unixepoch') AS probed_at_utc
+            FROM discoveries d
+            INNER JOIN (
+                SELECT ident_hash_hex, MAX(probed_at) AS max_probed
+                FROM discoveries GROUP BY ident_hash_hex
+            ) latest ON d.ident_hash_hex = latest.ident_hash_hex
+                    AND d.probed_at = latest.max_probed
+            ORDER BY d.probed_at DESC
+        """)
+        results: list[dict] = []
+        for dns_name, reachable, status_code, probed_at_utc in cur.fetchall():
+            # Use b32_addr as fallback when i2p_dns_name is empty/missing
+            if not dns_name:
+                cur2 = conn.cursor()
+                cur2.execute(
+                    "SELECT b32_addr FROM discoveries "
+                    "WHERE ident_hash_hex = (SELECT ident_hash_hex FROM discoveries "
+                    "  WHERE probed_at = ? LIMIT 1) LIMIT 1",
+                    (datetime.strptime(probed_at_utc, "%Y-%m-%d %H:%M:%S")
+                     .replace(tzinfo=timezone.utc).timestamp(),),
+                )
+                hit = cur2.fetchone()
+                dns_name = hit[0] if hit else ""
+            results.append({
+                "dns_name": dns_name or "",
+                "reachable": reachable,
+                "status_code": status_code,
+                "probed_at_utc": probed_at_utc,
+            })
+        return results
+    finally:
+        conn.close()
+
+
+def generate_address_book_ui(
+    db_path: str,
+    output_dir: str,
+    template_path: pathlib.Path | None = None,
+) -> pathlib.Path:
+    """Generate the enhanced browse UI HTML with tabs, timeline, and filters.
+
+    Uses ``browse_template.html`` from the source tree which provides a richer
+    interface than :func:`generate_address_book_html` — tabbed navigation,
+    interactive timeline view, type/language/status filters, row expansion
+    panels, and dark theme matching the project style guide.
+
+    Args:
+        db_path: Path to the I2P Indexer SQLite database.
+        output_dir: Directory to write the HTML file into (created if missing).
+        template_path: Optional explicit path to the browse template.
+            Defaults to ``src/browse_template.html`` alongside this module.
+
+    Returns:
+        Absolute path to the generated ``address_book_ui.html``.
+    """
+    # 1. Load template
+    tmpl = template_path or _TEMPLATE_DIR
+    html_template = tmpl.read_text(encoding="utf-8")
+
+    # 2. Fetch data
+    entries = _query_entries(db_path)
+    items_timeline = _query_timeline(db_path)
+
+    # 3. Serialize JSON payloads
+    entries_json = json.dumps(entries, ensure_ascii=False)
+    timeline_json = json.dumps(items_timeline, ensure_ascii=False)
+
+    # Timestamp for header/footer
+    export_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    # 4. Render template by replacing placeholders
+    html = (
+        html_template
+        .replace("__ENTRIES_JSON__", entries_json)
+        .replace("__TIMELINE_JSON__", timeline_json)
+        .replace("__EXPORT_TS__", export_ts)
+    )
+
+    # 5. Write to output directory
+    out_path = pathlib.Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    target = out_path / "address_book_ui.html"
+    target.write_text(html, encoding="utf-8")
     return target.resolve()

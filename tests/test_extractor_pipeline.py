@@ -856,8 +856,8 @@ class TestAnalyzerCli:
         assert code in (0, 1), f"Unexpected exit code {code}: {stderr}"
 
     def test_all_flagged_flag(self):
-        """all-flagged subcommand parses and runs."""
-        stdout, stderr, code = self._cli("all-flagged")
+        """all-flagged subcommand parses and runs with limit+timeout."""
+        stdout, stderr, code = self._cli("all-flagged", "--limit", "1", "--timeout", "5")
         assert code in (0, 1), f"Unexpected exit code {code}: {stderr}"
 
     def test_help_flag(self):

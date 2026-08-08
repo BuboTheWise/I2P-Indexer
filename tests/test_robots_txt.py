@@ -260,3 +260,203 @@ class TestRespectRobotsCLI:
         )
         # Should not error with 'unrecognized arguments'
         assert "unrecognized arguments: --respect-robots" not in result.stderr
+
+
+# ── End-to-end: robots policy filters discovered links from HTML ─────
+
+
+class TestRobotsFiltersDiscoveredLinks:
+    """Test that Disallow rules actually drop .i2p links extracted from mocked HTML.
+
+    Tests the wire-up path: discover_addresses() -> probe_destination() -> _do_probe()
+    where _do_probe fetches HTML via fetch_i2p, the HtmlExtractor extracts .i2p
+    hostnames from <a> tags / body text, and robots_policy filters them at result
+    assembly time.  Uses full mock responses with known disallowed/allowed paths."""
+
+    @patch("src.integration.fetch_i2p")
+    def test_fully_blocked_robots_drops_all_discovered_links(self, mock_fetch):
+        """When robots.txt Disallow: / (fully blocked), ALL .i2p links extracted from
+        the mocked HTML must be removed from result.found_links."""
+        from src.integration import probe_destination
+
+        # Mock HTML containing several .i2p links in <a> tags and body text
+        mock_html = (
+            "<html><head><title>Test Site</title></head>"
+            "<body>"
+            '  <p>Welcome to our site.</p>'
+            '  <a href="http://alice-market.i2p/">Alice Market</a>'
+            '  <a href="http://bob-forum.i2p/">Bob Forum</a>'
+            '  <a href="http://carol-blog.i2p/">Carol Blog</a>'
+            '  Also check charlie-wiki.i2p and dave-archive.i2p'
+            "</body></html>"
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.body = mock_html.encode("utf-8")
+        mock_resp.text = mock_html
+        mock_resp.title = MagicMock(return_value="Test Site")
+        mock_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        mock_fetch.return_value = mock_resp
+
+        # Robots policy that blocks EVERYTHING (Disallow: /)
+        from src.robots_parser import parse_robots_txt
+        robots_raw = "User-agent: *\nDisallow: /\n"
+        full_block_policy = parse_robots_txt("test.i2p", robots_raw)
+        assert full_block_policy.is_fully_blocked
+
+        result = probe_destination(
+            ident_hash_hex="aabbccddee" * 4,  # 40-char hex -> valid b32 address
+            i2p_dns_name="test.i2p",
+            robots_policy=full_block_policy,
+        )
+
+        # The extractor SHOULD have found .i2p links in the HTML,
+        # but the robots filter must remove all of them.
+        assert result.reachable is True
+        # All discovered i2p links must be blocked
+        assert len(result.found_links) == 0, (
+            f"Expected no links when fully blocked, got: {result.found_links}"
+        )
+
+    @patch("src.integration.fetch_i2p")
+    def test_partial_disallow_allows_hostname_links(self, mock_fetch):
+        """When robots.txt has partial Disallow rules (e.g. /admin), extracted .i2p
+        hostname links are NOT filtered (since hostnames != paths).
+
+        This documents current behavior: path-level Disallow only triggers link
+        removal when is_fully_blocked=True."""
+        from src.integration import probe_destination
+
+        mock_html = (
+            "<html><head><title>Test Site</title></head>"
+            "<body>"
+            '  <p>Welcome.</p>'
+            '  <a href="http://neighbor-site.i2p/">Neighbor</a>'
+            '  <a href="http://other-market.i2p/">Other Market</a>'
+            "</body></html>"
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.body = mock_html.encode("utf-8")
+        mock_resp.text = mock_html
+        mock_resp.title = MagicMock(return_value="Test Site")
+        mock_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        mock_fetch.return_value = mock_resp
+
+        # Partial disallow — blocks /admin but not everything
+        from src.robots_parser import parse_robots_txt
+        robots_raw = "User-agent: *\nDisallow: /admin\nDisallow: /private\n"
+        partial_policy = parse_robots_txt("test.i2p", robots_raw)
+        assert not partial_policy.is_fully_blocked
+
+        result = probe_destination(
+            ident_hash_hex="aabbccddee" * 4,
+            i2p_dns_name="test.i2p",
+            robots_policy=partial_policy,
+        )
+
+        # With partial disallow, hostname-level .i2p links pass through
+        assert result.reachable is True
+        # Links should be present (they're hostnames, not paths)
+        assert len(result.found_links) > 0, (
+            f"Expected links to pass through with partial disallow, got: {result.found_links}"
+        )
+
+    @patch("src.integration.fetch_i2p")
+    def test_discover_addresses_respects_robots_via_probe(self, mock_fetch):
+        """Full integration: discover_addresses with respect_robots=True should produce
+        results where fully-blocked sites have no discovered links and carry a robots_txt flag."""
+        from src.integration import discover_addresses
+
+        mock_html = (
+            "<html><head><title>Blocked Site</title></head>"
+            "<body>"
+            '  <a href="http://seed1.i2p/">Seed 1</a>'
+            '  <a href="http://seed2.i2p/">Seed 2</a>'
+            '  <a href="http://seed3.i2p/">Seed 3</a>'
+            "</body></html>"
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.body = mock_html.encode("utf-8")
+        mock_resp.text = mock_html
+        mock_resp.title = MagicMock(return_value="Blocked Site")
+        mock_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        mock_fetch.return_value = mock_resp
+
+        # Patch fetch_robots_txt to return a fully-blocked policy for this destination
+        with patch("src.robots_parser.fetch_robots_txt") as mock_fetch_robots:
+            from src.robots_parser import parse_robots_txt
+            block_all = parse_robots_txt("blocked.i2p", "User-agent: *\nDisallow: /\n")
+            mock_fetch_robots.return_value = block_all
+
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+                db_path = f.name
+
+            try:
+                results = discover_addresses(
+                    known_addrs=["blocked.i2p"],
+                    db_path=db_path,
+                    respect_robots=True,
+                )
+                assert len(results) == 1
+                r = results[0]
+                # Discovered links must be empty (blocked by robots policy)
+                assert len(r.found_links) == 0, (
+                    f"Expected no links from blocked site, got: {r.found_links}"
+                )
+                # A robots_txt flag must exist in the result flags
+                robot_flags = [f for f in r.flags if f.get("type") == "robots_txt"]
+                assert len(robot_flags) > 0, (
+                    f"Expected a robots_txt flag in flags: {r.flags}"
+                )
+                # The flag should reference blocked links
+                flag_value = robot_flags[0].get("value", "")
+                assert "blocked" in flag_value.lower(), (
+                    f"Flag value should mention 'blocked': {flag_value}"
+                )
+
+            finally:
+                import os
+                try:
+                    os.unlink(db_path)
+                except FileNotFoundError:
+                    pass
+
+    @patch("src.integration.fetch_i2p")
+    def test_no_robots_policy_preserves_discovered_links(self, mock_fetch):
+        """Without robots policy (respect_robots=False), all .i2p links from HTML
+        should be preserved in the result."""
+        from src.integration import probe_destination
+
+        mock_html = (
+            "<html><head><title>No Robots</title></head>"
+            "<body>"
+            '  <a href="http://link-a.i2p/">A</a>'
+            '  <a href="http://link-b.i2p/">B</a>'
+            '  Reference: link-c.i2p'
+            "</body></html>"
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.body = mock_html.encode("utf-8")
+        mock_resp.text = mock_html
+        mock_resp.title = MagicMock(return_value="No Robots")
+        mock_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        mock_fetch.return_value = mock_resp
+
+        result = probe_destination(
+            ident_hash_hex="aabbccddee" * 4,
+            i2p_dns_name="norobots.i2p",
+            robots_policy=None,  # equivalent to respect_robots=False
+        )
+
+        assert result.reachable is True
+        # All .i2p links should be present without filtering
+        assert len(result.found_links) >= 3, (
+            f"Expected at least 3 discovered i2p links, got: {result.found_links}"
+        )

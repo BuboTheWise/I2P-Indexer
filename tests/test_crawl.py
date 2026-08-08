@@ -23,6 +23,7 @@ from src.integration import (
     auto_crawl,
     probe_destination,
 )
+from src.models import DiscoveryResult
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +407,146 @@ class TestAutoCrawl:
         results = db.get_new_targets_for_crawl(depth=1)
         dns_list = [r[1] for r in results]
         assert dns_list.count("dedup.i2p") == 1
+
+    @patch("src.integration._do_probe")
+    def test_crawl_multi_depth_respects_max_depth(self, mock_do_probe, db):
+        """Site A → Site B → Site C: verify crawler follows links across 3 depth levels
+        and stops at max_depth boundary without going further.
+
+        Mock _do_probe (the HTTP call) so probe_destination() runs normally —
+        meaning upsert_targets_from_links() is actually called with found_links
+        from the mock, inserting next-depth targets into the DB automatically.
+
+        This exercises: depth-1 probing → auto-seeds depth-2 → round 2 probes those
+        → auto-seeds depth-3 → round 3 probes those → boundary stops at round 3.
+        """
+        # Seed two "Site A" targets at crawl_depth = 1 (the entry points)
+        cur = db._conn.cursor()
+        for i in range(2):
+            hx = f"a{i}" * 10
+            cur.execute(
+                "INSERT INTO targets (ident_hash_hex, i2p_dns_name, source, crawl_depth, last_probed_at) "
+                "VALUES (?, ?, 'linked', 1, 0)",
+                (hx, f"siteA_{i}.i2p"),
+            )
+        db._conn.commit()
+
+        # Build a lookup mapping each DNS name to the links it discovers.
+        # siteA → siteB (depth 2), siteB → siteC (depth 3)
+        link_map = {
+            "siteA_0.i2p": ["siteB_0.i2p"],
+            "siteA_1.i2p": ["siteB_1.i2p"],
+            "siteB_0.i2p": ["siteC_0.i2p"],
+            "siteB_1.i2p": ["siteC_1.i2p"],
+            "siteC_0.i2p": [],
+            "siteC_1.i2p": [],
+        }
+
+        def mock_do_probe_impl(url, ident_hash_hex, i2p_dns_name="", **kwargs):
+            return DiscoveryResult(
+                b32_addr="",
+                reachable=True,
+                body_length=512,
+                response_time_sec=0.1,
+                content_type="text/html",
+                title=f"Mocked {i2p_dns_name}",
+                found_links=link_map.get(i2p_dns_name, []),
+                probe_mode=kwargs.get("probe_mode", "dns"),
+                content_summary="",  # must be str, not None (record_discovery passes to _truncate)
+            )
+
+        mock_do_probe.side_effect = mock_do_probe_impl
+
+        stats = auto_crawl(
+            max_depth=3,
+            crawl_delay=0.01,
+            timeout=5.0,
+            db_instance=db,
+        )
+
+        # All 3 rounds must run (depth 1 → 2 → 3)
+        assert stats["rounds_run"] == 3, f"Expected 3 rounds, got {stats['rounds_run']}"
+        assert stats["depth_reached"] == 3, f"Max depth reached should be 3, got {stats['depth_reached']}"
+
+        # Per-depth breakdown: round1=2 siteA, round2=2 siteB, round3=2 siteC
+        assert "1" in stats["domains_per_depth"]
+        assert "2" in stats["domains_per_depth"]
+        assert "3" in stats["domains_per_depth"]
+
+        assert stats["domains_per_depth"]["1"]["attempted"] == 2, \
+            f"Depth 1 should probe 2 siteA targets, got {stats['domains_per_depth']['1']['attempted']}"
+        assert stats["domains_per_depth"]["2"]["attempted"] == 2, \
+            f"Depth 2 should probe 2 siteB targets, got {stats['domains_per_depth']['2']['attempted']}"
+        assert stats["domains_per_depth"]["3"]["attempted"] == 2, \
+            f"Depth 3 should probe 2 siteC targets, got {stats['domains_per_depth']['3']['attempted']}"
+
+        # Total probes = 6 (2 per round × 3 rounds)
+        assert stats["probes_attempted"] == 6
+
+        # Verify provenance chains reflect full A → B → C lineage
+        cur.execute(
+            "SELECT provenance_chain FROM targets WHERE i2p_dns_name = 'siteC_0.i2p'",
+        )
+        chain_c0 = cur.fetchone()[0]
+        assert "siteB_0.i2p" in chain_c0, "siteC_0 chain missing intermediate siteB_0"
+        assert "siteC_0.i2p" in chain_c0, "siteC_0 missing from own chain"
+
+    @patch("src.integration._do_probe")
+    def test_crawl_stops_at_max_depth_boundary(self, mock_do_probe, db):
+        """Even if max_depth=3 and siteC at depth 3 returns more links (hypothetical
+        depth-4), the auto_crawl loop stops after round 3."""
+        cur = db._conn.cursor()
+        hx_a0 = "a1" * 10
+        cur.execute(
+            "INSERT INTO targets (ident_hash_hex, i2p_dns_name, source, crawl_depth, last_probed_at) "
+            "VALUES (?, ?, 'linked', 1, 0)",
+            (hx_a0, "root.i2p"),
+        )
+        db._conn.commit()
+
+        # Chain: root → d2_target → d3_target → hypothetical_d4 (never probed)
+        link_map = {
+            "root.i2p":           ["d2_target.i2p"],
+            "d2_target.i2p":      ["d3_target.i2p"],
+            "d3_target.i2p":      ["hypothetical_d4.i2p"],  # depth 4 — never reached
+        }
+
+        def mock_do_probe_impl(url, ident_hash_hex, i2p_dns_name="", **kwargs):
+            return DiscoveryResult(
+                b32_addr="",
+                reachable=True,
+                body_length=100,
+                response_time_sec=0.05,
+                content_type="text/html",
+                title=f"Page: {i2p_dns_name}",
+                found_links=link_map.get(i2p_dns_name, []),
+                probe_mode=kwargs.get("probe_mode", "dns"),
+                content_summary="",  # must be str, not None (record_discovery passes to _truncate)
+            )
+
+        mock_do_probe.side_effect = mock_do_probe_impl
+
+        stats = auto_crawl(
+            max_depth=3,
+            crawl_delay=0.01,
+            timeout=5.0,
+            db_instance=db,
+        )
+
+        # Exactly 3 rounds — no fourth even though d3_target returned a link
+        assert stats["rounds_run"] == 3
+        assert stats["depth_reached"] == 3
+
+        # hypothetical_d4 SHOULD exist in the DB (seeded when d3 was probed)
+        # but with crawl_depth=4 and last_probed_at=0 — never probed
+        cur.execute(
+            "SELECT i2p_dns_name, crawl_depth, last_probed_at FROM targets WHERE i2p_dns_name = ?",
+            ("hypothetical_d4.i2p",),
+        )
+        row = cur.fetchone()
+        assert row is not None, "hypothetical_d4 should be in DB (seeded but unprobed)"
+        assert row[1] == 4, f"hypothetical_d4 crawl_depth should be 4, got {row[1]}"
+        assert row[2] == 0, "hypothetical_d4 should have last_probed_at=0 (never probed)"
 
 
 # ---------------------------------------------------------------------------

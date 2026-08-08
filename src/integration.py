@@ -439,6 +439,55 @@ class DiscoveryResult:
 
 
 # ---------------------------------------------------------------------------
+# Adaptive backoff — exponential or fixed penalties for dead destinations
+# ---------------------------------------------------------------------------
+
+# Backoff intervals in seconds (exponential strategy):
+# index N = interval after N consecutive failures.
+# 1→60s, 2→300s, 3→1800s, 4→7200s, 5→43200s (12h), capped at 604800s (7 days).
+_BACKOFF_INTERVALS = (60, 300, 1800, 7200, 43200, 604800)
+
+# Fixed strategy: constant delay per failure (seconds).
+_FIXED_BACKOFF_SECONDS = 300  # 5 minutes per failed attempt
+
+
+class BackoffStrategy:
+    """Named constants for backoff algorithm selection."""
+    EXPONENTIAL = "exponential"
+    FIXED = "fixed"
+
+    @classmethod
+    def valid(cls) -> set[str]:
+        return {cls.EXPONENTIAL, cls.FIXED}
+
+
+def _compute_backoff_interval(
+    consecutive_failures: int,
+    strategy: str = BackoffStrategy.EXPONENTIAL,
+) -> float:
+    """Return the backoff delay in seconds for a given failure count.
+
+    ``strategy`` selects the algorithm:
+      - "exponential" (default): exponential growth bounded by 7 days.
+        consecutive_failures=1 → 60s, 2 → 300s, 3 → 1800s, …
+      - "fixed": constant delay per failure
+        (_FIXED_BACKOFF_SECONDS = 300s × failure_count).
+
+    For backward compatibility, callers that pass only ``consecutive_failures``
+    get exponential behaviour.
+    """
+    if consecutive_failures <= 0:
+        return 0.0
+
+    if strategy == BackoffStrategy.FIXED:
+        return float(consecutive_failures) * _FIXED_BACKOFF_SECONDS
+
+    # Default: exponential growth (original behaviour)
+    idx = min(consecutive_failures - 1, len(_BACKOFF_INTERVALS) - 1)
+    return _BACKOFF_INTERVALS[idx]
+
+
+# ---------------------------------------------------------------------------
 # Persistent discovery database
 # ---------------------------------------------------------------------------
 
@@ -1202,10 +1251,16 @@ class DiscoveryDB:
             self._conn.commit()
             return cur.rowcount
 
-    def update_backoff_state(self, ident_hash_hex: str, dns_name: str, reachable: bool) -> None:
+    def update_backoff_state(
+        self,
+        ident_hash_hex: str,
+        dns_name: str,
+        reachable: bool,
+        backoff_strategy: str = BackoffStrategy.EXPONENTIAL,
+    ) -> None:
         """Update consecutive_failures and backoff_until after a probe attempt.
 
-        On failure: increment consecutive_failures, compute exponential backoff,
+        On failure: increment consecutive_failures, compute backoff interval,
         set backoff_until = now + interval, update last_probed_at.
 
         On success: reset consecutive_failures to 0, clear backoff_until,
@@ -1215,6 +1270,8 @@ class DiscoveryDB:
             ident_hash_hex: SHA-1 hash (40-char hex) of the destination identity.
             dns_name: .i2p DNS name when present (used as fallback lookup key).
             reachable: Whether this probe attempt succeeded.
+            backoff_strategy: "exponential" (default, growing delays) or
+                "fixed" (constant delay per failure).
         """
         with self._lock:
             cur = self._conn.cursor()
@@ -1253,7 +1310,7 @@ class DiscoveryDB:
             else:
                 # Failure — increment and compute backoff interval
                 new_failures = current_failures + 1
-                interval = _compute_backoff_interval(new_failures)
+                interval = _compute_backoff_interval(new_failures, strategy=backoff_strategy)
                 new_backoff = now + interval
                 logger.info(
                     "Backoff #%d for %s → skip %ds (until %.0f UTC)",
@@ -2054,28 +2111,6 @@ def _estimate_redirect_depth(url: str, _headers: dict) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Adaptive backoff — exponential penalties for chronically dead destinations
-# ---------------------------------------------------------------------------
-
-# Backoff intervals in seconds: index N = interval after N consecutive failures.
-# 1→60s, 2→300s, 3→1800s, 4→7200s, 5→43200s (12h), capped at 604800s (7 days).
-_BACKOFF_INTERVALS = (60, 300, 1800, 7200, 43200, 604800)
-
-
-def _compute_backoff_interval(consecutive_failures: int) -> float:
-    """Return the backoff delay in seconds for a given failure count.
-
-    Uses exponential growth bounded by 7 days (max_failures).
-    consecutive_failures=1 → 60s, 2 → 300s, 3 → 1800s, 4 → 7200s,
-    5 → 43200s (12h), >=6 → 604800s (7 days).
-    """
-    idx = min(consecutive_failures - 1, len(_BACKOFF_INTERVALS) - 1)
-    if idx < 0:
-        return 0.0
-    return _BACKOFF_INTERVALS[idx]
-
-
 def discover_addresses(
     known_addrs: list[str | tuple[str, str]] | None = None,
     catalog: AddressBookCatalog | None = None,
@@ -2088,6 +2123,7 @@ def discover_addresses(
     filter_mode: str = "all",
     min_age_hours: float = 24.0,
     skip_backoff: bool = True,
+    backoff_strategy: str = BackoffStrategy.EXPONENTIAL,
     respect_robots: bool = False,
 ) -> list[DiscoveryResult]:
     """Probe destinations and record results in persistent DB.
@@ -2111,6 +2147,9 @@ def discover_addresses(
         min_age_hours: Hours threshold for "stale" filter_mode (default 24).
         skip_backoff: When True (default), targets with active backoff_until are
             excluded from the probe queue. Set to False to force-probe everything.
+        backoff_strategy: "exponential" (default, growing delays) or "fixed"
+            (constant 300s delay per failure). Controls how backoff_until is
+            computed when updating after each probe attempt.
         respect_robots: When True, fetch robots.txt from each destination before
             probing paths. Disallow rules are enforced — matching paths are skipped
             during link extraction, and fully blocked sites get a flag instead of
@@ -2205,7 +2244,7 @@ def discover_addresses(
             # Adaptive backoff: update consecutive_failures and backoff_until
             # based on probe outcome, so chronically dead destinations
             # don't consume sweep budget every run.
-            db.update_backoff_state(hash_hex, dns_name, res.reachable)
+            db.update_backoff_state(hash_hex, dns_name, res.reachable, backoff_strategy=backoff_strategy)
 
         # Sort: reachable first, then fastest
         results.sort(key=lambda r: (not r.reachable, r.response_time_sec))

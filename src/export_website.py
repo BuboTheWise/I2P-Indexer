@@ -498,6 +498,52 @@ def _query_entries(db_path: str) -> list[dict]:
         conn.close()
 
 
+def _query_reachability_series(db_path: str, bucket: str = 'hour') -> list[dict]:
+    """Aggregate probe events into hourly buckets for the reachability trends chart.
+
+    Returns a list of dicts with keys:
+      - ts_utc: ISO-ish timestamp string for the bucket start (e.g. '2026-08-05 10:00')
+      - total_probes: number of probe events in this bucket
+      - reachable: number of probes that reached their destination
+      - unreachable: number that did not
+      - pct: reachability percentage (0-100)
+
+    The aggregation window is driven by *bucket* ('hour' or 'day').  Hourly gives
+    finer-grained sparkline data; daily collapses to one point per calendar day.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        label = "strftime('%Y-%m-%d %H:00', datetime(probed_at, 'unixepoch'))"
+        if bucket == 'day':
+            label = "DATE(datetime(probed_at, 'unixepoch'))"
+
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT {label} AS ts_utc,
+                   COUNT(*)                        AS total_probes,
+                   SUM(CASE WHEN reachable=1 THEN 1 ELSE 0 END) AS reachable,
+                   SUM(CASE WHEN reachable=0 THEN 1 ELSE 0 END) AS unreachable
+            FROM discoveries
+            GROUP BY {label}
+            ORDER BY ts_utc ASC
+        """)
+
+        results: list[dict] = []
+        for ts_utc, total, reached, unreach in cur.fetchall():
+            pct_val = round(100.0 * reached / total) if total > 0 else 0.0
+            # Include unique destination count per bucket (more meaningful than raw probe count)
+            results.append({
+                "ts_utc": ts_utc,
+                "total_probes": total,
+                "reachable": reached,
+                "unreachable": unreach,
+                "pct": pct_val,
+            })
+        return results
+    finally:
+        conn.close()
+
+
 def _query_timeline(db_path: str) -> list[dict]:
     """Fetch the latest discovery per destination for the timeline tab.
 
@@ -551,6 +597,7 @@ def generate_address_book_ui(
     db_path: str,
     output_dir: str,
     template_path: pathlib.Path | None = None,
+    output_filename: str = "address_book_ui.html",
 ) -> pathlib.Path:
     """Generate the enhanced browse UI HTML with tabs, timeline, and filters.
 
@@ -575,10 +622,12 @@ def generate_address_book_ui(
     # 2. Fetch data
     entries = _query_entries(db_path)
     items_timeline = _query_timeline(db_path)
+    series = _query_reachability_series(db_path, bucket='hour')
 
     # 3. Serialize JSON payloads
     entries_json = json.dumps(entries, ensure_ascii=False)
     timeline_json = json.dumps(items_timeline, ensure_ascii=False)
+    series_json = json.dumps(series, ensure_ascii=False)
 
     # Timestamp for header/footer
     export_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -588,12 +637,14 @@ def generate_address_book_ui(
         html_template
         .replace("__ENTRIES_JSON__", entries_json)
         .replace("__TIMELINE_JSON__", timeline_json)
+        .replace("__REACHABILITY_SERIES_JSON__", series_json)
         .replace("__EXPORT_TS__", export_ts)
     )
 
     # 5. Write to output directory
     out_path = pathlib.Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    target = out_path / "address_book_ui.html"
+    # Use configurable output filename, defaulting to address_book_ui.html
+    target = out_path / output_filename
     target.write_text(html, encoding="utf-8")
     return target.resolve()

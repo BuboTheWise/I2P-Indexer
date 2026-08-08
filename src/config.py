@@ -47,13 +47,32 @@ def _validate_host(host: str) -> str:
 
 
 @dataclass
+class OllamaConfig:
+    """Configuration for optional Ollama translation pipeline.
+
+    Routes translate_to_english() calls through a local Ollama instance
+    (e.g. llama3.2) running on the host. Disabled by default so translation
+    only activates when the operator explicitly sets ollama_url.
+
+    Typical usage:
+        cfg = I2PConfig(ollama=OllamaConfig(ollama_url="http://localhost:11434/api/generate"))
+    """
+    ollama_url: str = ""
+    model: str = "llama3.2"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.ollama_url.strip())
+
+
+@dataclass
 class I2PConfig:
     """Connection parameters for the local I2P daemon.
-    
+
     All fields are parameterized with sensible defaults pointing to a
     standard I2P router on localhost.  Validation runs at construction
     time so misconfigured values fail loud and early.
-    
+
     Typical usage:
         cfg = I2PConfig(http_port=8080)          # override one port
         cfg = I2PConfig(sam_host="remote-i2p")    # remote router
@@ -66,6 +85,7 @@ class I2PConfig:
     sam_port: int = 9025
     webconsole_host: str = "127.0.0.1"
     webconsole_port: int = 7657
+    ollama: OllamaConfig = field(default_factory=OllamaConfig)
 
     def __post_init__(self):
         """Validate all host/port pairs after dataclass initialization."""
@@ -97,6 +117,25 @@ class I2PConfig:
     @property
     def webconsole(self):
         return self.webconsole_host, self.webconsole_port
+
+    # -------------------------------------------------------------------------
+    # Backward-compatibility: flat ollama_url getter/setter delegates to .ollama
+    # -------------------------------------------------------------------------
+
+    @property
+    def ollama_url(self) -> str:
+        """Backward-compat: returns cfg.ollama.ollama_url."""
+        return self.ollama.ollama_url
+
+    @ollama_url.setter
+    def ollama_url(self, value: str):
+        """Backward-compat: sets cfg.ollama.ollama_url and re-derives .enabled."""
+        self.ollama = OllamaConfig(ollama_url=value, model=self.ollama.model)
+
+    @property
+    def ollama_enabled(self) -> bool:
+        """Backward-compat: delegation to embedded OllamaConfig.enabled."""
+        return self.ollama.enabled
 
 
 # Ports verified against running I2P JVM daemon on this host:

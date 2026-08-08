@@ -155,6 +155,86 @@ def process_content_for_language(
 
 
 # ---------------------------------------------------------------------------
+# Ollama translation (optional, local-only)
+# ---------------------------------------------------------------------------
+
+def _probe_ollama(url: str) -> bool:
+    """Return True if an Ollama instance responds at *url*."""
+    import json as _json
+    import urllib.request as _urllib
+    import urllib.error as _urllib_error
+
+    try:
+        req = _urllib.Request(
+            url.replace("/api/generate", "/api/tags") + ("/api/tags" if "/api/" not in url else ""),
+            method="GET",
+        )
+        with _urllib.urlopen(req, timeout=3) as r:
+            data = _json.loads(r.read().decode())
+            return isinstance(data, dict)
+    except Exception:
+        return False
+
+
+def translate_to_english(
+    text: str,
+    source_lang: str,
+    ollama_url: str,
+    model: str = "llama3.2",
+) -> str | None:
+    """Translate *text* from *source_lang* to English via a local Ollama instance.
+
+    Returns the translated text on success, or ``None`` on any failure so
+    callers can fall back to preserving original content — never crashes.
+
+    Graceful degradation:
+        - Empty url → returns None immediately
+        - source_lang == "en" → returns None (no translation needed)
+        - Empty/short input → returns None
+        - Network errors, timeouts, bad JSON → returns None with log warning
+    """
+    if not ollama_url.strip():
+        return None
+
+    if source_lang == "en":
+        return None
+
+    if not text or len(text.strip()) < 5:
+        return None
+
+    import json
+    import urllib.request
+    import urllib.error
+    import socket
+
+    payload = json.dumps({
+        "model": model,
+        "prompt": f"Translate the following {source_lang} text to English. Return ONLY the translation, nothing else:\n\n{text}",
+        "stream": False,
+    }).encode()
+
+    try:
+        req = urllib.request.Request(ollama_url, data=payload, method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            response_data = json.loads(resp.read().decode())
+            result = response_data.get("response", "").strip()
+            return result if result else None
+    except urllib.error.URLError as e:
+        logger.warning(f"Ollama translation failed (connection): {e.reason}")
+        return None
+    except socket.timeout as e:
+        logger.warning(f"Ollama translation timed out: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        logger.warning(f"Ollama returned invalid JSON: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"Ollama translation error: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # State reset (for test isolation)
 # ---------------------------------------------------------------------------
 

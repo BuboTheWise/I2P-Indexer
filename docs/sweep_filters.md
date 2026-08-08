@@ -158,7 +158,41 @@ Sweep filters work with all existing probe_sweep.py options:
 | `--report PATH` | `python3 probe_sweep.py --sweep-filter reachable_only --report report.md` (probe + generate report) |
 | `--show-book` | `python3 probe_sweep.py --sweep-filter all --show-book` (full sweep + print address book) |
 | `--probe-timeout S` | `python3 probe_sweep.py --sweep-filter reachable_only --probe-timeout 60` (shorter timeout for health checks) |
+| `--crawl-depth N` | `python3 probe_sweep.py --sweep-filter all --crawl-depth 2` (auto-crawl linked sites up to depth 2) |
+| `--max-new-targets N` | `python3 probe_sweep.py --crawl-depth 2 --max-new-targets 25` (limit auto-crawl to 25 new discoveries) |
 | `--dry-run` | See dry run section above |
+
+---
+
+### How `--crawl-depth` interacts with `--count` and `--delay`
+
+These three flags control different aspects of the same sweep run:
+
+- **`--count N`** limits how many targets from the queue are probed in this session.
+  When auto-crawl discovers new `.i2p` links, those become additional queue entries subject to the count limit.
+  For example, `--count 50 --crawl-depth 2` probes up to 50 targets total — if the first sweep batch discovers 30 new
+  linked sites, only 20 of those can be probed before hitting `--count`.
+
+- **`--delay S`** sets seconds between probes. When combined with auto-crawl, this delay applies to ALL probes including
+  the ones triggered by discovered links. Use a higher `--delay` (e.g., 8s) when running deeper crawls to be gentler
+  on I2P network bandwidth.
+
+- **`--crawl-depth N`** controls recursion depth: `0` = no auto-crawl, `1` = probe direct links only,
+  `2+` = recursive discovery at each depth level. Deeper crawls benefit from higher `--delay` and lower `--count`
+  to avoid overwhelming the I2P network.
+
+Example combinations:
+
+```bash
+# Shallow crawl — just discover directly-linked sites (default):
+python3 probe_sweep.py --crawl-depth 1 --max-new-targets 50
+
+# Deep crawl with controlled pace:
+python3 probe_sweep.py --crawl-depth 3 --delay 8 --count 200 --max-new-targets 75
+
+# Dry run to see how many targets would be touched before committing:
+python3 probe_sweep.py --dry-run --crawl-depth 2 --max-new-targets 100
+```
 
 ---
 

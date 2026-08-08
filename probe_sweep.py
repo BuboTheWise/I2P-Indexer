@@ -53,6 +53,9 @@ hashes, and finally by last_probed_at (oldest probes re-probed first).
     # Dry run — list what would be probed without actually sending requests:
     python3 probe_sweep.py --dry-run --sweep-filter reachable_only
 
+    # Auto-crawl control — discover linked sites up to depth 2:
+    python3 probe_sweep.py --crawl-depth 2 --max-new-targets 100
+
     # Export address book as website files:
     python3 probe_sweep.py export --output-dir website
 
@@ -376,7 +379,36 @@ def main():
         metavar="SECONDS",
         help="Wait up to SECONDS for I2P network readiness before sweeping (default: skip wait)",
     )
+    p.add_argument(
+        "--crawl-depth",
+        type=int,
+        default=1,
+        dest="crawl_depth",
+        metavar="N",
+        help=(
+            "Maximum auto-crawl depth (default: 1 — only directly linked sites are probed). "
+            "Set to 0 to disable auto-crawling entirely. Values > 1 enable recursive crawling: "
+            "depth=2 probes links found in depth-1 results, etc."
+        ),
+    )
+    p.add_argument(
+        "--max-new-targets",
+        type=int,
+        default=50,
+        dest="max_new_targets",
+        metavar="N",
+        help=(
+            "Maximum new targets to discover via auto-crawl in a single run (default: 50). "
+            "Prevents a single directory site from flooding the target queue with hundreds of links."
+        ),
+    )
     args = p.parse_args()
+
+    # ── Validate crawl args ───────────────────────────────────────
+    if args.crawl_depth < 0:
+        p.error("--crawl-depth must be >= 0")
+    if args.max_new_targets < 1:
+        p.error("--max-new-targets must be >= 1")
 
     # ── Export subcommand ─────────────────────────────────────────
     if args.subcommand == "export":

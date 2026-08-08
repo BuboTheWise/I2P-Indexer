@@ -1274,12 +1274,12 @@ class TestFlagExtraction:
             "User-Agent: *\nDisallow: /\nUser-Agent: Googlebot\nAllow: /blog/"
         )
         flags = _extract_flags(body, {}, 0)
-        assert "robots_disallow_all" in flags
+        assert any(f["type"] == "robots_txt" and f["value"] == "disallow_all" for f in flags)
 
     def test_robots_no_disallow_does_not_flag(self):
         body = "<html><body>Normal site content here.</body></html>"
         flags = _extract_flags(body, {}, 0)
-        assert "robots_disallow_all" not in flags
+        assert not any(f["type"] == "robots_txt" for f in flags)
 
     def test_robots_partial_disallow_does_not_flag(self):
         # "Disallow: /admin" contains substring "disallow: /" so it DOES trigger.
@@ -1287,13 +1287,13 @@ class TestFlagExtraction:
         body = "User-Agent: *\nDisallow: /admin\nAllow: /"
         flags = _extract_flags(body, {}, 0)
         # Because "disallow: /" is a substring of "disallow: /admin", this triggers.
-        assert "robots_disallow_all" in flags
+        assert any(f["type"] == "robots_txt" and f["value"] == "disallow_all" for f in flags)
 
     def test_robots_partial_disallow_no_useragent_does_not_flag(self):
         # Without User-Agent header text, even "Disallow: /" should not trigger.
         body = "Disallow: /\nAllow: /blog/"
         flags = _extract_flags(body, {}, 0)
-        assert "robots_disallow_all" not in flags
+        assert not any(f["type"] == "robots_txt" for f in flags)
 
     # ── 2. tech_stack_detected ─────────────────────────────────────
 
@@ -1301,17 +1301,17 @@ class TestFlagExtraction:
         body = "<html><body></body></html>"
         headers = {"Server": "nginx/1.24.0"}
         flags = _extract_flags(body, headers, 0)
-        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        tech_flags = [f for f in flags if f["type"] == "tech_stack"]
         assert len(tech_flags) == 1
-        assert "nginx" in tech_flags[0]
+        assert "nginx" in tech_flags[0]["value"]
 
     def test_tech_stack_x_powered_by(self):
         body = "<html><body></body></html>"
         headers = {"X-Powered-By": "PHP/8.2"}
         flags = _extract_flags(body, headers, 0)
-        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        tech_flags = [f for f in flags if f["type"] == "tech_stack"]
         assert len(tech_flags) == 1
-        assert "PHP" in tech_flags[0]
+        assert "PHP" in tech_flags[0]["value"]
 
     def test_tech_stack_generator_meta(self):
         body = (
@@ -1321,38 +1321,38 @@ class TestFlagExtraction:
         )
         headers = {}
         flags = _extract_flags(body, headers, 0)
-        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        tech_flags = [f for f in flags if f["type"] == "tech_stack"]
         assert len(tech_flags) == 1
-        assert "Jekyll" in tech_flags[0]
+        assert "Jekyll" in tech_flags[0]["value"]
 
     def test_tech_stack_wordpress_fingerprint(self):
         body = '<link rel="stylesheet" href="/wp-content/themes/twentytwenty/style.css">'
         flags = _extract_flags(body, {}, 0)
-        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        tech_flags = [f for f in flags if f["type"] == "tech_stack"]
         assert len(tech_flags) == 1
-        assert "wordpress" in tech_flags[0]
+        assert "wordpress" in tech_flags[0]["value"].lower()
 
     def test_tech_stack_joomla_fingerprint(self):
         body = '<script type="text/javascript" src="/media/system/js/mootools.js"></script>'
         flags = _extract_flags(body, {}, 0)
-        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        tech_flags = [f for f in flags if f["type"] == "tech_stack"]
         assert len(tech_flags) == 1
-        assert "joomla" in tech_flags[0]
+        assert "joomla" in tech_flags[0]["value"].lower()
 
     def test_tech_stack_drupal_fingerprint(self):
         body = '<script type="text/javascript" src="/core/misc/drupal.js"></script>'
         flags = _extract_flags(body, {}, 0)
-        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        tech_flags = [f for f in flags if f["type"] == "tech_stack"]
         assert len(tech_flags) == 1
-        assert "drupal" in tech_flags[0]
+        assert "drupal" in tech_flags[0]["value"].lower()
 
     def test_tech_stack_mediawiki_fingerprint(self):
         body = '<link rel="shortcut icon" href="/favicon.ico">' \
                 '<img src="/w/load.php?lang=en&modules=mediawiki">'
         flags = _extract_flags(body, {}, 0)
-        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        tech_flags = [f for f in flags if f["type"] == "tech_stack"]
         assert len(tech_flags) == 1
-        assert "mediawiki" in tech_flags[0]
+        assert "mediawiki" in tech_flags[0]["value"].lower()
 
     def test_tech_stack_ghost_fingerprint(self):
         # The ghost fingerprint looks for 'ghost-' pattern in body text.
@@ -1362,15 +1362,15 @@ class TestFlagExtraction:
             "</body></html>"
         )
         flags = _extract_flags(body, {}, 0)
-        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        tech_flags = [f for f in flags if f["type"] == "tech_stack"]
         assert len(tech_flags) == 1
-        assert "ghost" in tech_flags[0]
+        assert "ghost" in tech_flags[0]["value"].lower()
 
     def test_tech_stack_none_detected(self):
         body = "<html><body>Plain HTML site.</body></html>"
         headers = {"Content-Type": "text/html; charset=utf-8"}
         flags = _extract_flags(body, headers, 0)
-        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        tech_flags = [f for f in flags if f["type"] == "tech_stack"]
         assert len(tech_flags) == 0
 
     def test_tech_stack_multiple_sources_combined(self):
@@ -1383,21 +1383,21 @@ class TestFlagExtraction:
         )
         headers = {"Server": "Apache/2.4"}
         flags = _extract_flags(body, headers, 0)
-        tech_flags = [f for f in flags if f.startswith("tech_stack:")]
+        tech_flags = [f for f in flags if f["type"] == "tech_stack"]
         assert len(tech_flags) == 1
-        flag_text = tech_flags[0]
+        flag_text = tech_flags[0]["value"]
         assert "Apache" in flag_text
         assert "Hugo" in flag_text
-        assert "wordpress" in flag_text
+        assert "wordpress" in flag_text.lower()
 
     # ── 3. contact_found (email + social) ──────────────────────────
 
     def test_contact_email_found(self):
         body = '<a href="mailto:webmaster@example.com">Contact</a>'
         flags = _extract_flags(body, {}, 0)
-        contact_flags = [f for f in flags if f.startswith("contact_found:")]
+        contact_flags = [f for f in flags if f["type"] == "contact_signal"]
         assert len(contact_flags) == 1
-        assert "email" in contact_flags[0]
+        assert "email" in contact_flags[0]["value"]
 
     def test_contact_multiple_emails(self):
         body = (
@@ -1405,28 +1405,28 @@ class TestFlagExtraction:
             '<a href="mailto:b@c.com">B</a>'
         )
         flags = _extract_flags(body, {}, 0)
-        contact_flags = [f for f in flags if f.startswith("contact_found:")]
+        contact_flags = [f for f in flags if f["type"] == "contact_signal"]
         assert len(contact_flags) == 1
-        assert "2 addr" in contact_flags[0]
+        assert "2 addr" in contact_flags[0]["value"]
 
     def test_contact_twitter_found(self):
         body = '<a href="https://twitter.com/myhandle">Follow me</a>'
         flags = _extract_flags(body, {}, 0)
-        social_flags = [f for f in flags if "social" in f]
+        social_flags = [f for f in flags if "social" in f.get("value", "")]
         assert len(social_flags) == 1
-        assert "twitter" in social_flags[0]
+        assert "twitter" in social_flags[0]["value"]
 
     def test_contact_github_found(self):
         body = '<a href="https://github.com/myorg/myrepo">Code</a>'
         flags = _extract_flags(body, {}, 0)
-        social_flags = [f for f in flags if "social" in f]
+        social_flags = [f for f in flags if "social" in f.get("value", "")]
         assert len(social_flags) == 1
-        assert "github" in social_flags[0]
+        assert "github" in social_flags[0]["value"]
 
     def test_contact_no_email_no_social(self):
         body = "<p>Just generic content with no contact info.</p>"
         flags = _extract_flags(body, {}, 0)
-        contact_flags = [f for f in flags if f.startswith("contact_found:")]
+        contact_flags = [f for f in flags if f["type"] == "contact_signal"]
         assert len(contact_flags) == 0
 
     # ── 4. forum_site ──────────────────────────────────────────────
@@ -1435,43 +1435,43 @@ class TestFlagExtraction:
         body = '<link rel="stylesheet" href="/styles/silver/theme/common.css">' \
                 '<meta name="generator" content="phpBB">'
         flags = _extract_flags(body, {}, 0)
-        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        forum_flags = [f for f in flags if f["type"] == "forum_software"]
         assert len(forum_flags) == 1
-        assert "phpBB" in forum_flags[0]
+        assert "phpBB" in forum_flags[0]["value"]
 
     def test_forum_jenforo(self):
         body = '<script src="/js/xenforo.min.js"></script>'
         flags = _extract_flags(body, {}, 0)
-        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        forum_flags = [f for f in flags if f["type"] == "forum_software"]
         assert len(forum_flags) == 1
-        assert "XenForo" in forum_flags[0]
+        assert "XenForo" in forum_flags[0]["value"]
 
     def test_forum_discourse(self):
         body = '<div data-controller="discourse/helpers"></div>'
         flags = _extract_flags(body, {}, 0)
-        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        forum_flags = [f for f in flags if f["type"] == "forum_software"]
         assert len(forum_flags) == 1
-        assert "Discourse" in forum_flags[0]
+        assert "Discourse" in forum_flags[0]["value"]
 
     def test_forum_flarum(self):
         body = '<script src="/extensions/flarum-header.js"></script>'
         flags = _extract_flags(body, {}, 0)
-        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        forum_flags = [f for f in flags if f["type"] == "forum_software"]
         assert len(forum_flags) == 1
-        assert "Flarum" in forum_flags[0]
+        assert "Flarum" in forum_flags[0]["value"]
 
     def test_forum_ips(self):
         body = '<div class="ipsTemplate"></div>' \
                 '<img src="/uploads/avatar.jpg">'
         flags = _extract_flags(body, {}, 0)
-        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        forum_flags = [f for f in flags if f["type"] == "forum_software"]
         assert len(forum_flags) == 1
-        assert "IPS" in forum_flags[0]
+        assert "IPS" in forum_flags[0]["value"]
 
     def test_no_forum_sig(self):
         body = "<html><body>Regular blog post.</body></html>"
         flags = _extract_flags(body, {}, 0)
-        forum_flags = [f for f in flags if f.startswith("forum_site:")]
+        forum_flags = [f for f in flags if f["type"] == "forum_software"]
         assert len(forum_flags) == 0
 
     # ── 5. redirect_chain ─────────────────────────────────────────
@@ -1479,28 +1479,28 @@ class TestFlagExtraction:
     def test_redirect_depth_two_triggers_flag(self):
         body = "<html><body>Final destination</body></html>"
         flags = _extract_flags(body, {}, redirect_depth=2)
-        redirect_flags = [f for f in flags if f.startswith("redirect_chain:")]
+        redirect_flags = [f for f in flags if f["type"] == "redirect_chain"]
         assert len(redirect_flags) == 1
-        assert "depth=2" in redirect_flags[0]
+        assert "depth=2" in redirect_flags[0]["value"]
 
     def test_redirect_depth_zero_no_flag(self):
         body = "<html><body>No redirects</body></html>"
         flags = _extract_flags(body, {}, 0)
-        redirect_flags = [f for f in flags if f.startswith("redirect_chain:")]
+        redirect_flags = [f for f in flags if f["type"] == "redirect_chain"]
         assert len(redirect_flags) == 0
 
     def test_redirect_depth_one_does_not_flag(self):
         # The heuristic triggers only at depth > 1
         body = "<html></html>"
         flags = _extract_flags(body, {}, 1)
-        redirect_flags = [f for f in flags if f.startswith("redirect_chain:")]
+        redirect_flags = [f for f in flags if f["type"] == "redirect_chain"]
         assert len(redirect_flags) == 0
 
     def test_redirect_depth_five_triggers_flag(self):
         flags = _extract_flags("", {}, 5)
-        redirect_flags = [f for f in flags if f.startswith("redirect_chain:")]
+        redirect_flags = [f for f in flags if f["type"] == "redirect_chain"]
         assert len(redirect_flags) == 1
-        assert "depth=5" in redirect_flags[0]
+        assert "depth=5" in redirect_flags[0]["value"]
 
     # ── Empty / None inputs ────────────────────────────────────────
 
@@ -1551,11 +1551,10 @@ class TestProbeFlagIntegration:
         assert result.flags is not None
         assert len(result.flags) > 0
 
-        # Should detect tech_stack (Apache + WordPress), robots_disallow_all and contact_found
-        flag_str = " | ".join(result.flags)
-        assert any("tech_stack" in f for f in result.flags)
-        assert any("robots_disallow_all" in f for f in result.flags)
-        assert any("contact_found" in f for f in result.flags)
+        # Should detect tech_stack (Apache + WordPress), robots_txt and contact_signal
+        assert any(f["type"] == "tech_stack" for f in result.flags)
+        assert any(f["type"] == "robots_txt" for f in result.flags)
+        assert any(f["type"] == "contact_signal" for f in result.flags)
 
     @patch("src.integration.fetch_i2p")
     def test_do_probe_empty_flags_when_no_signals(self, mock_fetch):
@@ -1599,9 +1598,9 @@ class TestProbeFlagIntegration:
             probe_mode="b32",
         )
 
-        forum_flags = [f for f in result.flags if f.startswith("forum_site:")]
+        forum_flags = [f for f in result.flags if f["type"] == "forum_software"]
         assert len(forum_flags) == 1
-        assert "Discourse" in forum_flags[0]
+        assert "Discourse" in forum_flags[0]["value"]
 
 
 # ---------------------------------------------------------------------------
@@ -1626,14 +1625,14 @@ class TestPrintReportFlags:
                 content_type="blog",
                 content_summary="A test blog",
                 found_links=[],
-                flags=["robots_disallow_all", "tech_stack: nginx/1.24", "contact_found: email (1 addr(s))"],
+                flags=[{"type": "robots_txt", "value": "disallow_all"}, {"type": "tech_stack", "value": "nginx/1.24"}, {"type": "contact_signal", "value": "email_address_in_page (1 addr(s))"}],
             ),
         ]
         print_report(results)
         captured = capsys.readouterr()
-        assert "robots_disallow_all" in captured.out
-        assert "tech_stack: nginx/1.24" in captured.out
-        assert "contact_found: email (1 addr(s))" in captured.out
+        assert "robots_txt:disallow_all" in captured.out
+        assert "tech_stack:nginx/1.24" in captured.out
+        assert "contact_signal:email_address_in_page (1 addr(s))" in captured.out
 
     def test_print_report_no_flags_line_when_empty(self, capsys):
         results = [
@@ -2100,10 +2099,10 @@ class TestDoProbeNeedsReviewFlag:
         )
 
         # Should have both needs_review and tech_stack flags
-        assert any("tech_stack" in f for f in result.flags), \
+        assert any(f["type"] == "tech_stack" for f in result.flags), \
             f"Expected tech_stack flag in {result.flags}"
         if result.needs_review:
-            assert any("needs_review:" in f for f in result.flags)
+            assert any("needs_review" in f.get("type", "") or "needs_review" in f.get("value", "") for f in result.flags)
 
 
 # ---------------------------------------------------------------------------

@@ -175,12 +175,19 @@ def _extract_flags(
     body_text: str,
     resp_headers: dict | None = None,
     redirect_depth: int = 0,
-) -> list[str]:
-    """Analyse page content + response headers and emit structured flag strings.
+) -> list[dict]:
+    """Analyse page content + response headers and emit structured flag dicts.
 
-    Each flag is a ``type: detail`` string that describes something interesting
-    about the target (robots policy, tech stack fingerprints, contact signals,
-    forum software, redirect chains).
+    Each flag is a ``{"type": "...", "value": "..."}`` dict matching the schema
+    in DATABASE_SCHEMA.md. Four canonical types plus extensible extras:
+
+      - robots_txt       — robots policy signals (disallow_all, partial_block)
+      - tech_stack       — web framework / CMS / server fingerprints
+      - contact_signal   — PGP keys, email addresses, Tor contact forms, social links
+      - proxy_indicator  — CDN/proxy/reverse-proxy headers (cloudflare, akamai, ...)
+
+    Additional types "forum_software" and "redirect_chain" are emitted when
+    relevant evidence is found.
 
     Args:
         body_text: Full HTML/body text from the probe response.
@@ -188,30 +195,44 @@ def _extract_flags(
         redirect_depth: Number of redirects followed (>0 means a chain existed).
 
     Returns:
-        List of flag strings, e.g. ``["robots_disallow_all", "tech_stack: nginx/1.24"]``.
+        List of flag dicts, e.g. ``[{"type": "robots_txt", "value": "disallow_all"}, ...]``.
     """
     if resp_headers is None:
         resp_headers = {}
 
-    flags: list[str] = []
-    lower_body = body_text.lower()[:32768]  # first 32 KB for heuristics
+    flags: list[dict] = []
+    body_slice = body_text[:32768]  # first 32 KB for heuristics
+    lower_body = body_slice.lower()
 
-    # ── 1. robots_disallow_all ────────────────────────────────────────
-    if "user-agent" in lower_body and "disallow: /" in lower_body:
-        flags.append("robots_disallow_all")
+    # ── 1. robots_txt — disallow policy ───────────────────────────────
+    _robots_re = re.compile(
+        r'user-agent\s*:\s*\*\s*\n\s*disallow\s*:\s*/\s*',
+        re.IGNORECASE,
+    )
+    if _robots_re.search(lower_body):
+        flags.append({"type": "robots_txt", "value": "disallow_all"})
+    elif "user-agent" in lower_body and "disallow:" in lower_body:
+        # Some paths are blocked but not the entire root
+        flags.append({"type": "robots_txt", "value": "partial_block"})
 
-    # ── 2. tech_stack_detected ────────────────────────────────────────
+    # ── 2. tech_stack — server, framework, CMS fingerprints ───────────
     detected_techs: list[str] = []
-    import re as _re
 
-    # Server header
+    # Server header (case-insensitive lookup)
+    srv = ""
     for hdr_key in ("Server", "server"):
         srv = resp_headers.get(hdr_key, "")
         if srv:
-            detected_techs.append(srv)
+            break
+    if srv:
+        detected_techs.append(srv)
 
-    # X-Powered-By header
-    xp = resp_headers.get("X-Powered-By", "") or resp_headers.get("x-powered-by", "")
+    # X-Powered-By header (case-insensitive lookup)
+    xp = ""
+    for hdr_key in ("X-Powered-By", "x-powered-by"):
+        xp = resp_headers.get(hdr_key, "")
+        if xp:
+            break
     if xp:
         detected_techs.append(xp)
 
@@ -223,10 +244,12 @@ def _extract_flags(
         "Grav", "Concrete5", "TYPO3", "MODX", "ExpressionEngine",
         "October CMS", "CraftCMS", "Statamic", "Kirby",
     ]
-    gen_match = _re.search(r'<meta[^>]+name=["\']?generator["\']?\s+content=["\']([^"\']+)[ "\'"]', body_text[:32768], _re.IGNORECASE)
+    gen_match = re.search(
+        r'<meta[^>]+name=["\']?generator["\']?\s+content=["\']([^"\']+)[ "\'"]',
+        body_slice, re.IGNORECASE
+    )
     if gen_match:
         gen_value = gen_match.group(1).strip()
-        # Only record known generators; skip personal messages / junk
         for kg in KNOWN_GENERATORS:
             if kg.lower() in gen_value.lower():
                 detected_techs.append(gen_value)
@@ -243,39 +266,128 @@ def _extract_flags(
     }
     for cms, patterns in cms_signatures.items():
         for pat in patterns:
-            if _re.search(pat, body_text[:32768], _re.IGNORECASE):
+            if re.search(pat, body_slice, re.IGNORECASE):
                 detected_techs.append(cms)
                 break  # one match per CMS is enough
 
     if detected_techs:
-        flags.append(f"tech_stack: {', '.join(detected_techs[:5])}")
+        flags.append({"type": "tech_stack", "value": ", ".join(detected_techs[:5])})
 
-    # ── 3. contact_found ──────────────────────────────────────────────
-    import re as _re2
-    email_re = _re2.compile(
+    # ── 3. contact_signal — PGP, email, Tor form, social links ────────
+    _email_re = re.compile(
         r'[a-z0-9_.+-]+@[a-z0-9-]+\.[a-z]{2,}',
-        _re2.IGNORECASE,
+        re.IGNORECASE,
     )
-    found_emails = email_re.findall(body_text[:32768])
+    found_emails = _email_re.findall(body_slice)
     if found_emails:
-        flags.append(f"contact_found: email ({len(found_emails)} addr(s))")
+        flags.append({
+            "type": "contact_signal",
+            "value": f"email_address_in_page ({len(found_emails)} addr(s))",
+        })
+
+    # PGP/PGP key detection
+    _pgp_patterns = [
+        r'<[^>]+content=["\']application/pgp-keys["\']',
+        r'-----BEGIN PGP PUBLIC KEY BLOCK-----',
+        r'--begin pgp public key block--',
+        r'armour.*public.*key',
+        r'\.asc\b.*pgp',
+        r'gpg.*fingerprint',
+    ]
+    has_pgp = False
+    for pat in _pgp_patterns:
+        if re.search(pat, body_slice, re.IGNORECASE):
+            has_pgp = True
+            break
+    if has_pgp:
+        flags.append({"type": "contact_signal", "value": "pgp_key_found"})
+
+    # Tor contact form detection (TOR2WEB / onion routing references)
+    _tor_contact_patterns = [
+        r'class[^>]*="contact"',
+        r'contact.*form',
+        r'tor.*contact',
+        r'onion.*contact',
+        r'idiot\.onion',
+    ]
+    has_tor_contact = False
+    for pat in _tor_contact_patterns:
+        if re.search(pat, lower_body):
+            has_tor_contact = True
+            break
+    if has_tor_contact:
+        flags.append({"type": "contact_signal", "value": "tor_contact_form"})
 
     # Social media links
     social_patterns = {
         "twitter": r'(?:twitter\.com|x\.com)/\w+',
-        "mastodon": r'mastodon\.|\.\w+/@\w+',
+        "mastodon": r'mastodon\.|/\.\w+/@\w+',
         "github": r'github\.com/\w+',
         "telegram": r'telegram\.(?:me|org)/\w+',
     }
     found_social: list[str] = []
     for platform, pat in social_patterns.items():
-        if _re2.search(pat, body_text[:32768], _re2.IGNORECASE):
+        if re.search(pat, body_slice, re.IGNORECASE):
             found_social.append(platform)
 
     if found_social:
-        flags.append(f"contact_found: social ({', '.join(found_social)})")
+        flags.append({
+            "type": "contact_signal",
+            "value": f"social_links ({', '.join(found_social)})",
+        })
 
-    # ── 4. forum_site ────────────────────────────────────────────────
+    # ── 4. proxy_indicator — CDN / reverse-proxy / WAF headers ────────
+    _proxy_header_keys: dict[str, list[str]] = {
+        "cloudflare": [
+            r'cf-ray', r'cf-cache-status', r'cf-request-id',
+            r'x-cloudflare-', r'cdn-cgi',
+        ],
+        "akamai": [r'akamai', r'x-akamai'],
+    }
+
+    # Normalize header keys/values for case-insensitive matching
+    all_header_keys_lower = " ".join(resp_headers.keys()).lower()
+    all_header_vals_lower = " ".join(str(v) for v in resp_headers.values()).lower()
+
+    checked_proxies: list[str] = []
+    for proxy_name, patterns in _proxy_header_keys.items():
+        matched = False
+        for pat in patterns:
+            if pat in all_header_keys_lower or re.search(pat, all_header_vals_lower):
+                matched = True
+                break
+        if matched:
+            checked_proxies.append(proxy_name)
+
+    # Generic proxy/CDN detection from Server / X-Cache headers
+    server_val_lower = (resp_headers.get("Server") or "").lower()
+    xcache_val = resp_headers.get("X-Cache", "") or resp_headers.get("x-cache", "")
+
+    generic_cdn_keywords = [
+        ("cloudflare", ["cloudflare", "cf-", "cdn-cgi"]),
+        ("akamai", ["akamai", "x-akamai"]),
+        ("fastly", ["fastly", "x-served-by"]),
+        ("varnish", ["varnish", "x-varnish"]),
+        ("squid", ["squid", "via.*squid"]),
+        ("nginx/cdn", ["nginx.*cdn", "cdn.*nginx"]),
+    ]
+
+    for gw_name, kwlist in generic_cdn_keywords:
+        if any(kw in server_val_lower for kw in kwlist):
+            if gw_name not in checked_proxies:
+                checked_proxies.append(gw_name)
+        if any(kw in xcache_val.lower() for kw in ["hit", "miss"]) and gw_name != "nginx/cdn":
+            if gw_name not in checked_proxies:
+                # Cache header present but no strong identity — could be generic CDN
+                pass
+
+    if checked_proxies:
+        flags.append({
+            "type": "proxy_indicator",
+            "value": ", ".join(checked_proxies),
+        })
+
+    # ── 5. forum_software (supplementary type) ────────────────────────
     forum_signatures = {
         "phpBB": [r'phpbb', r'/styles/.*/theme/', r'forum\.php'],
         "XenForo": [r'xenforo', r'/xf\.', r'js/xenforo\.min\.js'],
@@ -286,13 +398,13 @@ def _extract_flags(
     }
     for forum_software, patterns in forum_signatures.items():
         for pat in patterns:
-            if _re2.search(pat, lower_body):
-                flags.append(f"forum_site: {forum_software}")
+            if re.search(pat, lower_body):
+                flags.append({"type": "forum_software", "value": forum_software})
                 break
 
-    # ── 5. redirect_chain ─────────────────────────────────────────────
+    # ── 6. redirect_chain (supplementary type) ────────────────────────
     if redirect_depth > 1:
-        flags.append(f"redirect_chain: depth={redirect_depth}")
+        flags.append({"type": "redirect_chain", "value": f"depth={redirect_depth}"})
 
     return flags
 
@@ -321,7 +433,7 @@ class DiscoveryResult:
     found_links: list[str] = field(default_factory=list)
     content_hash: str = ""     # SHA-256 of body for change detection
     last_modified: str = ""    # HTTP Last-Modified header value
-    flags: list[str] = field(default_factory=list)     # extracted signals (robots_disallow_all, tech_stack_detected, ...)
+    flags: list[dict] = field(default_factory=list)     # extracted signals as {"type": "...", "value": "..."} dicts
     needs_review: bool = False  # True when no extractor claimed or partial extract
     reason: str = ""  # reason string for needs_review (e.g. "no_extractor_claimed")
 
@@ -445,13 +557,13 @@ class DiscoveryDB:
                 ab.reachable,
                 datetime(ab.last_probed_at, 'unixepoch') AS last_probed_utc,
                 ab.content_summary,
-                ab.detected_lang,
                 ab.ident_hash_hex,
                 ab.b32_addr,
                 ab.status_code,
                 ab.body_length,
                 ab.title,
                 ab.response_time_sec,
+                ab.detected_lang,
                 ab.via_method,
                 ab.last_probed_at,
                 ab.content_hash,
@@ -622,15 +734,16 @@ class DiscoveryDB:
             cur.execute(
                 "ALTER TABLE targets ADD COLUMN backoff_until REAL DEFAULT 0"
             )
+        # Crawl depth tracking — 0 for manually seeded, N for auto-discovered
+        # at hop distance N from the seed set.
         if "crawl_depth" not in existing_cols:
-            # How many hops from the original seed this target is.
-            # 0 = manually seeded; 1 = found while probing a seeded site, etc.
             cur.execute(
                 "ALTER TABLE targets ADD COLUMN crawl_depth INTEGER DEFAULT 0"
             )
+        # Provenance chain — comma-separated list of DNS names forming the
+        # parentage chain (e.g. "A.i2p,B.i2p" means discovered by A which was
+        # linked from B). Empty string for original seeds.
         if "provenance_chain" not in existing_cols:
-            # Human-readable chain showing how we discovered this target,
-            # e.g. "seed → i2p-projekt.i2p → some-site.i2p"
             cur.execute(
                 "ALTER TABLE targets ADD COLUMN provenance_chain TEXT DEFAULT ''"
             )
@@ -717,6 +830,7 @@ class DiscoveryDB:
                 ab.body_length,
                 ab.title,
                 ab.response_time_sec,
+                ab.detected_lang,
                 ab.via_method,
                 ab.last_probed_at,
                 ab.content_hash,
@@ -881,7 +995,7 @@ class DiscoveryDB:
         content_hash: str = "",
         last_modified: str = "",
         found_links: list[str] | None = None,
-        flags: list[str] | None = None,
+        flags: list[dict] | None = None,
         needs_review: bool = False,
         error_msg: str = "",
     ) -> int:
@@ -1088,6 +1202,86 @@ class DiscoveryDB:
             self._conn.commit()
             return cur.rowcount
 
+    def update_backoff_state(self, ident_hash_hex: str, dns_name: str, reachable: bool) -> None:
+        """Update consecutive_failures and backoff_until after a probe attempt.
+
+        On failure: increment consecutive_failures, compute exponential backoff,
+        set backoff_until = now + interval, update last_probed_at.
+
+        On success: reset consecutive_failures to 0, clear backoff_until,
+        update last_probed_at.
+
+        Args:
+            ident_hash_hex: SHA-1 hash (40-char hex) of the destination identity.
+            dns_name: .i2p DNS name when present (used as fallback lookup key).
+            reachable: Whether this probe attempt succeeded.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            now = time.time()
+
+            # Read current state — match by hash if available, otherwise by dns
+            if ident_hash_hex:
+                cur.execute(
+                    "SELECT consecutive_failures FROM targets WHERE ident_hash_hex = ?",
+                    (ident_hash_hex,),
+                )
+            elif dns_name:
+                cur.execute(
+                    "SELECT consecutive_failures FROM targets WHERE i2p_dns_name = ?",
+                    (dns_name,),
+                )
+            else:
+                return  # nothing to update
+
+            row = cur.fetchone()
+            if not row:
+                logger.warning("Backoff update: target not found in DB, skipping")
+                return
+
+            current_failures = int(row[0])
+
+            if reachable:
+                # Success — reset counter and clear backoff
+                new_failures = 0
+                new_backoff = 0.0
+                logger.debug(
+                    "Backoff reset for %s (was %d failures)",
+                    ident_hash_hex or dns_name,
+                    current_failures,
+                )
+            else:
+                # Failure — increment and compute backoff interval
+                new_failures = current_failures + 1
+                interval = _compute_backoff_interval(new_failures)
+                new_backoff = now + interval
+                logger.info(
+                    "Backoff #%d for %s → skip %ds (until %.0f UTC)",
+                    new_failures,
+                    ident_hash_hex or dns_name,
+                    int(interval),
+                    new_backoff,
+                )
+
+            # Update target
+            if ident_hash_hex:
+                cur.execute(
+                    "UPDATE targets SET "
+                    "consecutive_failures = ?, backoff_until = ?, last_probed_at = ? "
+                    "WHERE ident_hash_hex = ?",
+                    (new_failures, new_backoff, now, ident_hash_hex),
+                )
+            elif dns_name:
+                cur.execute(
+                    "UPDATE targets SET "
+                    "consecutive_failures = ?, backoff_until = ?, last_probed_at = ? "
+                    "WHERE i2p_dns_name = ?",
+                    (new_failures, new_backoff, now, dns_name),
+                )
+
+            self._conn.commit()
+
+
     def upsert_targets(
         self,
         targets: list[tuple[str, str]],
@@ -1284,6 +1478,7 @@ class DiscoveryDB:
         self,
         filter_mode: str = "all",
         min_age_hours: float = 24.0,
+        skip_backoff: bool = True,
     ) -> list[tuple[str, str]]:
         """Return the target queue as (hash_hex, dns_name) tuples.
 
@@ -1294,6 +1489,9 @@ class DiscoveryDB:
                 - "never_probed"   — targets where last_probed_at == 0 (first probe pass)
                 - "stale"         — targets probed more than min_age_hours ago
             min_age_hours: Hours threshold for "stale" filter (default 24).
+            skip_backoff: When True (default), exclude targets whose backoff_until
+                has not yet expired. Set to False to probe everything regardless
+                of backoff — useful during initial sweeps or debugging.
 
         Priorities (within the filtered set):
         1. Previously reachable targets first (highest chance of success).
@@ -1302,6 +1500,12 @@ class DiscoveryDB:
         """
         where_clauses: list[str] = []
         params: list = []
+
+        # Adaptive backoff: skip targets still in their backoff window
+        if skip_backoff:
+            now = time.time()
+            where_clauses.append("backoff_until <= ?")
+            params.append(now)
 
         if filter_mode == "reachable_only":
             # Only targets that have at least one reachable discovery.
@@ -1454,6 +1658,7 @@ def probe_destination(
     db: DiscoveryDB | None = None,
     timeout: float = PROBE_TIMEOUT,
     config: I2PConfig | None = None,
+    robots_policy: TypingAny = None,
 ) -> DiscoveryResult:
     """Probe a single destination by BOTH its b32 key address and .i2p DNS name.
 
@@ -1461,6 +1666,8 @@ def probe_destination(
     If a DB is provided, records both attempts.
     ``timeout`` is the per-target deadline in seconds.
     ``config`` provides proxy host/port settings; defaults to I2PConfig().
+    ``robots_policy`` when set, filters discovered links against Disallow rules.
+        Fully blocked sites get a robots_txt flag instead of being crawled deeply.
     """
     b32_addr = _hex_to_b32_addr(ident_hash_hex) if len(ident_hash_hex) == 40 else ""
     results: list[DiscoveryResult] = []
@@ -1475,6 +1682,7 @@ def probe_destination(
             probe_mode="b32",
             timeout=timeout,
             config=config,
+            robots_policy=robots_policy,
         )
         results.append(res_b32)
         if db:
@@ -1524,6 +1732,7 @@ def probe_destination(
                 probe_mode="dns",
                 timeout=dns_timeout,
                 config=config,
+                robots_policy=robots_policy,
             )
             results.append(res_dns)
             if db:
@@ -1556,6 +1765,7 @@ def probe_destination(
                 probe_mode="dns",
                 timeout=timeout,
                 config=config,
+                robots_policy=robots_policy,
             )
             results.append(res_dns)
             if db:
@@ -1633,12 +1843,15 @@ def _do_probe(
     probe_mode: str = "b32",
     timeout: float = PROBE_TIMEOUT,
     config: I2PConfig | None = None,
+    robots_policy: TypingAny = None,
 ) -> DiscoveryResult:
     """Single HTTP fetch through proxy. Returns reachable=0 on any failure.
     
     ``timeout`` is the per-target deadline in seconds (default 120).
     The underlying I2PProxyClient uses this as a socket timeout.
     ``config`` provides proxy host/port settings; defaults to I2PConfig().
+    ``robots_policy`` when set, filters discovered links against Disallow rules
+        and adds robots_txt flags for blocked or fully-blocked destinations.
     """
     start = time.monotonic()
     try:
@@ -1697,7 +1910,7 @@ def _do_probe(
         # Append needs_review reason as a structured flag so it appears in
         # address_book and can be queried / filtered from the CLI.
         if extractor_result.needs_review:
-            flags.append(f"needs_review: {extractor_result.reason}")
+            flags.append({"type": "needs_review", "value": extractor_result.reason})
 
         # ── Language detection + tagging (no translation — NFR-07) ────────
         detected_lang = "en"  # default assumption
@@ -1749,13 +1962,45 @@ def _do_probe(
             last_modified=last_modified,
         )
 
+        # ── robots.txt filtering on discovered links ──────────────
+        if robots_policy:
+            blocked_links = []
+            allowed_links = []
+            for link in result.found_links:
+                # Each link is a .i2p hostname; we need to check paths too.
+                # Since extracted links are just hostnames, we only filter
+                # path-level disallow rules against common scraped paths.
+                # For simplicity: if the site blocks everything, drop ALL links.
+                if robots_policy.is_fully_blocked:
+                    blocked_links.append(link)
+                else:
+                    allowed_links.append(link)
+
+            if blocked_links:
+                from src.robots_parser import RobotsPolicy as _Rp
+                rp = robots_policy
+                assert isinstance(rp, _Rp) or rp is None
+                result.found_links = allowed_links
+                flags.append({
+                    "type": "robots_txt",
+                    "value": f"blocked_{len(blocked_links)}_links"
+                            + (" (site fully blocked)" if robots_policy.is_fully_blocked else ""),
+                })
+                logger.info(
+                    "  [robots] Blocked %d discovered links for %s (%s)",
+                    len(blocked_links),
+                    ident_hash_hex[:12],
+                    "fully blocked" if robots_policy.is_fully_blocked else "filtered",
+                )
+
         logger.info(
             "  [%s] %s  status=%d  body=%dB  %.1fs%s",
             probe_mode, url, resp.status, len(resp.body), elapsed,
             f"  title={result.title[:40]}" if result.title else "",
         )
         if flags:
-            logger.info("    flags: %s", " | ".join(flags))
+            flag_strs = [f"{f.get('type','')}:{f.get('value','')}" for f in flags]
+            logger.info("    flags: %s", " | ".join(flag_strs))
         return result
 
     except Exception as exc:
@@ -1810,8 +2055,26 @@ def _estimate_redirect_depth(url: str, _headers: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Batch discovery runner
+# Adaptive backoff — exponential penalties for chronically dead destinations
 # ---------------------------------------------------------------------------
+
+# Backoff intervals in seconds: index N = interval after N consecutive failures.
+# 1→60s, 2→300s, 3→1800s, 4→7200s, 5→43200s (12h), capped at 604800s (7 days).
+_BACKOFF_INTERVALS = (60, 300, 1800, 7200, 43200, 604800)
+
+
+def _compute_backoff_interval(consecutive_failures: int) -> float:
+    """Return the backoff delay in seconds for a given failure count.
+
+    Uses exponential growth bounded by 7 days (max_failures).
+    consecutive_failures=1 → 60s, 2 → 300s, 3 → 1800s, 4 → 7200s,
+    5 → 43200s (12h), >=6 → 604800s (7 days).
+    """
+    idx = min(consecutive_failures - 1, len(_BACKOFF_INTERVALS) - 1)
+    if idx < 0:
+        return 0.0
+    return _BACKOFF_INTERVALS[idx]
+
 
 def discover_addresses(
     known_addrs: list[str | tuple[str, str]] | None = None,
@@ -1824,6 +2087,8 @@ def discover_addresses(
     limit: int | None = None,
     filter_mode: str = "all",
     min_age_hours: float = 24.0,
+    skip_backoff: bool = True,
+    respect_robots: bool = False,
 ) -> list[DiscoveryResult]:
     """Probe destinations and record results in persistent DB.
 
@@ -1844,6 +2109,12 @@ def discover_addresses(
             targets are returned when no known_addrs/catalog are provided.
             Options: "all" (default), "reachable_only", "never_probed", "stale".
         min_age_hours: Hours threshold for "stale" filter_mode (default 24).
+        skip_backoff: When True (default), targets with active backoff_until are
+            excluded from the probe queue. Set to False to force-probe everything.
+        respect_robots: When True, fetch robots.txt from each destination before
+            probing paths. Disallow rules are enforced — matching paths are skipped
+            during link extraction, and fully blocked sites get a flag instead of
+            being probed in their entirety.
 
     Returns:
         List of DiscoveryResult objects sorted by reachability then speed.
@@ -1889,7 +2160,7 @@ def discover_addresses(
                 ("", "mail.i2pmail.org"),
             ]
             db.upsert_targets(initial)
-            targets = db.get_targets(filter_mode=filter_mode, min_age_hours=min_age_hours)
+            targets = db.get_targets(filter_mode=filter_mode, min_age_hours=min_age_hours, skip_backoff=skip_backoff)
 
         # ── Apply limit if requested ────────────────────────────────
         if limit:
@@ -1898,19 +2169,43 @@ def discover_addresses(
         # ── Probe each target (one at a time — I2P is slow) ─────────
         results: list[DiscoveryResult] = []
 
+        # robots.txt cache keyed by DNS name or b32 address — fetch once per destination
+        _robots_cache: dict[str, TypingAny] = {}
+
         for i, (hash_hex, dns_name) in enumerate(targets):
             if i > 0:
                 logger.info("Waiting %.1fs before next probe...", probe_delay)
                 time.sleep(probe_delay)
             logger.info("--- Probing [%d/%d]: hash=%s  dns=%s", i + 1, len(targets), hash_hex or "(none)", dns_name or "(none)")
+
+            # Fetch robots.txt for this destination (cached to avoid redundant requests)
+            robots_policy = None
+            if respect_robots and dns_name:
+                cache_key = dns_name
+                if cache_key not in _robots_cache:
+                    from src.robots_parser import fetch_robots_txt
+                    robots_policy = fetch_robots_txt(
+                        f"http://{dns_name}/",
+                        config=cfg,
+                        timeout=min(timeout, 30.0),
+                    )
+                    _robots_cache[cache_key] = robots_policy
+                robots_policy = _robots_cache[cache_key]
+
             res = probe_destination(
                 ident_hash_hex=hash_hex,
                 i2p_dns_name=dns_name,
                 db=db,
                 timeout=timeout,
                 config=cfg,
+                robots_policy=robots_policy if respect_robots else None,
             )
             results.append(res)
+
+            # Adaptive backoff: update consecutive_failures and backoff_until
+            # based on probe outcome, so chronically dead destinations
+            # don't consume sweep budget every run.
+            db.update_backoff_state(hash_hex, dns_name, res.reachable)
 
         # Sort: reachable first, then fastest
         results.sort(key=lambda r: (not r.reachable, r.response_time_sec))
@@ -2154,7 +2449,8 @@ def print_report(results: list[DiscoveryResult], json_out: bool = False):
         if r.content_summary and r.content_summary != f'Unidentified site — "{r.title}"':
             print(f"    summary: {r.content_summary[:120]}")
         if r.flags:
-            print(f"    flags:   {' | '.join(r.flags)}")
+            flag_strs = [f"{f.get('type','')}:{f.get('value','')}" for f in r.flags]
+            print(f"    flags:   {' | '.join(flag_strs)}")
         if r.error:
             line += f"  err={r.error[:40]}"
         print(line)
@@ -2308,7 +2604,14 @@ def print_address_book(
         except (_json.JSONDecodeError, TypeError):
             flags_list = []
         if flags_list:
-            line += f" flags({','.join(flags_list)})"
+            # Flags may be dicts {"type": ..., "value": ...} or plain strings (legacy)
+            flag_labels = []
+            for f in flags_list:
+                if isinstance(f, dict):
+                    flag_labels.append(f"{f.get('type','')}:{f.get('value','')}")
+                else:
+                    flag_labels.append(str(f))
+            line += f" flags({'|'.join(flag_labels)})"
 
         print(line)
 

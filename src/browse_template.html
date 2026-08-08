@@ -121,6 +121,15 @@ a.no-std{color:inherit;text-decoration:none}.no-std:hover{color:#ccc}
 <div class="tabs" role="tablist">
   <button class="tab-btn active" data-tab="browse-table">Browse Table</button>
   <button class="tab-btn" data-tab="browse-timeline">Timeline View</button>
+  <button class="tab-btn" data-tab="browse-chart">Reachability Trends</button>
+</div>
+
+<!-- ======== REACHABILITY CHART TAB ======= -->
+<div class="tab-pane" id="browse-chart">
+  <div style="padding:12px 0;">
+    <canvas id="reach-chart" width="900" height="340"></canvas>
+  </div>
+  <div id="chart-legend" style="display:flex;justify-content:center;gap:24px;padding:8px;font-size:11px;color:#aaa"></div>
 </div>
 
 <!-- ======== BROWSE TABLE TAB ======= -->
@@ -178,6 +187,7 @@ a.no-std{color:inherit;text-decoration:none}.no-std:hover{color:#ccc}
 // --- Embedded datasets -----------------------------------------------------
 const ENTRIES  = __ENTRIES_JSON__;
 const TIMELINE = __TIMELINE_JSON__;
+const REACHABILITY_SERIES = __REACHABILITY_SERIES_JSON__;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -362,7 +372,8 @@ document.querySelectorAll('.tab-btn').forEach(btn=>{btn.addEventListener('click'
   document.querySelectorAll('.tab-pane').forEach(p=>p.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById(btn.dataset.tab).classList.add('active');
-  if(btn.dataset.tab==='timeline-body'&&typeof renderTimeline==='function'){renderTimeline();}
+  if(btn.dataset.tab==='browse-timeline'&&typeof renderTimeline==='function'){renderTimeline();}
+  if(btn.dataset.tab==='browse-chart'&&typeof renderChart==='function'){renderChart();}
 });});
 
 // ---------------------------------------------------------------------------
@@ -418,12 +429,171 @@ document.getElementById('body').addEventListener('click',e=>{
   tr.insertAdjacentHTML('afterend',det);});
 
 // ---------------------------------------------------------------------------
+// Reachability Trends — canvas-based area/line chart
+// ---------------------------------------------------------------------------
+function renderChart(){
+  const canvas=document.getElementById('reach-chart');
+  if(!canvas)return;
+  const ctx=canvas.getContext('2d');
+  const W=canvas.width, H=canvas.height;
+
+  // Margins
+  const ML=60, MR=20, MT=30, MB=50;
+  const cw=W-ML-MR, ch=H-MT-MB;
+
+  // Clear
+  ctx.fillStyle='#0a0a0f';
+  ctx.fillRect(0,0,W,H);
+
+  const data=REACHABILITY_SERIES;
+  if(!data||data.length===0){
+    ctx.fillStyle='#555';ctx.font='13px Courier New';ctx.textAlign='center';
+    ctx.fillText('No reachability trend data available.',W/2,H/2);
+    document.getElementById('chart-legend').textContent='';
+    return;
+  }
+
+  const n=data.length;
+  const xStep=cw/(n-1>n?n-1:1);
+
+  // Grid lines (y axis — 0,25,50,75,100 %)
+  ctx.strokeStyle='#222';ctx.lineWidth=1;
+  for(let p of [0,25,50,75,100]){
+    const y=MT+ch-(p/100)*ch;
+    ctx.beginPath();ctx.moveTo(ML,y);ctx.lineTo(ML+cw,y);ctx.stroke();
+    ctx.fillStyle='#666';ctx.font='10px Courier New';ctx.textAlign='right';
+    ctx.fillText(`${p}%`,ML-6,y+3);
+  }
+
+  // X labels — show every Nth label to avoid overlap
+  const xLabelStep=Math.max(1,Math.floor(n/8));
+  ctx.fillStyle='#666';ctx.font='9px Courier New';ctx.textAlign='center';
+  for(let i=0;i<n;i+=xLabelStep){
+    const x=ML+i*xStep;
+    // Extract just the time portion for brevity
+    let label=data[i].ts_utc||'';
+    if(label.length>13) label=label.substring(5);
+    ctx.fillText(label,x,H-MB+14);
+  }
+
+  // Build points array
+  const pts=data.map((d,i)=>({
+    x: ML+i*xStep,
+    y: MT+ch-(d.pct/100)*ch,
+    pct: d.pct,
+    reachable: d.reachable,
+    unreachable: d.unreachable,
+    ts: d.ts_utc,
+  }));
+
+  // Green area (reachable portion)
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, MT+ch);
+  for(const p of pts){ctx.lineTo(p.x,p.y);}
+  ctx.lineTo(pts[n-1].x,MT+ch);
+  ctx.closePath();
+  const gGrad=ctx.createLinearGradient(0,MT,0,MT+ch);
+  gGrad.addColorStop(0,'rgba(85,255,85,0.25)');
+  gGrad.addColorStop(1,'rgba(85,255,85,0.03)');
+  ctx.fillStyle=gGrad;ctx.fill();
+
+  // Green line
+  ctx.beginPath();
+  ctx.strokeStyle='#5f5';ctx.lineWidth=2;
+  for(let i=0;i<pts.length;i++){
+    i===0?ctx.moveTo(pts[i].x,pts[i].y):ctx.lineTo(pts[i].x,pts[i].y);
+  }
+  ctx.stroke();
+
+  // Red area (unreachable portion — mirror line)
+  const redPts=data.map((d,i)=>({
+    x: ML+i*xStep,
+    y: MT+ch-(((100-d.pct))/100)*ch,
+  }));
+
+  ctx.beginPath();
+  // Start at top-left of unreachable zone
+  ctx.moveTo(pts[0].x, MT);
+  for(const rp of redPts){ctx.lineTo(rp.x,rp.y);}
+  ctx.lineTo(pts[n-1].x,MT);
+  ctx.closePath();
+  const rGrad=ctx.createLinearGradient(0,MT,0,MT+ch);
+  rGrad.addColorStop(0,'rgba(255,85,85,0.15)');
+  rGrad.addColorStop(1,'rgba(255,85,85,0.01)');
+  ctx.fillStyle=rGrad;ctx.fill();
+
+  // Red line
+  ctx.beginPath();
+  ctx.strokeStyle='#f55';ctx.lineWidth=1.5;
+  for(let i=0;i<redPts.length;i++){
+    i===0?ctx.moveTo(redPts[i].x,redPts[i].y):ctx.lineTo(redPts[i].x,redPts[i].y);
+  }
+  ctx.stroke();
+
+  // Dot markers on green line
+  for(const p of pts){
+    ctx.beginPath();ctx.arc(p.x,p.y,3,0,Math.PI*2);
+    ctx.fillStyle='#5f5';ctx.fill();
+  }
+
+  // Axis label
+  ctx.save();ctx.translate(14,MT+ch/2);ctx.rotate(-Math.PI/2);
+  ctx.fillStyle='#888';ctx.font='11px Courier New';ctx.textAlign='center';
+  ctx.fillText('Reachability %',0,0);ctx.restore();
+
+  // Legend
+  const legendEl=document.getElementById('chart-legend');
+  if(legendEl){
+    const avgPct=data.reduce((s,d)=>s+d.pct,0)/n;
+    legendEl.innerHTML=
+      `<span style="color:#5f5">■ Reachable line (avg ${Math.round(avgPct)}%)</span>
+       <span style="color:#f55">■ Unreachable line</span>
+       <span>${n} data points · hourly buckets</span>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tooltip — hover over chart to see details
+// ---------------------------------------------------------------------------
+(function(){
+  const canvas=document.getElementById('reach-chart');
+  if(!canvas)return;
+
+  canvas.addEventListener('mousemove',function(e){
+    const rect=canvas.getBoundingClientRect();
+    const W=canvas.width, H=canvas.height;
+    // Scale mouse coords to canvas coordinate space
+    const scaleX=W/rect.width, scaleY=H/rect.height;
+    const mx=(e.clientX-rect.left)*scaleX;
+    const my=(e.clientY-rect.top)*scaleY;
+
+    const ML=60, MR=20, MT=30, MB=50;
+    const cw=W-ML-MR;
+    const data=REACHABILITY_SERIES;
+    if(!data||data.length<2)return;
+
+    const n=data.length;
+    const xStep=cw/(n-1);
+
+    // Find nearest point
+    let idx=Math.round((mx-ML)/xStep);
+    if(idx<0)idx=0;if(idx>=n)idx=n-1;
+    const d=data[idx];
+
+    if(d){
+      canvas.title=`${d.ts_utc}\nReachable: ${d.reachable}/${d.total_probes} (${d.pct}%)`;
+    }
+  });
+})();
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 document.getElementById('header-subtitle').textContent=`${ENTRIES.length} entries &mdash; exported __EXPORT_TS__`;
 document.getElementById('footer').innerHTML=`Exported __EXPORT_TS__&middot; I2P Indexer Address Book`;
 render();
 renderTimeline();
+if(typeof renderChart==='function'){renderChart();}
 </script>
 </body>
 </html>

@@ -59,9 +59,6 @@ hashes, and finally by last_probed_at (oldest probes re-probed first).
     # Export address book as website files:
     python3 probe_sweep.py export --output-dir website
 
-    # Export with enhanced browse UI (tabs, timeline, filters):
-    python3 probe_sweep.py export --output-dir website --browse-ui
-
 --- Cron job usage patterns ---
 
   # Weekly full baseline (every Sunday 02:00):
@@ -313,11 +310,12 @@ def main():
     export_parser.add_argument(
         "--browse-ui",
         action="store_true",
-        default=False,
-        help=(
-            "Generate the enhanced browse UI with tabs, timeline, filters, and dark theme. "
-            "Generates address_book_ui.html alongside the standard HTML and TXT exports."
-        ),
+        help="Also generate the enhanced interactive browse UI with charts",
+    )
+    export_parser.add_argument(
+        "--ui-filename",
+        default="address_book_ui.html",
+        help="Filename for the enhanced browse UI (default: address_book_ui.html)",
     )
 
     # ── Global arguments (flat — apply to sweep when no subcommand) --
@@ -430,6 +428,17 @@ def main():
         default=False,
         help="Disable adaptive backoff — probe targets even when they are in their backoff window (default: respect backoff)",
     )
+    p.add_argument(
+        "--backoff-strategy",
+        choices=["exponential", "fixed"],
+        default="exponential",
+        dest="backoff_strategy",
+        help=(
+            "Backoff algorithm for unreachable targets (default: exponential). "
+            "'exponential' uses growing delays (60s → 300s → 1800s …), "
+            "'fixed' applies a constant delay per failure."
+        ),
+    )
     args = p.parse_args()
 
     # ── Validate crawl args ───────────────────────────────────────
@@ -451,7 +460,7 @@ def main():
             print(f"  HTML: {html_path} ({html_size:,} bytes)")
             print(f"  TXT:  {txt_path} ({txt_size:,} bytes)")
             if args.browse_ui:
-                ui_path = generate_address_book_ui(db_path, output_dir)
+                ui_path = generate_address_book_ui(db_path, output_dir, output_filename=args.ui_filename)
                 ui_size = ui_path.stat().st_size
                 print(f"  UI:   {ui_path} ({ui_size:,} bytes)")
             print("Export complete.")
@@ -538,6 +547,7 @@ def main():
         filter_mode=args.sweep_filter or "all",
         min_age_hours=args.min_age_hours,
         skip_backoff=not args.no_backoff,
+        backoff_strategy=args.backoff_strategy,
         respect_robots=args.respect_robots,
     )
 

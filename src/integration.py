@@ -595,7 +595,7 @@ class DiscoveryDB:
                 logger.warning("Failed to create dedup index on discoveries: %s", e)
 
     def _ensure_targets_columns(self) -> None:
-        """Add new columns for SUSI export support."""
+        """Add new columns for SUSI export support and adaptive backoff."""
         cur = self._conn.cursor()
         cur.execute("PRAGMA table_info(targets)")
         existing_cols = {row[1] for row in cur.fetchall()}
@@ -610,6 +610,17 @@ class DiscoveryDB:
         if "last_updated_at" not in existing_cols:
             cur.execute(
                 "ALTER TABLE targets ADD COLUMN last_updated_at REAL DEFAULT 0"
+            )
+        # Adaptive backoff columns — track consecutive failures and compute
+        # a backoff_until timestamp so chronically dead destinations don't
+        # consume sweep budget every run.
+        if "consecutive_failures" not in existing_cols:
+            cur.execute(
+                "ALTER TABLE targets ADD COLUMN consecutive_failures INTEGER DEFAULT 0"
+            )
+        if "backoff_until" not in existing_cols:
+            cur.execute(
+                "ALTER TABLE targets ADD COLUMN backoff_until REAL DEFAULT 0"
             )
         self._conn.commit()
 

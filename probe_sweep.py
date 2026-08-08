@@ -59,6 +59,9 @@ hashes, and finally by last_probed_at (oldest probes re-probed first).
     # Export address book as website files:
     python3 probe_sweep.py export --output-dir website
 
+    # Export with enhanced browse UI (tabs, timeline, filters):
+    python3 probe_sweep.py export --output-dir website --browse-ui
+
 --- Cron job usage patterns ---
 
   # Weekly full baseline (every Sunday 02:00):
@@ -88,6 +91,7 @@ logger = logging.getLogger(__name__)
 from src.export_website import (
     generate_address_book_html,
     generate_address_book_txt,
+    generate_address_book_ui,
 )
 
 from src.addressbook import AddressBookCatalog
@@ -306,6 +310,15 @@ def main():
         default=None,
         help=f"Path to SQLite database (default: {DEFAULT_DB_PATH})",
     )
+    export_parser.add_argument(
+        "--browse-ui",
+        action="store_true",
+        default=False,
+        help=(
+            "Generate the enhanced browse UI with tabs, timeline, filters, and dark theme. "
+            "Generates address_book_ui.html alongside the standard HTML and TXT exports."
+        ),
+    )
 
     # ── Global arguments (flat — apply to sweep when no subcommand) --
     p.add_argument(
@@ -437,6 +450,10 @@ def main():
             txt_size = txt_path.stat().st_size
             print(f"  HTML: {html_path} ({html_size:,} bytes)")
             print(f"  TXT:  {txt_path} ({txt_size:,} bytes)")
+            if args.browse_ui:
+                ui_path = generate_address_book_ui(db_path, output_dir)
+                ui_size = ui_path.stat().st_size
+                print(f"  UI:   {ui_path} ({ui_size:,} bytes)")
             print("Export complete.")
         except Exception as e:
             print(f"Export failed: {e}")

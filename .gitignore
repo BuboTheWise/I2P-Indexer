@@ -35,3 +35,14 @@ src/ext_plugins/*.py
 
 # UV lock file
 uv.lock
+
+# ML model weights — downloaded at runtime via huggingface_hub or Ollama
+models/
+
+# Test database (runtime artifact)
+tests/discoveries.db
+tests/*.db
+
+# Benchmark scripts — local performance measurements, not part of the library
+benchmark*.py
+*benchmark*.py

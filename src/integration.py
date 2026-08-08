@@ -595,7 +595,7 @@ class DiscoveryDB:
                 logger.warning("Failed to create dedup index on discoveries: %s", e)
 
     def _ensure_targets_columns(self) -> None:
-        """Add new columns for SUSI export support and adaptive backoff."""
+        """Add new columns for SUSI export support, adaptive backoff, and crawl tracking."""
         cur = self._conn.cursor()
         cur.execute("PRAGMA table_info(targets)")
         existing_cols = {row[1] for row in cur.fetchall()}
@@ -621,6 +621,18 @@ class DiscoveryDB:
         if "backoff_until" not in existing_cols:
             cur.execute(
                 "ALTER TABLE targets ADD COLUMN backoff_until REAL DEFAULT 0"
+            )
+        if "crawl_depth" not in existing_cols:
+            # How many hops from the original seed this target is.
+            # 0 = manually seeded; 1 = found while probing a seeded site, etc.
+            cur.execute(
+                "ALTER TABLE targets ADD COLUMN crawl_depth INTEGER DEFAULT 0"
+            )
+        if "provenance_chain" not in existing_cols:
+            # Human-readable chain showing how we discovered this target,
+            # e.g. "seed → i2p-projekt.i2p → some-site.i2p"
+            cur.execute(
+                "ALTER TABLE targets ADD COLUMN provenance_chain TEXT DEFAULT ''"
             )
         self._conn.commit()
 
@@ -1333,15 +1345,63 @@ class DiscoveryDB:
         cur.execute(query, params)
         return [(r[0], r[1]) for r in cur.fetchall()]
 
+    def get_new_targets_for_crawl(
+        self,
+        depth: int = 0,
+        source: str = "linked",
+        max_count: int | None = None,
+    ) -> list[tuple[str, str]]:
+        """Return targets eligible for auto-discovery crawl at the given depth.
+
+        These are targets with `source='linked'` (or any specified source),
+        matching the requested crawl_depth, that have never been probed
+        (last_probed_at == 0). Useful for the next-round of recursive crawling.
+
+        Args:
+            depth: Crawl depth to fetch targets at (default 0).
+            source: Target source to filter by (default 'linked').
+            max_count: Cap the number of targets returned per round.
+
+        Returns:
+            List of (ident_hash_hex, dns_name) tuples.
+        """
+        cur = self._conn.cursor()
+        query = (
+            "SELECT ident_hash_hex, i2p_dns_name FROM targets "
+            "WHERE source = ? AND crawl_depth = ? AND last_probed_at == 0 "
+            "ORDER BY first_seen_at ASC"
+        )
+        params: list = [source, depth]
+        if max_count is not None:
+            query += f" LIMIT {max_count}"
+        cur.execute(query, params)
+        return [(r[0], r[1]) for r in cur.fetchall()]
+
+    def get_new_target_count(self) -> int:
+        """Return count of targets that have never been probed and are linked-sourced."""
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM targets WHERE source = 'linked' AND last_probed_at == 0"
+        )
+        return cur.fetchone()[0]
+
     def upsert_targets_from_links(
         self,
         linked_sites: list[str],
         source_site: str = "",
+        crawl_depth: int = 1,
     ) -> int:
         """Upsert .i2p DNS names discovered while probing another site.
 
         Each entry gets an empty hash/b32 (DNS-only seed) and records which
-        site found it for traceability.  Returns the count of newly inserted rows.
+        site found it for traceability. Returns the count of newly inserted rows.
+
+        Args:
+            linked_sites: List of .i2p DNS names to upsert.
+            source_site: The DNS name or label of the parent site that contained
+                these links (for provenance chain tracking).
+            crawl_depth: How many hops from the original seed this target is.
+                Depth 1 = found in a seeded site; depth 2 = found via depth-1, etc.
         """
         with self._lock:
             cur = self._conn.cursor()
@@ -1353,10 +1413,23 @@ class DiscoveryDB:
                 cur.execute("SELECT 1 FROM targets WHERE i2p_dns_name = ?", (dns,))
                 if cur.fetchone():
                     continue
+                # Build provenance chain: source_site is the direct parent that found this link.
+                # We look up the parent's own provenance chain to build a full lineage.
+                chain = dns
+                if source_site:
+                    parent_chain = ""
+                    cur.execute(
+                        "SELECT provenance_chain FROM targets WHERE i2p_dns_name = ?",
+                        (source_site,),
+                    )
+                    pr = cur.fetchone()
+                    if pr and pr[0]:
+                        parent_chain = pr[0]
+                    chain = f"{parent_chain} → {dns}" if parent_chain else f"seed → {dns}"
                 cur.execute(
-                    "INSERT INTO targets (ident_hash_hex, b32_addr, i2p_dns_name, source, source_site) "
-                    "VALUES (?, ?, ?, 'linked', ?)",
-                    ("", "", dns, source_site),
+                    "INSERT INTO targets (ident_hash_hex, b32_addr, i2p_dns_name, source, source_site, "
+                    "crawl_depth, provenance_chain) VALUES (?, ?, ?, 'linked', ?, ?, ?)",
+                    ("", "", dns, source_site, crawl_depth, chain),
                 )
                 added += 1
             self._conn.commit()
@@ -1546,6 +1619,7 @@ def probe_destination(
             added = db.upsert_targets_from_links(
                 linked_sites=new,
                 source_site=parent,
+                crawl_depth=getattr(db, '_crawl_depth', 1),
             )
             logger.info("  Found %d new i2p link(s), seeded %d to targets", len(new), added)
 
@@ -1855,6 +1929,187 @@ def discover_addresses(
 
 
 # ---------------------------------------------------------------------------
+# Auto-crawl: multi-hop discovery with depth control and safety bounds
+# ---------------------------------------------------------------------------
+
+def auto_crawl(
+    max_depth: int = 2,
+    crawl_delay: float = 10.0,
+    timeout: float = PROBE_TIMEOUT,
+    max_new_targets: int | None = None,
+    config: I2PConfig | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+    db_instance: DiscoveryDB | None = None,
+) -> dict:
+    """Recursively discover new .i2p destinations by crawling links within depth bounds.
+
+    Workflow per round (depth 1..max_depth):
+    1. Query the DB for targets with crawl_depth == current_depth that haven't been probed.
+    2. Probe each target — probe_destination() records results and extracts links via
+       ``probe_destination()``, which calls ``db.upsert_targets_from_links()`` internally.
+    3. After a round completes, count how many NEW targets were seeded. Stop if the safety
+       cap is reached or no new links were discovered.
+
+    Safety bounds:
+    - ``max_depth``: maximum number of hops from the original seed (default 2).
+    - ``max_new_targets``: stop after this many linked targets are in the DB overall.
+      Set to None to disable the cap (not recommended for unattended runs).
+    - Visited set: each DNS name is only probed once per run — duplicates across parents
+      are skipped via ``db.upsert_targets_from_links()`` which uses UNIQUE constraints.
+
+    Rate limits:
+    - Unverified targets (source='linked') get longer delays than the default probe_delay,
+      since they haven't been confirmed reachable yet. The delay scales with depth:
+      depth_1 = crawl_delay * 1.0, depth_2 = crawl_delay * 1.5, etc.
+
+    Args:
+        max_depth: Maximum recursion depth (default 2). Depth 1 = sites linked from
+            known/seeded destinations; depth 2 = sites linked from depth-1 discoveries.
+        crawl_delay: Base delay between probes of linked targets in seconds (default 10s).
+            Longer than the default ``probe_delay`` since unverified links are riskier.
+        timeout: Per-target probe deadline in seconds (default PROBE_TIMEOUT=120).
+        max_new_targets: Maximum total number of newly discovered linked targets to allow
+            per run. When reached, crawling stops early. Disable with None.
+        config: I2P configuration override.
+        db_path: Path to SQLite DB (used when db_instance not provided).
+        db_instance: Optional pre-created DiscoveryDB.
+
+    Returns:
+        Dict with keys: probes_attempted, new_targets_inserted, depth_reached, rounds_run.
+    """
+    cfg = config or I2PConfig()
+    use_existing_db = db_instance is not None
+    db = db_instance or DiscoveryDB(db_path)
+
+    # Set crawl_depth flag on DB so probe_destination() propagates it via upsert
+    depth_to_use: int = 1  # incremented each round
+
+    stats = {
+        "probes_attempted": 0,
+        "new_targets_inserted": 0,
+        "depth_reached": 0,
+        "rounds_run": 0,
+        "domains_per_depth": {},
+    }
+
+    try:
+        # Initialize crawl tracking on DB instance
+        db._crawl_depth = 1
+
+        for depth_round in range(1, max_depth + 1):
+            round_start = time.monotonic()
+
+            # Rate limiting scales with depth (exponential backoff for deeper crawls)
+            effective_delay = crawl_delay * max(1.0, 1.0 + (depth_round - 1) * 0.5)
+
+            logger.info(
+                "=== Crawl round %d/%d — fetching targets at depth=%d, delay=%.1fs ===",
+                depth_round, max_depth, depth_round, effective_delay,
+            )
+
+            # Fetch targets that were seeded at this depth and haven't been probed yet
+            targets = db.get_new_targets_for_crawl(
+                depth=depth_round,
+                source="linked",
+            )
+
+            if not targets:
+                logger.info("No unprobed targets at depth %d — crawl finished.", depth_round)
+                break
+
+            stats["rounds_run"] += 1
+            stats["depth_reached"] = max(stats["depth_reached"], depth_round)
+
+            # Per-depth domain deduplication: only probe unique DNS names in this round.
+            seen_dns_this_round: set[str] = set()
+            unique_targets: list[tuple[str, str]] = []
+            for h, d in targets:
+                key = d.lower() if d else h.lower()
+                if key and key not in seen_dns_this_round:
+                    seen_dns_this_round.add(key)
+                    unique_targets.append((h, d))
+
+            logger.info("Depth %d: %d candidate(s), %d unique after domain dedup",
+                        depth_round, len(targets), len(unique_targets))
+
+            # Safety cap check before probing this round
+            if max_new_targets is not None:
+                # Count total new linked targets discovered so far in THIS run.
+                # We track this by counting how many unprobed linked targets remain
+                # plus probes we've already attempted (which are the ones we consumed).
+                # The DB was queried for unprobed at each depth before this check,
+                # so current_linked counts unprobed ones not yet touched in this run.
+                remaining_unprobed = db.get_new_target_count()
+                total_reached_or_remaining = remaining_unprobed + stats["probes_attempted"]
+                if total_reached_or_remaining >= max_new_targets:
+                    logger.info(
+                        "Safety cap reached (%d targets processed/remaining >= %d). Stopping crawl.",
+                        total_reached_or_remaining, max_new_targets,
+                    )
+                    break
+
+            # Update DB crawl_depth so probe_destination->upsert propagates the right level
+            db._crawl_depth = depth_round + 1
+
+            # Probe each target in this round
+            n_ok = 0
+            n_fail = 0
+            for i, (hash_hex, dns_name) in enumerate(unique_targets):
+                if i > 0:
+                    logger.info("Waiting %.1fs before next crawl probe...", effective_delay)
+                    time.sleep(effective_delay)
+
+                stats["probes_attempted"] += 1
+                label = f"Crawl d={depth_round} [{i+1}/{len(unique_targets)}]"
+                target_id = dns_name or hash_hex[:12] + "..."
+                logger.info("%s Probing: %s", label, target_id)
+
+                try:
+                    result = probe_destination(
+                        ident_hash_hex=hash_hex if hash_hex else "",
+                        i2p_dns_name=dns_name or "",
+                        db=db,
+                        timeout=timeout,
+                        config=cfg,
+                    )
+                except Exception as exc:
+                    logger.warning("  ERROR probing %s: %s", target_id, exc)
+                    n_fail += 1
+                    continue
+
+                reachable = result.reachable if hasattr(result, "reachable") else False
+                if reachable:
+                    n_ok += 1
+                    ctype = getattr(result, "content_type", "") or ""
+                    title = getattr(result, "title", "") or ""
+                    logger.info(
+                        "  ✓ [%s] status=OK type=%s title=%s links_found=%d",
+                        target_id, ctype, title[:40], len(getattr(result, "found_links", []) or []),
+                    )
+                else:
+                    n_fail += 1
+
+            stats["domains_per_depth"][str(depth_round)] = {
+                "attempted": len(unique_targets),
+                "ok": n_ok,
+                "fail": n_fail,
+            }
+
+            round_elapsed = round(time.monotonic() - round_start, 1)
+            logger.info(
+                "Round %d complete: %d attempted, %d ok, %d fail (%.1fs)",
+                depth_round, len(unique_targets), n_ok, n_fail, round_elapsed,
+            )
+
+        final_sum = db.summary()
+        logger.info("Crawl finished — DB summary: %s", final_sum)
+        return stats
+    finally:
+        if not use_existing_db:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
 # Reporting / CLI
 # ---------------------------------------------------------------------------
 
@@ -2106,6 +2361,33 @@ def main() -> None:
         help="Per-target probe timeout in seconds (default: 120)",
     )
 
+    # ── crawl: recursive link-following with depth and safety caps ────
+    crawl_p = sub.add_parser("crawl", help="Recursively discover new destinations from linked sites")
+    crawl_p.add_argument(
+        "--max-depth",
+        type=int,
+        default=2,
+        help="Maximum crawl depth (hops from seed). Default: 2",
+    )
+    crawl_p.add_argument(
+        "--crawl-delay",
+        type=float,
+        default=15.0,
+        help="Delay between probes in crawl mode (default: 15s, longer than sweep since targets are unverified)",
+    )
+    crawl_p.add_argument(
+        "--max-new-targets",
+        type=int,
+        default=None,
+        help="Safety cap: stop after this many newly discovered linked targets per run. Default: unlimited",
+    )
+    crawl_p.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Per-target probe timeout in seconds (default: 120)",
+    )
+
     args = p.parse_args()
 
     if hasattr(args, "probe_timeout") and args.probe_timeout is not None:
@@ -2117,6 +2399,23 @@ def main() -> None:
 
     if args.command == "reprobe":
         _do_reprobe(limit=args.limit, timeout=args.timeout)
+    elif args.command == "crawl":
+        stats = auto_crawl(
+            max_depth=getattr(args, "max_depth", 2),
+            crawl_delay=getattr(args, "crawl_delay", 15.0),
+            timeout=getattr(args, "timeout", 120.0),
+            max_new_targets=getattr(args, "max_new_targets", None),
+            config=cfg,
+        )
+        print(f"\n{'='*60}")
+        print(f"  CRAWL SUMMARY")
+        print(f"  Rounds run:           {stats['rounds_run']}")
+        print(f"  Max depth reached:    {stats['depth_reached']}")
+        print(f"  Probes attempted:     {stats['probes_attempted']}")
+        per_depth = stats.get('domains_per_depth', {})
+        for d, info in sorted(per_depth.items()):
+            print(f"  Depth {d}: attempted={info['attempted']} ok={info['ok']} fail={info['fail']}")
+        print(f"{'='*60}\n")
     elif args.command == "show" or args.command is None and getattr(args, "needs_review", False):
         # Address book mode (explicit 'show' or --needs-review on bare invocation)
         entries = get_address_book(needs_review_only=getattr(args, "needs_review", False))

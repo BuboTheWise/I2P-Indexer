@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>I2P Indexer &mdash; Address Book Browser</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+/* === Reset & base (dark theme matching export style) ======================= */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Courier New',monospace;font-size:12px;color:#e0e0e0;
+    background:#0a0a0f;padding:8px;line-height:1.4}
+
+/* === Header =============================================================== */
+.header{text-align:center;padding:12px 0 8px;border-bottom:1px solid #333;margin-bottom:12px}
+.header h1{font-size:18px;color:#fff;font-weight:normal;letter-spacing:2px}
+.header .subtitle{color:#666;font-size:11px;margin-top:4px}
+
+/* === Stats bar ============================================================ */
+.stats{display:flex;gap:16px;padding:8px 12px;margin-bottom:8px;
+      border:1px solid #333;border-radius:4px;background:#111;font-size:11px;flex-wrap:wrap}
+.stats span{white-space:nowrap}
+.ok{color:#5f5}.down{color:#f55}
+
+/* === Tabs ================================================================= */
+.tabs{display:flex;gap:0;margin-bottom:8px;border:1px solid #333;border-radius:4px;overflow:hidden}
+.tab-btn{flex:1;padding:6px;text-align:center;background:#111;color:#999;
+    border:none;cursor:pointer;font-size:12px;font-family:inherit;transition:.15s}
+.tab-btn.active{background:#222;color:#fff;border-bottom:2px solid #5f5}
+.tab-btn:hover:not(.active){background:#1a1a1a}
+.tab-pane{display:none}.tab-pane.active{display:block}
+
+/* === Controls ============================================================= */
+.controls{display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;align-items:center}
+.controls input[type="text"]{flex:1;min-width:160px;padding:4px 8px;
+    background:#111;color:#ccc;border:1px solid #444;border-radius:3px;font-size:12px;font-family:inherit}
+.controls select,.controls button,.filter-btn{padding:4px 8px;background:#1a1a1a;color:#ccc;
+    border:1px solid #444;border-radius:3px;font-size:11px;cursor:pointer;font-family:inherit}
+.controls button:hover,.controls select:hover,.filter-btn:hover{border-color:#888}
+.filter-row{display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;align-items:center}
+.filter-group{display:flex;align-items:center;gap:4px;font-size:11px;color:#aaa}
+.filter-group label{color:#888}
+.filter-active{position:relative}
+.filter-active::after{content:'';width:5px;height:5px;background:#5f5;border-radius:50%;position:absolute;top:-2px;right:-2px}
+
+/* === Toggle panel button ================================================== */
+.adv-toggle{font-size:11px;color:#5f5;cursor:pointer;padding:4px 8px;border:1px solid #333;
+    border-radius:3px;background:#111;font-family:inherit}
+.adv-toggle:hover{border-color:#888}
+.adv-panel{display:none;margin-bottom:8px;padding:8px 12px;border:1px solid #333;
+    border-radius:4px;background:#111;font-size:11px}
+.adv-panel.open{display:block}
+
+/* === Table (fixed-width grid) ============================================= */
+table{width:100%;border-collapse:collapse;table-layout:fixed;word-break:break-all}
+th,td{padding:3px 6px;border:1px solid #222;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}
+thead th{position:sticky;top:0;background:#15151a;color:#aaa;cursor:pointer;user-select:none}
+thead th:hover{background:#252530;color:#fff}
+thead .sort-asc::after{content:' &uarr;'>}thead .sort-desc::after{content:' &darr;'>}
+/* Column widths */
+  col.c-status{width:60px;}col.c-type{width:90px;}col.c-site{width:auto;}
+  col.c-title{width:120px;}col.c-rt{width:54px;}col.c-size{width:54px;}
+  col.c-lang{width:46px;}col.c-time{width:150px;}col.c-bw{width:64px;}col.c-links{width:30px;}
+
+tbody tr:nth-child(even){background:#0e0e14}
+tbody tr:hover{background:#1a1a28;cursor:pointer}
+.unreachable{color:#666!important;opacity:.55}
+.status-ok{text-decoration:none;color:#5f5;font-weight:bold}.status-down{text-decoration:none;color:#f55}
+a.no-std{color:inherit;text-decoration:none}.no-std:hover{color:#ccc}
+
+/* === Details row (expand) ================================================= */
+.detail-row td{background:#101018;border-left:3px solid #333;padding:8px 12px;font-size:11px;
+    color:#bbb;white-space:normal;table-layout:auto}
+.detail-grid{display:grid;grid-template-columns:auto 1fr;gap:4px 12px}
+.detail-label{color:#666;text-align:right;font-weight:bold}
+
+/* === Pagination =========================================================== */
+.pager{text-align:center;margin-top:8px;padding:4px;color:#999;font-size:11px;
+    display:flex;justify-content:center;gap:6px;align-items:center}
+.pager button{padding:3px 10px;background:#1a1a1a;color:#ccc;border:1px solid #444;
+     border-radius:3px;font-size:11px;cursor:pointer;font-family:inherit}
+.pager button:hover:not(:disabled){border-color:#888}
+.pager button:disabled{opacity:.35}
+.jump-input{width:50px;text-align:center;padding:2px;background:#111;color:#ccc;border:1px solid #444;
+    border-radius:3px;font-size:11px;font-family:inherit}
+
+/* === Timeline (tab 2) ===================================================== */
+.tl-search{width:100%;padding:6px;margin-bottom:8px;background:#111;color:#ccc;
+    border:1px solid #444;border-radius:3px;font-size:12px;font-family:inherit}
+.tl-timeline{position:relative;padding-left:20px;margin-top:8px}
+.tl-timeline::before{content:'';position:absolute;left:8px;top:0;bottom:0;width:2px;background:#333}
+.tl-point{position:relative;margin-bottom:12px;padding:6px 10px;border-radius:4px;
+    background:#111;border:1px solid #333}
+.tl-point::before{content:'';position:absolute;left:-17px;top:8px;width:8px;height:8px;
+    border-radius:50%;border:2px solid #0a0a0f}
+.tl-point.up::before{background:#5f5}.tl-point.down::before{background:#f55}
+.tl-dns{color:#fff;font-size:12px;font-weight:bold}
+.tl-meta{font-size:10px;color:#888;margin-top:2px}
+
+/* === Footer =============================================================== */
+.footer{text-align:center;color:#444;font-size:10px;margin-top:12px;padding:4px}
+
+/* === Empty state ========================================================== */
+.empty{text-align:center;padding:40px;color:#555;font-size:13px}
+
+@media(max-width:600px){
+  body{padding:4px}.stats{gap:8px}.controls{flex-direction:column}
+  .filter-row{flex-direction:column}.controls input[type="text"]{min-width:unset;width:100%}
+  .detail-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>I2P INDEXER &mdash; ADDRESS BOOK</h1>
+  <div class="subtitle" id="header-subtitle"></div>
+</div>
+
+<div class="stats" id="stats"></div>
+
+<!-- Tabs -->
+<div class="tabs" role="tablist">
+  <button class="tab-btn active" data-tab="browse-table">Browse Table</button>
+  <button class="tab-btn" data-tab="browse-timeline">Timeline View</button>
+</div>
+
+<!-- ======== BROWSE TABLE TAB ======= -->
+<div class="tab-pane active" id="browse-table">
+  <!-- Basic controls -->
+  <div class="controls">
+    <input type="text" id="filter" placeholder="Search dns / title / type / summary ..." autofocus>
+    <label style="font-size:11px;display:flex;align-items:center;gap:4px;white-space:nowrap">
+      <input type="checkbox" id="show-unreachable"> show down</label>
+    <label style="font-size:11px">rows <select id="pageSize">
+        <option value="25">25</option><option value="50" selected>50</option>
+        <option value="100">100</option><option value="200">200</option></select></label>
+    <button id="adv-toggle" class="adv-toggle">+ filters</button>
+    <button id="reset-btn">Reset</button>
+  </div>
+
+  <!-- Advanced filters -->
+  <div class="adv-panel" id="adv-panel">
+    <div class="filter-row">
+      <div class="filter-group"><label>Type:</label>
+        <select id="filter-type"><option value="">all types</option></select></div>
+      <div class="filter-group"><label>Status:</label>
+        <select id="filter-status"><option value="any">any</option><option value="1">up</option><option value="0">down</option></select></div>
+      <div class="filter-group"><label>Language:</label>
+        <select id="filter-lang"><option value="">all languages</option></select></div>
+    </div>
+  </div>
+
+  <!-- Table -->
+  <div style="overflow-x:auto">
+  <table id="grid" role="grid">
+    <colgroup>
+      <col class="c-status"><col class="c-type"><col class="c-site">
+      <col class="c-title"><col class="c-rt"><col class="c-size">
+      <col class="c-lang"><col class="c-time"><col class="c-bw"><col class="c-links">
+    </colgroup>
+    <thead id="head"></thead><tbody id="body"></tbody>
+  </table>
+  </div>
+
+  <!-- Pagination -->
+  <div class="pager" id="pager"></div>
+</div>
+
+<!-- ======== TIMELINE TAB ======= -->
+<div class="tab-pane" id="browse-timeline">
+  <input class="tl-search" type="text" id="tl-filter" placeholder="Search timeline entries by dns name ...">
+  <div id="tl-stats" style="font-size:11px;color:#888;margin-bottom:8px"></div>
+  <div class="tl-timeline" id="tl-body"></div>
+</div>
+
+<div class="footer" id="footer"></div>
+
+<script>
+// --- Embedded datasets -----------------------------------------------------
+const ENTRIES  = __ENTRIES_JSON__;
+const TIMELINE = __TIMELINE_JSON__;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function esc(s){return(typeof s==='string')?s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'):'0'}
+function escId(s){return (typeof s==='string')?s.replace(/[^\w.-]/g,'_'):''}
+
+// ---------------------------------------------------------------------------
+// Populate filter options
+// ---------------------------------------------------------------------------
+(function initFilterOptions(){
+  const types=new Set(), langs=new Set();
+  for(const r of ENTRIES){if(r.content_type)types.add(r.content_type); if(r.detected_lang&&r.detected_lang!=='en')langs.add(r.detected_lang)}
+  const fs=document.getElementById('filter-type');
+  for(const t of[...types].sort()){const o=document.createElement('option');o.value=t;o.textContent=t;fs.appendChild(o)}
+  const fl=document.getElementById('filter-lang');
+  for(const l of[...langs].sort()){const o=document.createElement('option');o.value=l;o.textContent=l.toUpperCase();fl.appendChild(o)}
+})();
+
+// ---------------------------------------------------------------------------
+// Column definitions
+// ---------------------------------------------------------------------------
+const COLS=[
+  {key:'_status',      label:'Status'},
+  {key:'content_type', label:'Type'},
+  {key:'dns_name',     label:'Site'},
+  {key:'title',        label:'Title'},
+  {key:'response_time_sec',label:'RT'},
+  {key:'body_length',  label:'Size'},
+  {key:'detected_lang',label:'Lang'},
+  {key:'last_probed_utc',label:'Last Probed'},
+  {key:'bandwidth_kbps',label:'BW'},
+  {key:'_linkcount',   label:'#L'},
+];
+
+const hiBytes=v=>{if(!v||v===0)return'';if(v<1024)return v+'B';const k=v/1024;if(k<1024)return k.toFixed(1)+'KB';return(k/1024).toFixed(1)+'MB'};
+const hiRT=v=>{if(!v||v===0)return'';return v.toFixed(1)+'s'};
+function tryJson(v){try{return JSON.parse(v)}catch{if(typeof v==='object'&&v!==null)return v;return[]}}
+
+// Precompute display helper values
+for(const r of ENTRIES){
+  r._status = r.reachable ? 'OK' : 'DOWN';
+  const raw=r.found_links;
+  r._linkcount=(Array.isArray(raw)?raw.length:(typeof raw==='string'?tryJson(raw).length:0))||0;
+}
+
+function colValue(r,key){
+  if(key==='response_time_sec')return hiRT(r[key]);
+  if(key==='body_length')return hiBytes(r[key]);
+  if(key==='_linkcount')return r[key]??0;
+  return r[key]??'';
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let sortKey='dns_name', sortAsc=false;
+let filterText='';
+let showUnreachable=true;
+let pageSize=50, page=1;
+let filterType='', filterStatus='any', filterLang='';
+
+function filteredRows(){
+  return ENTRIES.filter(r=>{
+    if(!showUnreachable&&!r.reachable)return false;
+    if(filterType&&r.content_type!==filterType)return false;
+    if(filterLang&&r.detected_lang!==filterLang)return false;
+    if(filterStatus==='1'&&!r.reachable)return false;
+    if(filterStatus==='0'&&r.reachable)return false;
+    if(filterText){
+      const q=filterText.toLowerCase();
+      const hay=[r.dns_name,r.title,r.content_type,r.content_summary].join(' ').toLowerCase();
+      if(hay.indexOf(q)===-1)return false;
+    }
+    return true;
+  });
+}
+
+function sortFn(a,b){
+  let va=colValue(a,sortKey), vb=colValue(b,sortKey);
+  if(va==null)va='';if(vb==null)vb='';
+  if(typeof va==='string')return sortAsc?va.localeCompare(vb):vb.localeCompare(va);
+  return sortAsc?va-vb:vb-va;
+}
+
+// ---------------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------------
+function render(){
+  let rows=filteredRows();rows.sort(sortFn);
+  const total=Math.ceil(rows.length/pageSize)||1;
+  if(page>total)page=total;
+  const slice=rows.slice((page-1)*pageSize,page*pageSize);
+
+  // Header
+  let h=''; for(const c of COLS){
+    const cls=sortKey===c.key?(sortAsc?'sort-asc':'sort-desc'):'';
+    h+=`<th class="${cls}" data-key="${c.key}">${esc(c.label)}</th>`;
+  }
+  document.getElementById('head').innerHTML=h;
+
+  // Body
+  let b=''; for(const r of slice){
+    const unrc=r.reachable?'':'unreachable';
+    const scl=r.reachable?'status-ok':'status-down';
+    const sid=escId(r.dns_name);
+    b+=`<tr class="${unrc}" data-id="${sid}">`;
+    b+=`<td class="${scl}">${r._status}</td>`;
+    b+=`<td>${esc(r.content_type||'')}</td>`;
+    b+=`<td style="overflow:visible;white-space:normal">${esc(r.dns_name)}</td>`;
+    b+=`<td title="${esc((r.content_summary||'').replace(/"/g,'&quot;'))}">${esc(r.title||'')}</td>`;
+    b+=`<td>${hiRT(r.response_time_sec)}</td>`;
+    b+=`<td>${hiBytes(r.body_length)}</td>`;
+    const langLabel=r.detected_lang&&r.detected_lang!=='en'?r.detected_lang.toUpperCase():'';
+    b+=`<td title="ISO 639-1">${esc(langLabel)}</td>`;
+    b+=`<td title="${esc((r.content_summary||'').replace(/"/g,'&quot;'))}">${esc(r.last_probed_utc||'')}</td>`;
+    b+=`<td>${esc(String(r.bandwidth_kbps??''))}</td>`;
+    b+=`<td>${r._linkcount}</td>`;
+    b+=`</tr>`;
+  }
+  document.getElementById('body').innerHTML=b;
+
+  // Pagination
+  let pg=`<button ${page<=1?'disabled':''} onclick="goPage(page-1)">prev</button>`;
+  pg+=`<span>${page}/${total} (${rows.length})</span>`;
+  pg+=`<button ${page>=total?'disabled':''} onclick="goPage(page+1)">next</button>`;
+  document.getElementById('pager').innerHTML=pg;
+
+  // Stats
+  const ok=ENTRIES.filter(r=>r.reachable).length, down=ENTRIES.length-ok;
+  document.getElementById('stats').innerHTML=
+    `<span>Total: ${ENTRIES.length}</span><span class="ok">Reachable: ${ok}</span>` +
+    `<span class="down">Unreachable: ${down}</span><span>Showing: ${rows.length} filtered</span>`;
+
+  // Highlight active filters
+  const advBtn=document.getElementById('adv-toggle');
+  if(filterType||filterLang||filterStatus!=='any'){
+    advBtn.classList.add('filter-active');}else{advBtn.classList.remove('filter-active');}
+}
+
+function goPage(n){page=n;render();}
+
+// ---------------------------------------------------------------------------
+// Event listeners
+// ---------------------------------------------------------------------------
+document.getElementById('head').addEventListener('click',e=>{
+  const th=e.target.closest&&e.target.closest('th');if(!th)return;
+  const key=th.dataset.key;if(sortKey===key)sortAsc=!sortAsc;else{sortKey=key;sortAsc=true;}
+  page=1;render();});
+
+document.getElementById('filter').addEventListener('input',e=>{filterText=e.target.value;page=1;render();});
+document.getElementById('show-unreachable').checked=true;
+document.getElementById('show-unreachable').addEventListener('change',e=>{showUnreachable=e.target.checked;page=1;render();});
+
+document.getElementById('pageSize').value=pageSize;
+document.getElementById('pageSize').addEventListener('change',e=>{pageSize=parseInt(e.target.value);page=1;render();});
+
+document.getElementById('filter-type').addEventListener('change',e=>{filterType=e.target.value;page=1;render();});
+document.getElementById('filter-lang').addEventListener('change',e=>{filterLang=e.target.value;page=1;render();});
+document.getElementById('filter-status').addEventListener('change',e=>{filterStatus=e.target.value;page=1;render();});
+
+// Advanced toggle
+document.getElementById('adv-toggle').addEventListener('click',()=>{
+  const p=document.getElementById('adv-panel');p.classList.toggle('open');});
+
+// Reset
+document.getElementById('reset-btn').addEventListener('click',()=>{
+  filterText='';document.getElementById('filter').value='';
+  showUnreachable=true;document.getElementById('show-unreachable').checked=true;
+  pageSize=50;document.getElementById('pageSize').value='50';
+  sortKey='dns_name';sortAsc=false;page=1;
+  filterType='';document.getElementById('filter-type').value='';
+  filterLang='';document.getElementById('filter-lang').value='';
+  filterStatus='any';document.getElementById('filter-status').value='any';
+  render();});
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+document.querySelectorAll('.tab-btn').forEach(btn=>{btn.addEventListener('click',()=>{
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p=>p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById(btn.dataset.tab).classList.add('active');
+  if(btn.dataset.tab==='timeline-body'&&typeof renderTimeline==='function'){renderTimeline();}
+});});
+
+// ---------------------------------------------------------------------------
+// Timeline tab
+// ---------------------------------------------------------------------------
+document.getElementById('tl-filter').addEventListener('input',renderTimeline);
+function renderTimeline(){
+  const q=document.getElementById('tl-filter').value.toLowerCase();
+  let items=TIMELINE;if(q)items=TIMELINE.filter(t=>t.dns_name.toLowerCase().indexOf(q)>-1);
+  document.getElementById('tl-stats').textContent=`${items.length} entries (${new Set(items.map(t=>t.dns_name)).size} unique sites)`;
+  let h='';for(const t of items){
+    const cls=t.reachable?'up':'down';
+    h+=`<div class="tl-point ${cls}">`;
+    h+=`<span class="tl-dns">${esc(t.dns_name)}</span>`;
+    h+=`<span class="tl-meta"> ${t.probed_at_utc} &mdash; `;
+    h+= t.reachable ? `<span style="color:#5f5">REACHED (HTTP ${t.status_code})</span>` : `<span style="color:#f55">UNREACHABLE${t.status_code?` (${t.status_code})`:''}</span>`;
+    h+=`</span></div>`;
+  }
+  document.getElementById('tl-body').innerHTML=h||'<div class="empty">No timeline data available.</div>';
+}
+
+// ---------------------------------------------------------------------------
+// Row click &mdash; expand detail row
+// ---------------------------------------------------------------------------
+document.getElementById('body').addEventListener('click',e=>{
+  const tr=e.target.closest&&e.target.closest('#body tr');if(!tr)return;
+  const existing=tr.nextElementSibling;
+  if(existing&&existing.classList.contains('detail-row')){existing.remove();return;}
+  // Find data
+  const id=tr.dataset.id;const entry=ENTRIES.find(r=>escId(r.dns_name)===id);
+  if(!entry)return;
+  const dl=Array.isArray(entry.found_links)?entry.found_links:[];
+  const fl=Array.isArray(entry.flags)?entry.flags:[];
+  let linksH='';if(dl.length){linksH='<ul>';for(const l of dl)linksH+=`<li>${esc(l)}</li>`;linksH+='</ul>';}
+  let flagsH='';if(fl.length){flagsH='<ul>';for(const f of fl){const val=typeof f==='object'?JSON.stringify(f):String(f);flagsH+=`<li>${esc(val)}</li>`;}flagsH+='</ul>';}
+
+  const det=`<tr class="detail-row"><td colspan="${COLS.length}">
+    <div class="detail-grid">
+      <span class="detail-label">DNS:</span><span>${esc(entry.dns_name)}</span>
+      <span class="detail-label">Title:</span><span>${esc(entry.title||'(none)')}</span>
+      <span class="detail-label">Type:</span><span>${esc(entry.content_type||'unknown')}</span>
+      <span class="detail-label">Reachable:</span><span class="${entry.reachable?'ok':'down'}">${entry.reachable?'YES':'NO'}</span>
+      <span class="detail-label">Last Probed:</span><span>${esc(entry.last_probed_utc||'N/A')}</span>
+      <span class="detail-label">Response Time:</span><span>${hiRT(entry.response_time_sec)}</span>
+      <span class="detail-label">Body Size:</span><span>${hiBytes(entry.body_length)}</span>
+      <span class="detail-label">Bandwidth:</span><span>${esc(String(entry.bandwidth_kbps??'N/A'))}</span>
+      <span class="detail-label">Status Code:</span><span>${entry.status_code||0}</span>
+      <span class="detail-label">Summary:</span><span style="white-space:pre-wrap">${esc(entry.content_summary||'(none)')}</span>
+    </div>
+    ${linksH?`<details open style="margin-top:8px"><summary style="cursor:pointer;color:#5f5;font-size:11px">Discovered Links (${dl.length})</summary>${linksH}</details>`:''}
+    ${flagsH?`<details style="margin-top:8px"><summary style="cursor:pointer;color:#5f5;font-size:11px">Flags (${fl.length})</summary>${flagsH}</details>`:''}
+  </td></tr>`;
+  tr.insertAdjacentHTML('afterend',det);});
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+document.getElementById('header-subtitle').textContent=`${ENTRIES.length} entries &mdash; exported __EXPORT_TS__`;
+document.getElementById('footer').innerHTML=`Exported __EXPORT_TS__&middot; I2P Indexer Address Book`;
+render();
+renderTimeline();
+</script>
+</body>
+</html>

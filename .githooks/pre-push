@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Pre-push hook: warn when tests/smoke_targets.json hasn't been refreshed
+# in 30+ days. Non-blocking — prints a warning but does NOT abort the push.
+#
+# Install by copying or symlinking into .git/hooks/pre-push, or run manually:
+#   bash .githooks/pre-push
+
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HOOK_DIR/.." && pwd)"
+
+TARGETS_FILE="$REPO_ROOT/tests/smoke_targets.json"
+
+if [ ! -f "$TARGETS_FILE" ]; then
+    echo "[pre-push] WARNING: tests/smoke_targets.json not found."
+    exit 0  # non-blocking
+fi
+
+STALE_DAYS=30
+
+LAST_REFRESH=$(python3 -c "import json; print(json.load(open('$TARGETS_FILE')).get('_last_refresh',''))" 2>/dev/null || echo "")
+
+if [ -z "$LAST_REFRESH" ]; then
+    echo "[pre-push] WARNING: tests/smoke_targets.json has no _last_refresh field."
+    exit 0
+fi
+
+REFRESH_EPOCH=$(date -d "$LAST_REFRESH" +%s 2>/dev/null || echo 0)
+NOW_EPOCH=$(date +%s)
+AGE_DAYS=$(( (NOW_EPOCH - REFRESH_EPOCH) / 86400 ))
+
+if [ "$AGE_DAYS" -gt "$STALE_DAYS" ]; then
+    echo "=============================================="
+    echo "[pre-push] WARNING: smoke_targets.json is ${AGE_DAYS} days old (threshold ${STALE_DAYS})."
+    echo "I2P eepsites change without notice. Consider refreshing:"
+    echo "  python scripts/check_smoke_staleness.py --stale-days $STALE_DAYS"
+    echo "=============================================="
+fi
+
+exit 0  # Non-blocking warning only

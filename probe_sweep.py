@@ -88,6 +88,7 @@ logger = logging.getLogger(__name__)
 from src.export_website import (
     generate_address_book_html,
     generate_address_book_txt,
+    generate_index_html,
     generate_address_book_ui,
 )
 
@@ -475,6 +476,9 @@ def main():
                 ui_path = generate_address_book_ui(db_path, output_dir, output_filename=args.ui_filename)
                 ui_size = ui_path.stat().st_size
                 print(f"  UI:   {ui_path} ({ui_size:,} bytes)")
+            idx_path = generate_index_html(output_dir)
+            idx_size = idx_path.stat().st_size
+            print(f"  IDX:  {idx_path} ({idx_size:,} bytes)")
             print("Export complete.")
         except Exception as e:
             print(f"Export failed: {e}")

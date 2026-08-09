@@ -50,16 +50,18 @@ body{font-family:'Courier New',monospace;font-size:12px;color:#e0e0e0;
     border-radius:4px;background:#111;font-size:11px}
 .adv-panel.open{display:block}
 
-/* === Table (fixed-width grid) ============================================= */
-table{width:100%;border-collapse:collapse;table-layout:fixed;word-break:break-all}
-th,td{padding:3px 6px;border:1px solid #222;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}
+/* === Table (auto-layout so text wraps) ==================================== */
+table{width:100%;border-collapse:collapse;table-layout:auto}
+th,td{padding:4px 8px;border:1px solid #222;word-wrap:break-word;text-overflow:ellipsis}
 thead th{position:sticky;top:0;background:#15151a;color:#aaa;cursor:pointer;user-select:none}
 thead th:hover{background:#252530;color:#fff}
 thead .sort-asc::after{content:' &uarr;'>}thead .sort-desc::after{content:' &darr;'>}
-/* Column widths */
-  col.c-status{width:60px;}col.c-type{width:90px;}col.c-site{width:auto;}
-  col.c-title{width:120px;}col.c-rt{width:54px;}col.c-size{width:54px;}
-  col.c-lang{width:46px;}col.c-time{width:150px;}col.c-bw{width:64px;}col.c-links{width:30px;}
+/* Column minimum widths */
+  col.c-status{min-width:48px;}col.c-type{min-width:70px;max-width:160px;}
+  col.c-site{min-width:120px;}col.c-title{min-width:100px;}
+  col.c-summary{min-width:150px;}
+  col.c-rt{min-width:48px;}col.c-size{min-width:48px;}
+  col.c-lang{min-width:42px;}col.c-time{min-width:130px;}col.c-links{min-width:28px;}
 
 tbody tr:nth-child(even){background:#0e0e14}
 tbody tr:hover{background:#1a1a28;cursor:pointer}
@@ -163,8 +165,8 @@ a.no-std{color:inherit;text-decoration:none}.no-std:hover{color:#ccc}
   <table id="grid" role="grid">
     <colgroup>
       <col class="c-status"><col class="c-type"><col class="c-site">
-      <col class="c-title"><col class="c-rt"><col class="c-size">
-      <col class="c-lang"><col class="c-time"><col class="c-bw"><col class="c-links">
+      <col class="c-title"><col class="c-summary"><col class="c-rt">
+      <col class="c-size"><col class="c-lang"><col class="c-time"><col class="c-links">
     </colgroup>
     <thead id="head"></thead><tbody id="body"></tbody>
   </table>
@@ -215,12 +217,12 @@ const COLS=[
   {key:'content_type', label:'Type'},
   {key:'dns_name',     label:'Site'},
   {key:'title',        label:'Title'},
-  {key:'response_time_sec',label:'RT'},
+  {key:'content_summary',label:'Summary'},
+  {key:'response_time_sec',label:'Response Time'},
   {key:'body_length',  label:'Size'},
-  {key:'detected_lang',label:'Lang'},
+  {key:'detected_lang',label:'Language'},
   {key:'last_probed_utc',label:'Last Probed'},
-  {key:'bandwidth_kbps',label:'BW'},
-  {key:'_linkcount',   label:'#L'},
+  {key:'_linkcount',   label:'Links'},
 ];
 
 const hiBytes=v=>{if(!v||v===0)return'';if(v<1024)return v+'B';const k=v/1024;if(k<1024)return k.toFixed(1)+'KB';return(k/1024).toFixed(1)+'MB'};
@@ -299,12 +301,13 @@ function render(){
     b+=`<td>${esc(r.content_type||'')}</td>`;
     b+=`<td style="overflow:visible;white-space:normal">${esc(r.dns_name)}</td>`;
     b+=`<td title="${esc((r.content_summary||'').replace(/"/g,'&quot;'))}">${esc(r.title||'')}</td>`;
+    const summary=esc(r.content_summary||'—');
+    b+=`<td title="${esc((r.content_summary||'').replace(/"/g,'&quot;'))}">${summary}</td>`;
     b+=`<td>${hiRT(r.response_time_sec)}</td>`;
     b+=`<td>${hiBytes(r.body_length)}</td>`;
     const langLabel=r.detected_lang&&r.detected_lang!=='en'?r.detected_lang.toUpperCase():'';
     b+=`<td title="ISO 639-1">${esc(langLabel)}</td>`;
     b+=`<td title="${esc((r.content_summary||'').replace(/"/g,'&quot;'))}">${esc(r.last_probed_utc||'')}</td>`;
-    b+=`<td>${esc(String(r.bandwidth_kbps??''))}</td>`;
     b+=`<td>${r._linkcount}</td>`;
     b+=`</tr>`;
   }
@@ -419,7 +422,6 @@ document.getElementById('body').addEventListener('click',e=>{
       <span class="detail-label">Last Probed:</span><span>${esc(entry.last_probed_utc||'N/A')}</span>
       <span class="detail-label">Response Time:</span><span>${hiRT(entry.response_time_sec)}</span>
       <span class="detail-label">Body Size:</span><span>${hiBytes(entry.body_length)}</span>
-      <span class="detail-label">Bandwidth:</span><span>${esc(String(entry.bandwidth_kbps??'N/A'))}</span>
       <span class="detail-label">Status Code:</span><span>${entry.status_code||0}</span>
       <span class="detail-label">Summary:</span><span style="white-space:pre-wrap">${esc(entry.content_summary||'(none)')}</span>
     </div>

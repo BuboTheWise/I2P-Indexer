@@ -42,7 +42,6 @@ def _transform_row(row: dict[str, Any]) -> dict[str, Any]:
     """Add display-friendly derived fields for the embedded JSON payload."""
     rt = row.get("response_time_sec")
     bl = row.get("body_length")
-    bw = row.get("bandwidth_kbps")
     summary = row.get("content_summary", "") or ""
     found_links_raw = row.get("found_links", "[]")
 
@@ -56,9 +55,7 @@ def _transform_row(row: dict[str, Any]) -> dict[str, Any]:
         "last_probed_utc": row.get("last_probed_utc", "") or "",
         "_rt": _format_response_time(rt),
         "_size": _humanize_bytes(bl) if isinstance(bl, (int, type(None))) else "",
-        "_bw": str(bw) if bw is not None and bw != "" else "",
         "found_links": found_links_raw if found_links_raw else "[]",
-        "needs_review": bool(row.get("needs_review", False)),
     }
 
 
@@ -92,18 +89,19 @@ body{{font-family:'Courier New',monospace;font-size:12px;color:#e0e0e0;
     border:1px solid #444;border-radius:3px;font-size:11px;cursor:pointer}}
 .controls button:hover,.controls select:hover{{border-color:#888}}
 
-/* --- Table (fixed-width grid) ------------------------------------------- */
-table{{width:100%;border-collapse:collapse;table-layout:fixed;word-break:break-all}}
-th,td{{padding:3px 6px;border:1px solid #222;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}}
+/* --- Table (auto-layout so long text wraps) ---------------------------- */
+table{{width:100%;border-collapse:collapse;table-layout:auto}}
+th,td{{padding:4px 8px;border:1px solid #222;word-wrap:break-word;text-overflow:ellipsis}}
 thead th{{position:sticky;top:0;background:#15151a;color:#aaa;cursor:pointer;user-select:none}}
 thead th:hover{{background:#252530;color:#fff}}
 thead .sort-asc::after{{content:' ▲'}} thead .sort-desc::after{{content:' ▼'}}
 
-/* Column widths (fixed, predictable) */
-  col.c-status{{width:64px;}} col.c-type{{width:90px;}}
-  col.c-site{{width:auto;}} col.c-title{{width:120px;}}
-  col.c-rt{{width:64px;}} col.c-size{{width:64px;}} col.c-lang{{width:50px;}}
-  col.c-time{{width:150px;}} col.c-bw{{width:70px;}} col.c-probe{{width:30px;}}
+/* Column minimum widths */
+  col.c-status{{min-width:48px;}}col.c-type{{min-width:70px;max-width:160px;}}
+  col.c-site{{min-width:120px;}}col.c-title{{min-width:100px;}}
+  col.c-summary{{min-width:150px;}}
+  col.c-rt{{min-width:48px;}}col.c-size{{min-width:48px;}}col.c-lang{{min-width:42px;}}
+  col.c-time{{min-width:130px;}}col.c-probe{{min-width:28px;}}
 
 tbody tr:nth-child(even){{background:#0e0e14}}
 tbody tr:hover{{background:#1a1a28}}
@@ -145,13 +143,12 @@ td.unreachable{{color:#666;opacity:.55}}
     <col class="c-type">
     <col class="c-site">
     <col class="c-title">
+    <col class="c-summary">
     <col class="c-rt">
     <col class="c-size">
     <col class="c-lang">
     <col class="c-time">
-    <col class="c-bw">
     <col class="c-probe">
-    <col class="c-review" style="width:60px;">
   </colgroup>
   <thead id="head"></thead>
   <tbody   id="body"></tbody>
@@ -167,17 +164,16 @@ const DATA = {DATA_JSON};
 
 // --- Column definitions --------------------------------------------------
 const COLS = [
-  {{key:'_status',     label:'Status',    width:64}},
-  {{key:'content_type',label:'Type',      width:90}},
-  {{key:'dns_name',    label:'Site',       width:null}},
-  {{key:'title',       label:'Title',     width:120}},
-  {{key:'_rt',         label:'Resp T',    width:64}},
-  {{key:'_size',       label:'Size',      width:64}},
-  {{key:'detected_lang',label:'Lang',    width:50}},
-  {{key:'last_probed_utc',label:'Last Probed',width:150}},
-  {{key:'_bw',         label:'Bandwidth',width:70}},
-  {{key:'_probe',      label:'#L',        width:30}},
-  {{key:'needs_review',label:'Review',    width:60}},
+  {{key:'_status',     label:'Status'}},
+  {{key:'content_type',label:'Type'}},
+  {{key:'dns_name',    label:'Site'}},
+  {{key:'title',       label:'Title'}},
+  {{key:'content_summary',label:'Summary'}},
+  {{key:'_rt',         label:'Response Time'}},
+  {{key:'_size',       label:'Size'}},
+  {{key:'detected_lang',label:'Language'}},
+  {{key:'last_probed_utc',label:'Last Probed'}},
+  {{key:'_probe',      label:'Links'}},
 ];
 
 /* Precomputed display columns (added by Python for small JSON) */
@@ -242,15 +238,15 @@ function render(){{
     b += `<td>${{esc(r.content_type||'')}}</td>`;
     b += `<td style="overflow:visible;white-space:normal">${{esc(r.dns_name)}}</td>`;
     b += `<td title="${{esc((r.content_summary||'').replace(/"/g,'&quot;'))}}">${{esc(r.title||'')}}</td>`;
+    const summary = esc(r.content_summary || '—');
+    b += `<td title="${{esc((r.content_summary||'').replace(/"/g,'&quot;'))}}">${{summary}}</td>`;
     b += `<td>${{esc(r._rt||'')}}</td>`;
     b += `<td>${{esc(r._size||'')}}</td>`;
     const langLabel = r.detected_lang && r.detected_lang !== 'en' ? r.detected_lang.toUpperCase() : '';
     b += `<td title="ISO 639-1">${{esc(langLabel)}}</td>`;
     b += `<td title="${{esc((r.content_summary||'').replace(/"/g,'&quot;'))}}">${{esc(r.last_probed_utc||'')}}</td>`;
-    b += `<td>${{esc(r._bw||'')}}</td>`;
     const linkCount = r.found_links && typeof r.found_links === 'string' ? JSON.parse(r.found_links+'').length : 0;
     b += `<td>${{linkCount}}</td>`;
-    b += `<td title="${{r.needs_review ? 'Needs review' : ''}}">${{r.needs_review ? '⚠' : ''}}</td>`;
     b += `</tr>`;
   }}
   document.getElementById('body').innerHTML = b;

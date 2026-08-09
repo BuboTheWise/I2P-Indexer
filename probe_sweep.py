@@ -439,6 +439,18 @@ def main():
             "'fixed' applies a constant delay per failure."
         ),
     )
+    p.add_argument(
+        "--ollama-url",
+        default=None,
+        dest="ollama_url",
+        metavar="URL",
+        help=(
+            "Ollama API endpoint for local translation of non-English content. "
+            "Example: http://localhost:11434. When set, detected non-English "
+            "summaries are translated to English via the HY-MT2 model. "
+            "(default: off — language detection and tagging only)"
+        ),
+    )
     args = p.parse_args()
 
     # ── Validate crawl args ───────────────────────────────────────
@@ -540,7 +552,7 @@ def main():
 
     results = discover_addresses(
         known_addrs=None,
-        config=I2PConfig(),
+        config=I2PConfig(ollama_url=args.ollama_url),
         db_path=args.db,
         probe_delay=args.delay,
         timeout=effective_timeout,

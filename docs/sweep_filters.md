@@ -158,9 +158,44 @@ Sweep filters work with all existing probe_sweep.py options:
 | `--report PATH` | `python3 probe_sweep.py --sweep-filter reachable_only --report report.md` (probe + generate report) |
 | `--show-book` | `python3 probe_sweep.py --sweep-filter all --show-book` (full sweep + print address book) |
 | `--probe-timeout S` | `python3 probe_sweep.py --sweep-filter reachable_only --probe-timeout 60` (shorter timeout for health checks) |
-| `--crawl-depth N` | `python3 probe_sweep.py --sweep-filter all --crawl-depth 2` (auto-crawl linked sites up to depth 2) |
-| `--max-new-targets N` | `python3 probe_sweep.py --crawl-depth 2 --max-new-targets 25` (limit auto-crawl to 25 new discoveries) |
-| `--dry-run` | See dry run section above |
+|| `--crawl-depth N` | `python3 probe_sweep.py --sweep-filter all --crawl-depth 2` (auto-crawl linked sites up to depth 2) |
+|| `--max-new-targets N` | `python3 probe_sweep.py --crawl-depth 2 --max-new-targets 25` (limit auto-crawl to 25 new discoveries) |
+|| `--ollama-url URL` | `python3 probe_sweep.py --sweep-filter reachable_only --ollama-url http://localhost:11434` (translate non-English summaries) |
+|| `--dry-run` | See dry run section above |
+
+---
+
+## Local Translation with Ollama
+
+When `--ollama-url` is provided, the probe pipeline attempts to translate non-English site summaries to English using a local Ollama instance. This keeps all text processing off-network and privacy-preserving.
+
+```bash
+# Re-scan reachable sites with translation enabled
+python3 probe_sweep.py --sweep-filter reachable_only --ollama-url http://localhost:11434
+```
+
+### How it works
+
+1. **Language detection** runs on every probed site (always-on, no network call)
+2. For non-English content, a translation request is sent to the local Ollama `/api/generate` endpoint
+3. The HY-MT2 1.8B multilingual model handles the translation efficiently (~1GB VRAM)
+4. Translated text is stored with the original preserved as `[original: ...]`
+5. If Ollama is unavailable, times out, or returns an error, the probe falls back to language-tagging-only
+
+### Requirements
+
+- Ollama running locally (`ollama serve`)
+- A multilingual translation model loaded (`RogerBen/HY-MT2-1.8B:latest` recommended)
+- Configure via `I2PConfig(ollama_url="http://localhost:11434")` or `--ollama-url` CLI flag
+
+### Output format
+
+Translated summaries appear as:
+```
+[detected_language: de (German)]
+Community discussion platform [original: Community-Diskussionsplattform]
+Active user base, regular updates [original: Aktive Benutzerbasis, regelmäßige Aktualisierungen]
+```
 
 ---
 

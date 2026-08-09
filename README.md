@@ -54,6 +54,7 @@ All I2P proxy endpoints are managed through `I2PConfig` in `src/config.py`. The 
 | `http_port` | `4444` | HTTP proxy (primary fetch path) |
 | `sam_port` | `9025` | SAM API for controlled tunnel creation |
 | `webconsole_port` | `7657` | Router web console (address book parsing) |
+| `ollama_url` | `None` | Local Ollama endpoint for translation (e.g., `http://localhost:11434`) |
 
 Custom configuration:
 
@@ -211,6 +212,19 @@ python analyzer.py --auto-generate --top 5
 
 This creates a self-healing cycle: sweep finds gaps → analyzer inspects and generates extractors → next sweep covers more ground.
 
+### Local Translation with Ollama
+
+When configured with an Ollama endpoint, non-English site summaries are automatically translated to English during probing. All translation happens locally — no external API calls.
+
+```bash
+# Re-scan reachable sites with local translation
+python3 probe_sweep.py --sweep-filter reachable_only --ollama-url http://localhost:11434
+```
+
+Requires **Ollama** running locally with a multilingual model (`RogerBen/HY-MT2-1.8B:latest` recommended, ~1GB VRAM). Translated summaries include the original text as `[original: ...]` for auditability. Falls back to language-tagging-only when Ollama is unavailable.
+
+See [sweep_filters.md](docs/sweep_filters.md#local-translation-with-ollama) for details.
+
 ### Website / Eepsite Export
 
 Export the address book as static files for hosting on your I2P proxy:
@@ -239,9 +253,10 @@ src/                    ← core library
   addressbook.py        ← AddressBookCatalog: scan netdb, parse .rtr/.ls64
   config.py             ← I2PConfig: proxy endpoints and ports
   i2p_proxy.py          ← ProxyClient + SAM Client + fetch_i2p() helper
-  integration.py        ← probe loop, SQLite store, content classification
-  extractors.py         ← BaseExtractor interface, registry, plugin discovery, orchestrator
-  ext_plugins/          ← auto-discovered extractor modules (gitignored)
+  |  integration.py        ← probe loop, SQLite store, content classification
+  |  extractors.py         ← BaseExtractor interface, registry, plugin discovery, orchestrator
+  |  translation.py        ← Language detection (langid), tagging, and local Ollama translation
+  |  ext_plugins/          ← auto-discovered extractor modules (gitignored)
   export_website.py     ← HTML grid + TXT host-list generators for eepsite export
 analyzer.py             ← feedback-loop CLI: inspects flagged destinations, generates extractors
 tests/                  ← unit + integration tests (100+ cases)

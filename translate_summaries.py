@@ -192,8 +192,7 @@ def _needs_translation(summary: str) -> bool:
     """Check if a summary already has a translation applied."""
     if not summary or len(summary.strip()) < 10:
         return False
-    if "[detected_language:" in summary:
-        return False
+    # Already translated — probe adds [detected_language:], translator adds [original: ..]
     if "[original:" in summary:
         return False
     return True

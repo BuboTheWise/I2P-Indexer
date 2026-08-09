@@ -168,8 +168,12 @@ class TestNeedsTranslation:
         assert _needs_translation("This is German text here long enough") is True
 
     def test_already_tagged_detected_language_false(self):
-        """Presence of [detected_language: means already translated."""
-        assert _needs_translation("[detected_language: de (German)]\nTranslated line") is False
+        """Presence of [detected_language: without [original:] still needs translation."""
+        assert _needs_translation("[detected_language: de (German)]\nSome untranslated text here that is long enough") is True
+
+    def test_detected_language_with_original_is_translated(self):
+        """Full translated entry has both markers — no re-translation needed."""
+        assert _needs_translation("[detected_language: de (German)]\nTranslated [original: original]") is False
 
     def test_already_has_original_marker_false(self):
         """Presence of [original: means already translated."""

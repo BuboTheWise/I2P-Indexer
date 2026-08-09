@@ -441,6 +441,29 @@ def main():
         ),
     )
     p.add_argument(
+        "--i2p-host",
+        default="127.0.0.1",
+        dest="i2p_host",
+        metavar="HOST",
+        help=("I2P router hostname or IP (default: 127.0.0.1)"),
+    )
+    p.add_argument(
+        "--i2p-http-port",
+        type=int,
+        default=4444,
+        dest="i2p_http_port",
+        metavar="PORT",
+        help=("I2P HTTP proxy port (default: 4444)"),
+    )
+    p.add_argument(
+        "--i2p-socks-port",
+        type=int,
+        default=7656,
+        dest="i2p_socks_port",
+        metavar="PORT",
+        help=("I2P SOCKS5 proxy port (default: 7656)"),
+    )
+    p.add_argument(
         "--ollama-url",
         default=None,
         dest="ollama_url",
@@ -556,7 +579,12 @@ def main():
 
     results = discover_addresses(
         known_addrs=None,
-        config=I2PConfig(ollama_url=args.ollama_url),
+        config=I2PConfig(
+            http_host=args.i2p_host,
+            http_port=args.i2p_http_port,
+            socks_port=args.i2p_socks_port,
+            ollama_url=args.ollama_url,
+        ),
         db_path=args.db,
         probe_delay=args.delay,
         timeout=effective_timeout,

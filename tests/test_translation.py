@@ -231,3 +231,45 @@ class TestOllamaTranslation:
         assert "[detected_language: de (German)]" in tagged[0]
         # Original preserved since ollama is unreachable
         assert "Community-Diskussionsplattform" in "\n".join(tagged)
+
+    def test_retry_on_transient_failure(self):
+        """Retries on transient failure before exhausting and setting cooldown."""
+        import json
+        from unittest.mock import patch
+        set_ollama_url("http://localhost:11434")
+        reset_state()
+
+        class FakeResp:
+            def read(self):
+                return json.dumps({"response": "Success"}).encode("utf-8")
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+
+        call_count = 0
+        def flaky_urlopen(*a, **kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise Exception("transient")
+            return FakeResp()
+
+        with patch("urllib.request.urlopen", side_effect=flaky_urlopen):
+            result = translate_to_english("texto", "es", 10.0)
+
+        assert result == "Success"
+        assert call_count == 3
+
+    def test_exhausted_retries_sets_cooldown(self):
+        """After max retries, cooldown flag is set."""
+        from unittest.mock import patch
+        set_ollama_url("http://localhost:11434")
+        reset_state()
+
+        with patch("urllib.request.urlopen", side_effect=Exception("fail")):\
+            result = translate_to_english("test", "de", 10.0)
+
+        assert result is None
+        from src import translation as trans_mod
+        assert trans_mod._ollama_error is True

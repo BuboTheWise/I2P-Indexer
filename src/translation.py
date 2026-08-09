@@ -91,11 +91,13 @@ def detect_language(
 # Public entry point for the extractor pipeline
 # ---------------------------------------------------------------------------
 
-_OLLAMA_URL: Optional[str] = None
+_Ollama_URL: Optional[str] = None
 _OLLAMA_MODEL: str = "RogerBen/HY-MT2-1.8B:latest"
 _ollama_error: bool = False
 _ollama_error_time: float = 0.0
-_OLLAMA_COOLDOWN_S: float = 300  # 5 minutes before retry
+_OLLAMA_COOLDOWN_S: float = 300
+_retry_max_attempts: int = 3
+_retry_base_delay: float = 0.5
 
 
 def set_ollama_url(url: Optional[str]) -> None:
@@ -120,10 +122,9 @@ def translate_to_english(
 ) -> Optional[str]:
     """Translate *text* from *source_lang* to English via local Ollama.
 
-    Returns the translated string on success, or ``None`` if Ollama is
-    unavailable, times out, or returns an error.  Callers should fall
-    back to the original text when ``None`` is returned — translation
-    must never break a probe.
+    Retries up to _retry_max_attempts with exponential backoff on transient
+    failures. Returns the translated string on success, or ``None`` if Ollama
+    is unavailable, times out, or returns an error after all retries.
     """
     global _ollama_error, _ollama_error_time
 
@@ -132,44 +133,56 @@ def translate_to_english(
 
     _try_clear_ollama_error()
     if _ollama_error:
+        logger.debug("Ollama in cooldown — skipping")
         return None
 
     if source_lang == "en":
         return text
 
-    try:
-        import urllib.request
+    import random
 
-        payload = json.dumps({
-            "model": _OLLAMA_MODEL,
-            "prompt": f"Translate the following {source_lang} text to English. Output only the translation, nothing else:\n{text}",
-            "stream": False,
-        }).encode("utf-8")
+    attempt = 0
+    while attempt < _retry_max_attempts:
+        attempt += 1
+        try:
+            import urllib.request
 
-        req = urllib.request.Request(
-            f"{_OLLAMA_URL}/api/generate",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read())
+            payload = json.dumps({
+                "model": _OLLAMA_MODEL,
+                "prompt": f"Translate the following {source_lang} text to English. Output only the translation, nothing else:\n{text}",
+                "stream": False,
+            }).encode("utf-8")
 
-        result = data.get("response", "").strip()
-        if not result:
-            return None
+            req = urllib.request.Request(
+                f"{_OLLAMA_URL}/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read())
 
-        # Sanity: response contains a newline + extra text → likely not a
-        # clean translation. Truncate to first paragraph in that case.
-        if "\n" in result and len(result.split("\n")) > 3:
-            result = result.split("\n")[0].strip()
+            result = data.get("response", "").strip()
+            if not result:
+                continue   # empty response → retry
 
-        return result
+            # Sanity: response contains a newline + extra text → likely not a
+            # clean translation. Truncate to first paragraph in that case.
+            if "\n" in result and len(result.split("\n")) > 3:
+                result = result.split("\n")[0].strip()
 
-    except Exception as exc:
-        logger.debug(f"Ollama translation failed: {exc}")
-        _ollama_error = True
-        _ollama_error_time = time.time()
-        return None
+            return result
+
+        except Exception as exc:
+            logger.debug(f"Ollama translation failed (attempt {attempt}): {exc}")
+            if attempt < _retry_max_attempts:
+                delay = _retry_base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                time.sleep(delay)
+                continue
+
+    # Exhausted retries — set global cooldown
+    _ollama_error = True
+    _ollama_error_time = time.time()
+    return None
 
 
 def process_content_for_language(

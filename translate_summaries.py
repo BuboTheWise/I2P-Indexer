@@ -33,6 +33,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import sqlite3
 import sys
 import time
@@ -64,12 +65,16 @@ _LANG_NAMES = {
 }
 
 # ---------------------------------------------------------------------------
-# Ollama client
+# Ollama client — per-request retry with bounded backoff
 # ---------------------------------------------------------------------------
 
-_ollama_error = False
+_ollama_error = False        # legacy global cooldown flag (kept for compat)
 _ollama_error_time = 0.0
-OLLAMA_COOLDOWN_S = 300  # 5 minutes before retry
+OLLAMA_COOLDOWN_S = 300      # default 5 minutes before retry (overridable via --cooldown)
+
+# Per-request retry config — prevents single timeout from blocking entire batch
+_retry_max_attempts = 3
+_retry_base_delay = 2.0
 
 
 def _try_clear_ollama_error() -> None:
@@ -81,6 +86,7 @@ def _try_clear_ollama_error() -> None:
 def translate_text(text: str, source_lang: str, url: str, timeout: float) -> str | None:
     """Translate *text* from *source_lang* to English via Ollama.
 
+    Retries up to _retry_max_attempts with exponential backoff on transient failures.
     Returns translated string or None on failure.
     """
     global _ollama_error, _ollama_error_time
@@ -96,36 +102,46 @@ def translate_text(text: str, source_lang: str, url: str, timeout: float) -> str
     if source_lang == "en":
         return text
 
-    try:
-        payload = json.dumps({
-            "model": OLLAMA_MODEL,
-            "prompt": f"Translate the following {source_lang} text to English. Output only the translation, nothing else:\n{text}",
-            "stream": False,
-        }).encode("utf-8")
+    attempt = 0
+    while attempt < _retry_max_attempts:
+        attempt += 1
+        try:
+            payload = json.dumps({
+                "model": OLLAMA_MODEL,
+                "prompt": f"Translate the following {source_lang} text to English. Output only the translation, nothing else:\n{text}",
+                "stream": False,
+            }).encode("utf-8")
 
-        req = urllib.request.Request(
-            f"{url}/api/generate",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read())
+            req = urllib.request.Request(
+                f"{url}/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read())
 
-        result = data.get("response", "").strip()
-        if not result:
-            return None
+            result = data.get("response", "").strip()
+            if not result:
+                continue  # empty response counts as transient failure
 
-        # Sanity: multi-paragraph response → truncate to first paragraph
-        if "\n" in result and len(result.split("\n")) > 3:
-            result = result.split("\n")[0].strip()
+            # Sanity: multi-paragraph response → truncate to first paragraph
+            if "\n" in result and len(result.split("\n")) > 3:
+                result = result.split("\n")[0].strip()
 
-        return result
+            return result
 
-    except Exception as exc:
-        logger.debug(f"Ollama translation failed: {exc}")
-        _ollama_error = True
-        _ollama_error_time = time.time()
-        return None
+        except Exception as exc:
+            logger.debug(f"Ollama translation failed (attempt {attempt}): {exc}")
+            if attempt < _retry_max_attempts:
+                delay = _retry_base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                logger.debug(f"Retrying in {delay:.1f}s")
+                time.sleep(delay)
+                continue
+
+    # Exhausted retries
+    _ollama_error = True
+    _ollama_error_time = time.time()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +164,9 @@ def get_pending_translations(db_path: str, lang_filter: str = "", limit: int = 0
     where = "reachable=1 AND detected_lang != '' AND detected_lang != 'en'"
     params: list = []
 
-    # Skip already-translated entries
-    where += " AND content_summary NOT LIKE '%[detected_language:%'"
+    # Skip already-translated entries (translator adds [original: tag)
+    # Do NOT filter [detected_language:] here: probe adds that tag before Ollama runs,
+    # so filtering it would block all untranslated entries from being fetched.
     where += " AND content_summary NOT LIKE '%[original:%'"
 
     if lang_filter:

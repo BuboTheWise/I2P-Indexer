@@ -74,12 +74,19 @@ class TestGetPendingTranslations:
             "VALUES (?, ?, ?, ?, ?, ?)",
             ("dead003" * 4, "en-site.i2p", "en", "English content here", "EN Site", 1),
         )
-        # Already-translated (has [detected_language: tag)
+        # Already-translated (has [detected_language: tag AND [original: marker)
         cur.execute(
             "INSERT INTO discoveries (ident_hash_hex, i2p_dns_name, detected_lang, content_summary, title, reachable) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             ("dead004" * 4, "translated.i2p", "fr",
              "[detected_language: fr (French)]\nTranslated text [original: original]", "FR", 1),
+        )
+        # Has [detected_language: but NO [original: — untranslated, should appear
+        cur.execute(
+            "INSERT INTO discoveries (ident_hash_hex, i2p_dns_name, detected_lang, content_summary, title, reachable) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("dead008" * 4, "detected-but-untranslated.i2p", "de",
+             "[detected_language: de (German)]\nCommunity-Diskussionsplattform ohne Übersetzung", "DE Untranslated", 1),
         )
         # Already-translated (has [original: marker)
         cur.execute(
@@ -109,7 +116,7 @@ class TestGetPendingTranslations:
     def test_pending_returns_only_needing_translation(self):
         """Only reachable non-English untranslated entries returned."""
         results = get_pending_translations(self.db_path)
-        assert len(results) == 2  # German + Russian only
+        assert len(results) == 3  # German + Russian + detected-but-untranslated
         langs = {r["detected_lang"] for r in results}
         assert "de" in langs
         assert "ru" in langs
@@ -126,12 +133,14 @@ class TestGetPendingTranslations:
         assert len(results) == 1
 
     def test_skips_already_translated(self):
-        """Entries with translation markers are excluded."""
+        """Entries with [original: marker are excluded."""
         results = get_pending_translations(self.db_path)
         ids = [r["id"] for r in results]
-        # IDs 4 (detected_language tag) and 5 ([original: tag) should NOT appear
+        # ID 4 (fr, has [original:) and ID 6 (es, has [original:) should NOT appear
+        # ID 5 (de, has [detected_language: but NO [original:) SHOULD appear
         assert 4 not in ids
-        assert 5 not in ids
+        assert 6 not in ids
+        assert 5 in ids
 
     def test_skips_unreachable(self):
         """Unreachable sites are excluded."""
@@ -327,18 +336,59 @@ class TestCooldownBehavior:
     """Test Ollama error cooldown mechanism."""
 
     def test_cooldown_blocks_after_error(self):
-        """After an error, subsequent calls in cooldown return None."""
-        # Trigger error via exception
-        with patch("urllib.request.urlopen", side_effect=Exception("fail")):
+        """After exhausting retries, subsequent calls in cooldown return None."""
+        import translate_summaries as ts
+        # Clear state first
+        ts._ollama_error = False
+        ts._ollama_error_time = 0.0
+
+        with patch("urllib.request.urlopen", side_effect=Exception("fail")):\
             translate_text("test", "de", "http://localhost:11434", 10.0)
 
-        import translate_summaries as ts
         assert ts._ollama_error is True
 
-        # Second call should return None without even trying urllib
-        with patch("urllib.request.urlopen", wraps=translate_text) as mock_url:
-            result = translate_text("test2", "de", "http://localhost:11434", 10.0)
+    def test_retry_on_transient_failure(self):
+        """Translate retries on transient failure before giving up."""
+        import translate_summaries as ts
+
+        # Clear state
+        ts._ollama_error = False
+        ts._ollama_error_time = 0.0
+
+        class FakeResp:
+            def read(self):
+                return json.dumps({"response": "Success"}).encode("utf-8")
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+
+        call_count = 0
+        def flaky_urlopen(*a, **kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise Exception("transient")
+            return FakeResp()
+
+        with patch("urllib.request.urlopen", side_effect=flaky_urlopen):
+            result = translate_text("texto", "es", "http://localhost:11434", 10.0)
+
+        assert result == "Success"
+        assert call_count == 3  # 2 failures + 1 success
+
+    def test_exhausted_retries_returns_none(self):
+        """After max retries exhausted, returns None and sets cooldown."""
+        import translate_summaries as ts
+
+        ts._ollama_error = False
+        ts._ollama_error_time = 0.0
+
+        with patch("urllib.request.urlopen", side_effect=Exception("fail")):\
+            result = translate_text("test", "de", "http://localhost:11434", 10.0)
+
         assert result is None
+        assert ts._ollama_error is True
 
     def test_cooldown_clears_after_timeout(self):
         """After cooldown period elapses, normal operation resumes."""

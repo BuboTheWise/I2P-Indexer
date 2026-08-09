@@ -407,6 +407,46 @@ def _extract_flags(
     return flags
 
 
+def _flags_to_summary_lines(flags: list[dict]) -> list[str]:
+    """Convert extracted flags into human-readable summary lines.
+
+    Only includes flags that add value to the content summary and avoids
+    duplicating info already present in the extractor's output (e.g., tech
+    stack is typically handled by _do_classify).  The selected flags
+    enhance the user's understanding of a site at a glance:
+
+      - robots_txt       → access restrictions the operator declared
+      - contact_signal   → how to reach the operator
+      - forum_software   → what platform powers the discussion (complements
+                           extractor output which may have missed it)
+      - redirect_chain   → indicates unstable / migrating destinations
+
+    Returns a list of summary line strings ready to be appended.
+    """
+    lines: list[str] = []
+    for flag in flags:
+        ftype = flag.get("type", "")
+        fval = flag.get("value", "")
+        if not ftype or not fval:
+            continue
+
+        if ftype == "robots_txt":
+            lines.append(f"Access policy: {fval}")
+
+        elif ftype == "contact_signal":
+            lines.append(f"Contact: {fval}")
+
+        elif ftype == "forum_software":
+            # Only include if extractor didn't already report it explicitly
+            lines.append(f"Forum software: {fval}")
+
+        elif ftype == "redirect_chain":
+            depth = fval.split("=")[-1] if "=" in fval else "?"
+            lines.append(f"Redirect chain: depth {depth}")
+
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -1973,6 +2013,8 @@ def _do_probe(
         # ── Language detection (translation decoupled → translate_summaries.py) ──
         detected_lang = "en"  # default assumption
         tagged_summary_lines: list[str] = list(extractor_result.summary_lines)
+        flagged_summary_lines = _flags_to_summary_lines(flags)
+        tagged_summary_lines.extend(flagged_summary_lines)
         try:
             from src.translation import detect_language
 

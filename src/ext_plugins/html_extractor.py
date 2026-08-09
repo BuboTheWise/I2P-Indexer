@@ -42,7 +42,6 @@ def _extract_i2p_links(body_text: str) -> list[str]:
 
 
 
-
 # ---------------------------------------------------------------------------
 # HtmlExtractor
 # ---------------------------------------------------------------------------
@@ -136,8 +135,15 @@ def _do_classify(
             re.IGNORECASE,
         )
 
-    # --- Bucket detection ---
+    # --- Bucket detection (ordered by specificity) ---
     type_keywords: list[tuple[str, list[str]]] = [
+        # Streaming/media servers — check before generic buckets
+        ("media server", ["icecast", "airtime", "streaming media", "radio stream",
+                          "livestream", "jwplayer", "video.js", "radio broadcast",
+                          "live audio"]),
+        # Social/fediverse instances
+        ("social network", ["pleroma", "mastodon", "akkoma", "misskey", "activitypub",
+                            "fediverse"]),
         ("blog", ["blog", "diary", "journal", "entries"]),
         ("forum", ["forum", "board", "thread", "topic"]),
         ("wiki", ["wiki", "knowledge base", "mediawiki"]),
@@ -150,11 +156,56 @@ def _do_classify(
     ]
     content_type = ""
     for bucket, keywords in type_keywords:
-        if any(kw in lower_title or kw in lower_body for kw in keywords):
+        # Use word-boundary matching to avoid "board" in "dashboard", etc.
+        matched = False
+        for kw in keywords:
+            # Single words get word-boundary checks; multi-word phrases use substring
+            if " " not in kw:
+                if re.search(r'\b' + re.escape(kw) + r'\b', lower_title) or \
+                   re.search(r'\b' + re.escape(kw) + r'\b', lower_body):
+                    matched = True
+                    break
+            else:
+                if kw in lower_title or kw in lower_body:
+                    matched = True
+                    break
+        if matched:
             content_type = bucket
             break
 
-    # --- Tech stack detection ---
+    # --- Fallback classifiers for unidentified sites ---
+    # Heuristics to catch common I2P site types missed by keyword matching
+    linked_sites: list[str] = _extract_i2p_links(body_text[:32768])
+
+    if not content_type:
+        # Account management / auth portals
+        password_re = re.compile(r'type\s*=\s*["\']password["\']', re.IGNORECASE)
+        if any(kw in lower_body for kw in [
+            "account manager", "login portal", "authentication required",
+            "sign in to continue",
+        ]) or password_re.search(body_text[:8192]):
+            content_type = "web application"
+
+        # Dashboard / admin panel
+        if any(kw in lower_body for kw in [
+            "dashboard", "admin panel", "control panel", "management interface",
+            "statistics dashboard", "server status",
+        ]):
+            content_type = "web application"
+
+        # API endpoints returning HTML wrapper
+        if any(kw in lower_body for kw in [
+            "swagger-ui", "redoc", "openapi", "application/json",
+        ]) or re.search(r'content-type.*application/json', lower_body[:8192]):
+            content_type = "api endpoint"
+
+        # Landing page with primarily links/redirect (dense link page)
+        if len(linked_sites) >= 5:
+            body_sentences = len(re.findall(r'[.!?]\s+', words_text[:4096]))
+            if body_sentences < 8:
+                content_type = "landing page"
+
+    # --- Tech stack detection (also used for flag enrichment) ---
     tech_signatures: dict[str, list[str]] = {
         "Node.js": ["npm", "node_modules", "express"],
         "Ruby on Rails": ["csrf-token", "media_types/"],
@@ -177,8 +228,6 @@ def _do_classify(
         if any(re.search(p, lower_body) for p in pats):
             spa_framework = fw
             break
-
-    linked_sites: list[str] = _extract_i2p_links(body_text[:32768])
 
     # --- Build rich summary (as lines list) ---
     lines: list[str] = []
@@ -232,8 +281,26 @@ def _do_classify(
             _add(f"Section: {h.strip()}")
             headings_added += 1
 
+    # --- Media server enrichment ---
+    if content_type == "media server":
+        # Detect stream formats
+        if re.search(r'\.(mp3|ogg|opus|aac|flac)\b', lower_body):
+            _add("Audio streaming detected")
+        if re.search(r'\.(mp4|webm|mkv|avi)\b', lower_body):
+            _add("Video streaming detected")
+        if re.search(r'm3u8|hls\b', lower_body):
+            _add("HLS adaptive streaming")
+        # Icecast/Airtime specific info
+        mount_m = re.findall(r'mount["\']?\s*[:=]\s*["\']?([^"\'>\s]+)', body_text[:16384], re.IGNORECASE)
+        if mount_m:
+            _add(f"Stream mount points: {', '.join(set(mount_m))}")
+        mount_re = re.compile(r'<source[^>]+src=["\']([^"\']+)\.m3u8["\']', re.IGNORECASE)
+        mounts_from_source = mount_re.findall(body_text[:16384])
+        if mounts_from_source:
+            _add(f"Stream sources: {', '.join(set(mounts_from_source))}")
+
     # --- Marketplace enrichment ---
-    if content_type == "marketplace":
+    elif content_type == "marketplace":
         cat_terms = [
             "drugs", "services", "digital goods", "hardware", "software",
             "electronics", "clothing", "food", "health", "documents",

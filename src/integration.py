@@ -1910,6 +1910,11 @@ def _do_probe(
     ``robots_policy`` when set, filters discovered links against Disallow rules
         and adds robots_txt flags for blocked or fully-blocked destinations.
     """
+    # Configure ollama translation if available in config
+    from src.translation import set_ollama_url
+    if config and config.ollama_url:
+        set_ollama_url(config.ollama_url)
+
     start = time.monotonic()
     try:
         resp = fetch_i2p(url, via="http-proxy", timeout=timeout, config=config)
@@ -1969,7 +1974,7 @@ def _do_probe(
         if extractor_result.needs_review:
             flags.append({"type": "needs_review", "value": extractor_result.reason})
 
-        # ── Language detection + tagging (no translation — NFR-07) ────────
+        # ── Language detection + local translation ───────────────────
         detected_lang = "en"  # default assumption
         tagged_summary_lines: list[str] = list(extractor_result.summary_lines)
         try:

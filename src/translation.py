@@ -1,29 +1,22 @@
-"""Language detection, tagging, and offline translation for I2P site content.
+"""Language detection, tagging, and local translation for I2P site content.
 
 Detects the language of extracted title/summary text using ``langid``
 (a lightweight, CPU-only library with no network calls). Non-English
 content is tagged with a ``[detected_language: XX (LanguageName)]``
 preamble so auditors can see provenance.
 
-**Offline translation (NFR-07):** When enabled via ``enable_translation()``,
-summary lines in German, Russian, Chinese, or Japanese are translated to
-English using cached Helsinki-NLP MarianMT models running entirely on CPU.
-HF_HUB_OFFLINE=1 blocks all outbound network calls — models must be
-pre-downloaded to the local cache before offline mode works.
-
-Model locations (auto-discovered from HF_HOME or project-local cache):
-    Helsinki-NLP/opus-mt-de-en   → ~74M params, 0.32s/sentence CPU
-    Helsinki-NLP/opus-mt-ru-en   → ~77M params, 0.27s/sentence CPU
-    Helsinki-NLP/opus-mt-zh-en   → ~78M params, 0.33s/sentence CPU
-    Helsinki-NLP/opus-mt-ja-en   → ~76M params, 0.24s/sentence CPU
-
-Memory footprint: ~1.8GB RSS with all 4 models loaded in memory.
+**Local translation:** When an Ollama endpoint is configured via
+``I2PConfig.ollama_url``, summary lines in non-English languages are
+translated to English using the HY-MT2 multilingual model over the
+Ollama API (localhost by default). Falls back gracefully when Ollama
+is unavailable — probes never fail due to translation errors.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -97,17 +90,87 @@ def detect_language(
 # Public entry point for the extractor pipeline
 # ---------------------------------------------------------------------------
 
+_OLLAMA_URL: Optional[str] = None
+_OLLAMA_MODEL: str = "RogerBen/HY-MT2-1.8B:latest"
+_ollama_error: bool = False
+
+
+def set_ollama_url(url: Optional[str]) -> None:
+    """Configure the Ollama endpoint for local translation."""
+    global _OLLAMA_URL, _ollama_error
+    _OLLAMA_URL = url
+    _ollama_error = False
+
+
+def translate_to_english(
+    text: str,
+    source_lang: str,
+    timeout: float = 30.0,
+) -> Optional[str]:
+    """Translate *text* from *source_lang* to English via local Ollama.
+
+    Returns the translated string on success, or ``None`` if Ollama is
+    unavailable, times out, or returns an error.  Callers should fall
+    back to the original text when ``None`` is returned — translation
+    must never break a probe.
+    """
+    global _ollama_error
+
+    if not _OLLAMA_URL:
+        return None
+
+    if _ollama_error:
+        return None
+
+    if source_lang == "en":
+        return text
+
+    try:
+        import urllib.request
+
+        payload = json.dumps({
+            "model": _OLLAMA_MODEL,
+            "prompt": f"Translate the following {source_lang} text to English. Output only the translation, nothing else:\n{text}",
+            "stream": False,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{_OLLAMA_URL}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+
+        result = data.get("response", "").strip()
+        if not result:
+            return None
+
+        # Sanity: response contains a newline + extra text → likely not a
+        # clean translation. Truncate to first paragraph in that case.
+        if "\n" in result and len(result.split("\n")) > 3:
+            result = result.split("\n")[0].strip()
+
+        return result
+
+    except Exception as exc:
+        logger.debug(f"Ollama translation failed: {exc}")
+        _ollama_error = True
+        return None
+
+
 def process_content_for_language(
     title: str,
     summary_lines: list[str],
     detected_lang: str = "",
     confidence: float = 1.0,
 ) -> tuple[list[str], str]:
-    """Detect language and prepend language tags for non-English content.
+    """Detect language, prepend tags, and translate non-English content.
 
-    Called after extraction but before storing in DB. Does **not** translate
-    — it only detects language and adds a ``[detected_language: XX]`` tag
-    so auditors know the original language.
+    Called after extraction but before storing in DB. When Ollama is
+    configured via ``set_ollama_url()``, summary lines are translated to
+    English with the original preserved as a comment.  Falls back to
+    tagging-only when Ollama is unavailable.
 
     Returns ``(tagged_summary_lines, language_code)``. The returned
     list includes a preamble like ``"[detected_language: de (German)]"``
@@ -140,6 +203,11 @@ def process_content_for_language(
     tagged_lines: list[str] = []
     tagged_lines.append(preamble)
 
+    try:
+        translated = translate_to_english("\n".join(line.strip() for line in summary_lines if line.strip()), lang)
+    except Exception:
+        translated = None
+
     for line in summary_lines:
         stripped = line.strip()
         if not stripped:
@@ -148,8 +216,13 @@ def process_content_for_language(
         if stripped.startswith("http") or len(stripped) < 10:
             tagged_lines.append(stripped)
             continue
-        # Keep the original line as-is — no translation
-        tagged_lines.append(stripped)
+
+        # If we have a translation for the whole block, use it; otherwise keep original
+        if translated:
+            # Store translated text with original in parentheses
+            tagged_lines.append(f"{translated} [original: {stripped}]")
+        else:
+            tagged_lines.append(stripped)
 
     return tagged_lines, lang
 
@@ -160,5 +233,6 @@ def process_content_for_language(
 
 def reset_state() -> None:
     """Reset global state for test isolation."""
-    global _detect_error
+    global _detect_error, _ollama_error
     _detect_error = False
+    _ollama_error = False

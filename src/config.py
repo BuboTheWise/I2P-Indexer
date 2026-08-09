@@ -48,7 +48,7 @@ def _validate_host(host: str) -> str:
 
 @dataclass
 class I2PConfig:
-    """Connection parameters for the local I2P daemon.
+    """Connection parameters for the local I2P daemon and optional services.
     
     All fields are parameterized with sensible defaults pointing to a
     standard I2P router on localhost.  Validation runs at construction
@@ -66,6 +66,7 @@ class I2PConfig:
     sam_port: int = 9025
     webconsole_host: str = "127.0.0.1"
     webconsole_port: int = 7657
+    ollama_url: Optional[str] = None
 
     def __post_init__(self):
         """Validate all host/port pairs after dataclass initialization."""
@@ -104,3 +105,4 @@ class I2PConfig:
 # ✓ 7654 — Webconsole (HTTP API), accessible
 # ✓ 7656 — SOCKS5 proxy, accessible
 # ✗ 9025 — SAM API, not exposed by this daemon instance
+# ✓ 11434 — Ollama API (when available)

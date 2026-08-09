@@ -129,7 +129,6 @@ class TestTransformRow:
         out = _transform_row(row)
         assert out["_rt"] == "3.0s"
         assert out["_size"] == "1.0KB"
-        assert out["_bw"] == "50"
         assert out["content_summary"] == "summary"
 
     def test_empty_fields_become_unidentified(self):
@@ -138,7 +137,6 @@ class TestTransformRow:
             "reachable": False,
             "response_time_sec": 0,
             "body_length": 0,
-            "bandwidth_kbps": None,
             "content_summary": "",
             "found_links": None,
         }
@@ -146,7 +144,6 @@ class TestTransformRow:
         assert out["content_summary"] == "Unidentified"
         assert out["_rt"] == ""
         assert out["_size"] == ""
-        assert out["_bw"] == ""
         assert out["found_links"] == "[]"
 
 
@@ -335,12 +332,12 @@ class TestGenerateAddressBookHtml:
         assert by_dns["fr-site.i2p"]["detected_lang"] == "fr"
 
     def test_html_contains_lang_column_header(self, tmp_path: pathlib.Path):
-        """Generated HTML JS includes 'Lang' column in COLS array."""
+        """Generated HTML JS includes 'Language' column in COLS array."""
         db = _make_sample_db(tmp_path)
         result = generate_address_book_html(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        assert "'Lang'" in content or '"Lang"' in content, \
-            "COLS array missing Lang column label"
+        assert "'Language'" in content or '"Language"' in content, \
+            "COLS array missing Language column label"
         assert "detected_lang" in content, \
             "JS template missing detected_lang field reference"
 

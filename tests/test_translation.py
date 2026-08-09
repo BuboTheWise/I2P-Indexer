@@ -1,13 +1,14 @@
-"""Tests for src/translation.py — language detection and tagging pipeline.
+"""Tests for src/translation.py — language detection, tagging, and local translation.
 
 Covers:
 - Language detection with langid (various languages, confidence)
-- The process_content_for_language integration entry point (detection + tagging only)
-- Graceful fallback when libraries are unavailable
+- The process_content_for_language integration entry point (detection + tagging + translation)
+- Ollama-based translate_to_english (success, timeout, fallback)
+- Graceful fallback when libraries or Ollama are unavailable
 - Detected_lang column in DB schema and migrations
 
-Translation via deep-translator was removed (NFR-07 privacy mandate).
 Non-English content is tagged with language code for identification.
+When Ollama is configured via set_ollama_url(), summaries are translated to English.
 """
 import sys
 import os
@@ -18,6 +19,8 @@ from src.translation import (
     detect_language,
     process_content_for_language,
     reset_state,
+    translate_to_english,
+    set_ollama_url,
 )
 
 
@@ -178,3 +181,53 @@ class TestTaggingFallbacks:
             summary_lines=summary_lines,
         )
         assert any("https://" in line for line in tagged)
+
+
+class TestOllamaTranslation:
+    """Test translate_to_english and set_ollama_url."""
+
+    def setup_method(self):
+        reset_state()
+        set_ollama_url(None)
+
+    def test_translate_returns_none_when_no_url(self):
+        """Without ollama configured, translation returns None."""
+        result = translate_to_english("Hallo Welt", "de")
+        assert result is None
+
+    def test_translate_returns_text_for_english(self):
+        """English content should be returned as-is even with ollama configured."""
+        set_ollama_url("http://localhost:11434")
+        result = translate_to_english("Hello world", "en")
+        assert result == "Hello world"
+
+    def test_translate_returns_none_on_timeout(self):
+        """Translation to unreachable endpoint should return None gracefully."""
+        set_ollama_url("http://127.0.0.1:99999")
+        result = translate_to_english("Hallo Welt", "de", timeout=2.0)
+        assert result is None
+
+    def test_set_ollama_url_clears_error_state(self):
+        """Setting a new URL should reset the error flag."""
+        from src import translation as trans_mod
+        # Trigger an error first
+        set_ollama_url("http://127.0.0.1:99999")
+        translate_to_english("Hallo", "de", timeout=2.0)
+        assert trans_mod._ollama_error is True
+        # New URL resets the flag
+        set_ollama_url("http://localhost:11434")
+        assert trans_mod._ollama_error is False
+
+    def test_translation_integration_with_process_content(self):
+        """Non-English content should fall back gracefully when ollama unavailable."""
+        set_ollama_url("http://127.0.0.1:99999")
+        tagged, lang = process_content_for_language(
+            title="Willkommen",
+            summary_lines=["Community-Diskussionsplattform"],
+            detected_lang="de",
+            confidence=0.9,
+        )
+        assert lang == "de"
+        assert "[detected_language: de (German)]" in tagged[0]
+        # Original preserved since ollama is unreachable
+        assert "Community-Diskussionsplattform" in "\n".join(tagged)

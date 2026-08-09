@@ -67,18 +67,29 @@ fetch_i2p() → Response.text
     │   · can_handle()            ← first match wins
     │   · extract()               → (content_type, summary_lines, found_links)
     │
-    ├─► detect_language(title_text, body_text[:8192])  ← langid (local, no network)
-    │   → (detected_lang, confidence)                   # e.g. ("de", 1.0)
-    │
-    └─► process_content_for_language(                      title=title_text,
-           summary_lines=extractor_result.summary_lines,
-           detected_lang=det_lang)
-           → (tagged_summary_lines, lang_code)            # [detected_language: XX] tag added
+    └─► detect_language(title_text, body_text[:8192])  ← langid (local, no network)
+        → (detected_lang, confidence)                   # e.g. ("de", 1.0)
 
     DiscoveryDB.record_discovery(content_type=..., content_summary=..., detected_lang=...)
+
+### Async translation pass (post-probe, decoupled)
+
+```
+translate_summaries.py --ollama-url http://localhost:11434
+    │
+    ├─► get_pending_translations(db_path)              # reachable + non-EN + untagged
+    │
+    ├─► translate_text(text, source_lang, url)         # Ollama /api/generate (HY-MT2)
+    │
+    └─► build_translation_summary(original, translated, lang)
+        → prepends [detected_language: XX], appends [original: …]
+        → update_summary(db_path, id, new_summary)     # back to discoveries table
 ```
 
-Classification is intentionally **offline and heuristic-only**. No LLM call is made at probe time. Language detection uses `langid` (~1 MB model, CPU-only, zero network traffic). Non-English content is tagged with `[detected_language: XX (LanguageName)]` for auditability. Per NFR-07, no crawled I2P content leaves the host machine — translation to English is disabled pending an offline engine.
+Translation runs as a **separate script** outside the probe sweep loop. This prevents translation failures from blocking probe workers and avoids polluting probe logs with LLM latency. Probe time only does language detection via `langid`.
+```
+
+Classification is intentionally **offline and heuristic-only**. No LLM call is made at probe time. Language detection uses `langid` (~1 MB model, CPU-only, zero network traffic). Non-English content is tagged with `[detected_language: XX (LanguageName)]` for auditability. Translation to English runs as a separate pass via `translate_summaries.py`, which connects to a local Ollama instance — still fully on-device per NFR-07 since no content leaves the host.
 
 ## Design Decisions and Rationale
 
@@ -92,14 +103,14 @@ Classification is intentionally **offline and heuristic-only**. No LLM call is m
 | Separate `routers` / `leasesets` tables | Addressbook data (from `.rtr`/`.ls64` files) describes network topology, not endpoint behavior. Disjoint concerns warrant disjoint stores. |
 || DNS-first dedup in `address_book` view | Humans think in DNS names, not hashes. A site probed via two DNS names appears as two rows (separate entry points); b32-only probes fall back to the b32 address. Pivot to hash-based dedup if alias tracking proves unnecessary. |
 || Local language detection (`langid`) | No network dependency for detection. ~1 MB model, fast inference, reliable on HTML content that survives tag stripping. Confidence thresholds prevent false positives on short/mixed text. |
-|| Translation disabled — privacy-first | Per NFR-07: crawled I2P content must never leave the host over non-I2P channels. Original `deep-translator` (Google Translate) sent data to external servers — an extreme privacy violation for darknet data. Offline translation is future work pending local engine (quantized MarianMT, ONNX backends). |
+|| Translation decoupled from probe sweep (v0.4.5+) | Per NFR-07: crawled I2P content must never leave the host over non-I2P channels. `translate_summaries.py` uses a **local Ollama** endpoint (HY-MT2 model) so all translation stays on-device. Decoupling from probe prevents LLM latency from blocking workers and avoids silent failures in the main loop. |
 || Persistent `detected_lang` column | Structured language metadata enables filtering (e.g., "show all German sites"). Summary text gets `[detected_language: XX (LanguageName)]` prefix for auditability. |
 
 ## Language Detection Pipeline
 
 ### Module: `src/translation.py`
 
-A post-extraction pipeline that detects the language of scraped page content using `langid` and **annotates** non-English summaries with a language tag. No translation occurs — crawled I2P content must never leave the host machine (NFR-07). Runs in `_do_probe()` between content extraction and SQLite persistence.
+A post-extraction pipeline that detects the language of scraped page content using `langid` and **annotates** non-English summaries with a language tag. Runs in `_do_probe()` between content extraction and SQLite persistence. Translation is decoupled into `translate_summaries.py`, which processes tagged discoveries async via local Ollama — keeping probe workers unblocked and NFR-07 compliant.
 
 | Entrypoint | Purpose | Depends On |
 |---|---|---|
@@ -148,19 +159,28 @@ Detection failures never break probing:
 
 | Choice | Reason |
 |---|---|
-| Detection only, no translation | Cloud translation sends I2P content to third parties — privacy violation. Offline translation is future work pending local engine. |
+|| Language detection at probe time, translation async | Detection (`langid`) lives in `_do_probe()` — fast, reliable, no LLM. Translation runs post-sweep via `translate_summaries.py` + local Ollama (HY-MT2). Decoupling prevents blocking workers and keeps probe logs clean. Still fully on-device per NFR-07. |
 | Full body for detection, not just summary | Title + 8KB of raw page text gives `langid` far more signal than summary lines alone — reduces false positives on mixed-language or short extracted summaries. |
 | Language tag in summary text | Humans auditing address_book can immediately see which entries are non-English without querying the DB directly. |
 | 29-language name mapping | Covers most languages likely encountered on I2P. Unknown codes still show ISO code without English name — graceful fallback. |
 | Persistent `detected_lang` column | Enables structured queries (e.g., "show all non-English destinations") without parsing summary text. Supports future features like per-language probe prioritization. |
 | Fallback to English on low confidence | Prevents false positives on short/mixed-language content that `langid` can't reliably classify. Safer than tagging uncertain content as foreign. |
 
-### Future: offline translation (post-MVP)
+### Translation via `translate_summaries.py` (live)
 
-When a fully local translation engine is integrated, it must satisfy NFR-07:
-- Runs entirely on-CPU with zero outbound network traffic
-- No runtime model downloads, update checks, or telemetry
-- Viable candidates: quantized MarianMT via `transformers` library (with updates disabled), ONNX-based sentencepiece models, or bundled dictionary-based systems
+Translation is implemented as a standalone script that connects to a **local Ollama** endpoint, keeping all processing on-device per NFR-07:
+
+```
+python3 translate_summaries.py --ollama-url http://localhost:11434 [--dry-run] [--limit N] [--lang ru]
+```
+
+Key functions:
+- `get_pending_translations()` — queries discoveries with `reachable=1`, non-English `detected_lang`, no translation markers already present
+- `_needs_translation()` — checks summary text for `[detected_language:` / `[original:` patterns (idempotent)
+- `build_translation_summary()` — prepends language tag, appends `[original: ...]` to translated line
+- `translate_text()` — POSTs to Ollama `/api/generate` with HY-MT2 model; 5-minute cooldown on errors
+
+The script is fully decoupled from the probe sweep. It can run independently at any time and safely skips already-translated entries. Per-request timeout defaults to 30s to avoid blocking on slow LLM inference.
 
 ## Configuration
 

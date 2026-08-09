@@ -1977,32 +1977,22 @@ def _do_probe(
         if extractor_result.needs_review:
             flags.append({"type": "needs_review", "value": extractor_result.reason})
 
-        # ── Language detection + local translation ───────────────────
+        # ── Language detection (translation decoupled → translate_summaries.py) ──
         detected_lang = "en"  # default assumption
         tagged_summary_lines: list[str] = list(extractor_result.summary_lines)
         try:
             from src.translation import detect_language
-            from src.translation import process_content_for_language
 
-            # Detect language from title + body sample
             det_lang, conf = detect_language(title_text, body_text)
 
             if det_lang != "en" and conf >= 0.4:
-                # Tag summary lines with detected language (no translation)
-                tagged_summary_lines, detected_lang = process_content_for_language(
-                    title=title_text,
-                    summary_lines=list(extractor_result.summary_lines),
-                    detected_lang=det_lang,
-                    confidence=conf,
-                )
+                detected_lang = det_lang
                 logger.info(
-                    f"  [lang] Detected {det_lang} (conf={conf:.2f}), "
-                    f"tagged summary for {url}"
+                    f"  [lang] Detected {det_lang} (conf={conf:.2f}) for {url}"
                 )
-            else:
-                detected_lang = det_lang if conf >= 0.4 else "en"
+            elif conf >= 0.4:
+                detected_lang = det_lang
         except Exception:
-            # Language detection is best-effort; never fail a probe for it
             logger.debug("Language detection skipped")
             pass
 

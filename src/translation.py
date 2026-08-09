@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -93,13 +94,23 @@ def detect_language(
 _OLLAMA_URL: Optional[str] = None
 _OLLAMA_MODEL: str = "RogerBen/HY-MT2-1.8B:latest"
 _ollama_error: bool = False
+_ollama_error_time: float = 0.0
+_OLLAMA_COOLDOWN_S: float = 300  # 5 minutes before retry
 
 
 def set_ollama_url(url: Optional[str]) -> None:
     """Configure the Ollama endpoint for local translation."""
-    global _OLLAMA_URL, _ollama_error
+    global _OLLAMA_URL, _ollama_error, _ollama_error_time
     _OLLAMA_URL = url
     _ollama_error = False
+    _ollama_error_time = 0.0
+
+
+def _try_clear_ollama_error() -> None:
+    """Clear error latch if cooldown elapsed."""
+    global _ollama_error, _ollama_error_time
+    if _ollama_error and time.time() - _ollama_error_time >= _OLLAMA_COOLDOWN_S:
+        _ollama_error = False
 
 
 def translate_to_english(
@@ -114,11 +125,12 @@ def translate_to_english(
     back to the original text when ``None`` is returned — translation
     must never break a probe.
     """
-    global _ollama_error
+    global _ollama_error, _ollama_error_time
 
     if not _OLLAMA_URL:
         return None
 
+    _try_clear_ollama_error()
     if _ollama_error:
         return None
 
@@ -156,6 +168,7 @@ def translate_to_english(
     except Exception as exc:
         logger.debug(f"Ollama translation failed: {exc}")
         _ollama_error = True
+        _ollama_error_time = time.time()
         return None
 
 
@@ -208,6 +221,7 @@ def process_content_for_language(
     except Exception:
         translated = None
 
+    first_translated = False
     for line in summary_lines:
         stripped = line.strip()
         if not stripped:
@@ -217,10 +231,10 @@ def process_content_for_language(
             tagged_lines.append(stripped)
             continue
 
-        # If we have a translation for the whole block, use it; otherwise keep original
-        if translated:
-            # Store translated text with original in parentheses
+        # Append translation only on the first content line, with original preserved
+        if translated and not first_translated:
             tagged_lines.append(f"{translated} [original: {stripped}]")
+            first_translated = True
         else:
             tagged_lines.append(stripped)
 
@@ -233,6 +247,7 @@ def process_content_for_language(
 
 def reset_state() -> None:
     """Reset global state for test isolation."""
-    global _detect_error, _ollama_error
+    global _detect_error, _ollama_error, _ollama_error_time
     _detect_error = False
     _ollama_error = False
+    _ollama_error_time = 0.0

@@ -158,10 +158,10 @@ Sweep filters work with all existing probe_sweep.py options:
 | `--report PATH` | `python3 probe_sweep.py --sweep-filter reachable_only --report report.md` (probe + generate report) |
 | `--show-book` | `python3 probe_sweep.py --sweep-filter all --show-book` (full sweep + print address book) |
 | `--probe-timeout S` | `python3 probe_sweep.py --sweep-filter reachable_only --probe-timeout 60` (shorter timeout for health checks) |
-|| `--crawl-depth N` | `python3 probe_sweep.py --sweep-filter all --crawl-depth 2` (auto-crawl linked sites up to depth 2) |
-|| `--max-new-targets N` | `python3 probe_sweep.py --crawl-depth 2 --max-new-targets 25` (limit auto-crawl to 25 new discoveries) |
-|| `--ollama-url URL` | `python3 probe_sweep.py --sweep-filter reachable_only --ollama-url http://localhost:11434` (translate non-English summaries) |
-|| `--dry-run` | See dry run section above |
+| `--crawl-depth N` | `python3 probe_sweep.py --sweep-filter all --crawl-depth 2` (auto-crawl linked sites up to depth 2) |
+| `--max-new-targets N` | `python3 probe_sweep.py --crawl-depth 2 --max-new-targets 25` (limit auto-crawl to 25 new discoveries) |
+| `--ollama-url URL` | `python3 probe_sweep.py --sweep-filter reachable_only --ollama-url http://localhost:11434` (translate non-English summaries) |
+| `--dry-run` | See dry run section above |
 
 ---
 

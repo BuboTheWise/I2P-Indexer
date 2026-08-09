@@ -425,6 +425,133 @@ def generate_address_book_txt(db_path: str, output_dir: str) -> pathlib.Path:
     return target.resolve()
 
 
+def generate_index_html(output_dir: str) -> pathlib.Path:
+    """Generate a project landing page with links to all exports and GitHub.
+
+    Writes *index.html* into *output_dir*.
+
+    Returns:
+        Absolute path to the generated ``index.html``.
+    """
+    now_utc = datetime.utcnow()
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>I2P Indexer — Eepsite Discovery &amp; Cataloging</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Courier New',monospace;font-size:14px;color:#e0e0e0;
+    background:#0a0a0f;line-height:1.6;max-width:820px;margin:0 auto;padding:32px 16px}}
+h1{{font-size:24px;color:#fff;margin-bottom:4px;letter-spacing:-0.5px}}
+h2{{font-size:16px;color:#aaa;margin:28px 0 8px;border-bottom:1px solid #222;padding-bottom:4px}}
+h3{{font-size:13px;color:#888;margin:16px 0 6px}}
+p{{margin:8px 0}}
+a{{color:#5b9;text-decoration:none}} a:hover{{color:#7df;text-decoration:underline}}
+code{{background:#14141a;padding:2px 6px;border-radius:3px;font-size:13px;color:#ccc}}
+.hero{{text-align:center;padding:48px 0 32px;border-bottom:1px solid #222;margin-bottom:32px}}
+.hero h1{{font-size:32px;margin-bottom:8px}}
+.hero .subtitle{{color:#888;font-size:15px;max-width:600px;margin:0 auto}}
+.hero .emoji{{font-size:48px;display:block;margin-bottom:16px}}
+.links{{display:grid;gap:12px;margin:16px 0}}
+.link-card{{display:flex;align-items:center;gap:12px;padding:14px 16px;
+    background:#111;border:1px solid #2a2a30;border-radius:6px;text-decoration:none;color:#e0e0e0}}
+.link-card:hover{{border-color:#5b9;background:#151520}}
+.link-card .icon{{font-size:24px;flex-shrink:0;width:36px;text-align:center}}
+.link-card .label{{font-weight:bold;font-size:14px}}
+.link-card .desc{{font-size:12px;color:#888;margin-top:2px}}
+.features{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:16px 0}}
+.feature{{padding:14px;background:#111;border:1px solid #222;border-radius:6px}}
+.feature h3{{margin:0 0 6px;color:#ccc}}
+.feature p{{font-size:13px;color:#888;margin:0}}
+pre{{background:#14141a;padding:12px;border-radius:6px;overflow-x:auto;font-size:13px;margin:8px 0;border:1px solid #222}}
+footer{{text-align:center;margin-top:48px;padding:16px;border-top:1px solid #222;
+    font-size:12px;color:#555}}
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <span class="emoji">🦉</span>
+  <h1>I2P Indexer</h1>
+  <p class="subtitle">Client-side discovery and cataloging of I2P eepsites — probes, classifies, and exports a searchable address book from a local router daemon.</p>
+</div>
+
+<h2>Explore the Data</h2>
+<div class="links">
+  <a class="link-card" href="address_book_ui.html">
+    <span class="icon">🔍</span>
+    <div><div class="label">Interactive Address Book</div><div class="desc">Full interactive browse UI with sortable grid, search, filters, and per-entry detail panels.</div></div>
+  </a>
+
+  <a class="link-card" href="address_book.html">
+    <span class="icon">📇</span>
+    <div><div class="label">Address Book (Compact)</div><div class="desc">Self-contained HTML page with sortable table and embedded JSON — lightweight for slow connections.</div></div>
+  </a>
+
+  <a class="link-card" href="address_book_hosts.txt">
+    <span class="icon">📋</span>
+    <div><div class="label">Hosts Export</div><div class="desc">Plain text <code>dns=*.b32.i2p</code> format matching SUSI DNS export — importable by other I2P tools.</div></div>
+  </a>
+
+  <a class="link-card" href="https://github.com/BuboTheWise/I2P-Indexer">
+    <span class="icon">⚡</span>
+    <div><div class="label">Source on GitHub</div><div class="desc">View the code, report issues, or contribute extractors and sweep configurations.</div></div>
+  </a>
+</div>
+
+<h2>What It Does</h2>
+<div class="features">
+  <div class="feature">
+    <h3>B32-First Probing</h3>
+    <p>Direct <code>*.b32.i2p</code> requests that bypass SU3/SUSI DNS — dramatically faster for dead targets.</p>
+  </div>
+  <div class="feature">
+    <h3>Content Classification</h3>
+    <p>Plugin-based extractors auto-classify sites into forums, blogs, marketplaces, wikis, and more.</p>
+  </div>
+  <div class="feature">
+    <h3>Local Translation</h3>
+    <p>Non-English summaries translated via Ollama (HY-MT2) — no external API calls required.</p>
+  </div>
+  <div class="feature">
+    <h3>Sweep Filters</h3>
+    <p>Probe subsets: reachable-only, needs-review, by content type, or crawl linked sites.</p>
+  </div>
+  <div class="feature">
+    <h3>Persistent SQLite Store</h3>
+    <p>All results survive across runs — query, re-probe, and track address drift over time.</p>
+  </div>
+  <div class="feature">
+    <h3>Eepsite Export</h3>
+    <p>Generate static HTML + text exports for hosting on I2P proxy servers with zero backend dependency.</p>
+  </div>
+</div>
+
+<h2>Quick Start</h2>
+<pre>
+python3 probe_sweep.py export --browse-ui       # generate full interactive UI
+python3 probe_sweep.py --sweep-filter reachable_only --ollama-url http://localhost:11434   # re-scan with translation
+</pre>
+
+<h2>License</h2>
+<p><a href="https://github.com/BuboTheWise/I2P-Indexer/blob/master/LICENSE">MIT</a> — free for discovery, not surveillance.</p>
+
+<footer>
+  Generated by <a href="https://github.com/BuboTheWise/I2P-Indexer">I2P Indexer</a> · Exported {now_utc.strftime('%Y-%m-%d %H:%M UTC')}
+</footer>
+
+</body>
+</html>"""
+
+    out_path = pathlib.Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    target = out_path / "index.html"
+    target.write_text(html, encoding="utf-8")
+    return target.resolve()
+
+
 # ---------------------------------------------------------------------------
 # Enhanced browse UI (tabs, timeline, filters, language detection)
 # ---------------------------------------------------------------------------

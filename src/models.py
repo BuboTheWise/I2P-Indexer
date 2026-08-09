@@ -118,6 +118,7 @@ class DiscoveryResult:
     # needs_review — set True by extractor framework when no extractor matched
     needs_review: bool = False
     reason: str = ''            # reason string for needs_review (e.g. "no_extractor_claimed")
+    detected_lang: str = ''    # ISO 639-1 language code from langid (e.g. 'de', 'ja')
     # Content fingerprinting
     content_hash: str = ''     # SHA-256 of page body (empty when unreachable)
     last_modified: str = ''    # Last-Modified header value, if present

@@ -602,7 +602,6 @@ class TestCrawlCLI:
         result = subprocess.run(
             [sys.executable, "-m", "src.integration", "--help"],
             capture_output=True, text=True,
-            cwd="/home/stefan/Projects/I2P-Indexer/.worktrees/t_cedd150d",
         )
         assert "crawl" in result.stdout.lower()
 
@@ -611,7 +610,6 @@ class TestCrawlCLI:
         result = subprocess.run(
             [sys.executable, "-m", "src.integration", "crawl", "--help"],
             capture_output=True, text=True,
-            cwd="/home/stefan/Projects/I2P-Indexer/.worktrees/t_cedd150d",
         )
         assert "--max-depth" in result.stdout
         assert "--crawl-delay" in result.stdout

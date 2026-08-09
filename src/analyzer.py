@@ -19,11 +19,13 @@ Usage::
 """
 from __future__ import annotations
 
+import sys
+sys.path.insert(0, ".")
+
 import argparse
 import inspect
 import json
 import logging
-import sys
 import tempfile
 import textwrap
 import time

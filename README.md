@@ -45,26 +45,27 @@ Verify the proxy backend:
 
 ### Configuration
 
-All I2P proxy endpoints are managed through `I2PConfig` in `src/config.py`. The defaults match a standard I2P router setup:
+All endpoints default to `localhost` — override only if your router or Ollama runs elsewhere. Parameters are managed through `I2PConfig` in `src/config.py`:
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `host` | `localhost` | Router bind address |
+| `host` | `localhost` | I2P router bind address |
 | `socks_port` | `7656` | SOCKS5 proxy for outbound traffic |
 | `http_port` | `4444` | HTTP proxy (primary fetch path) |
 | `sam_port` | `9025` | SAM API for controlled tunnel creation |
 | `webconsole_port` | `7657` | Router web console (address book parsing) |
-| `ollama_url` | `None` | Local Ollama endpoint for translation (e.g., `http://localhost:11434`) |
+| Ollama URL | `http://localhost:11434` | Local translation endpoint |
 
-Custom configuration:
-
+Override in code when your router or Ollama runs elsewhere:
 ```python
 from src.config import I2PConfig
 
-cfg = I2PConfig(host="my-router", http_port=8080, socks_port=9050)
+cfg = I2PConfig(
+    http_host="otherhost", http_port=8080,
+    socks_port=9050,
+    ollama_url="http://otherhost:11434"
+)
 ```
-
-All probe paths — `fetch_i2p()`, `probe_destination()`, and `discover_addresses()` — accept the config parameter and route traffic through it. No hardcoded proxy strings remain in the codebase.
 
 ## Usage
 
@@ -212,18 +213,29 @@ python analyzer.py --auto-generate --top 5
 
 This creates a self-healing cycle: sweep finds gaps → analyzer inspects and generates extractors → next sweep covers more ground.
 
-### Local Translation with Ollama
+### Language Detection
 
-When configured with an Ollama endpoint, non-English site summaries are automatically translated to English during probing. All translation happens locally — no external API calls.
+Every probe automatically detects the page's language using `langid` (~1 MB CPU model, zero network traffic). Non-English pages get an `[detected_language: XX (LanguageName)]` tag in their summary for auditability. No LLM or proxy call is made at probe time — detection runs locally and synchronously alongside content extraction.
+
+### Local Translation with Ollama (decoupled)
+
+Translation runs as a **separate step** after probing, via `translate_summaries.py`. This prevents translation latency from blocking the sweep worker and lets you target specific languages:
 
 ```bash
-# Re-scan reachable sites with local translation
-python3 probe_sweep.py --sweep-filter reachable_only --ollama-url http://localhost:11434
+# Translate all pending non-English summaries (default Ollama on localhost:11434)
+python3 translate_summaries.py
+
+# Dry-run: see what would be translated without making changes
+python3 translate_summaries.py --dry-run
+
+# Target a specific language only (regional pipelines)
+python3 translate_summaries.py --lang de
+
+# Use a custom Ollama endpoint
+python3 translate_summaries.py --ollama-url http://other-host:11434
 ```
 
-Requires **Ollama** running locally with a multilingual model (`RogerBen/HY-MT2-1.8B:latest` recommended, ~1GB VRAM). Translated summaries include the original text as `[original: ...]` for auditability. Falls back to language-tagging-only when Ollama is unavailable.
-
-See [sweep_filters.md](docs/sweep_filters.md#local-translation-with-ollama) for details.
+Requires **Ollama** running locally with `RogerBen/HY-MT2-1.8B:latest` (~1GB VRAM). Translated summaries preserve original text as `[original: ...]` for auditability. Already-translated entries are skipped (idempotent). All translation stays on-device — no content leaves the host (NFR-07).
 
 ### Website / Eepsite Export
 

@@ -50,6 +50,26 @@ body{font-family:'Courier New',monospace;font-size:12px;color:#e0e0e0;
     border-radius:4px;background:#111;font-size:11px}
 .adv-panel.open{display:block}
 
+/* === Column filter dropdowns (Excel-style) ================================= */
+.col-filter-wrap{position:relative;display:inline-block;width:100%}
+.col-filter-btn{background:none;border:none;color:#555;cursor:pointer;padding:0 2px;font-size:10px;
+    margin-left:4px;vertical-align:middle;opacity:.6}
+.col-filter-btn:hover,.col-filter-btn.open{color:#fff;opacity:1}
+.col-filter-menu{display:none;position:absolute;top:100%;left:0;z-index:100;
+    background:#181820;border:1px solid #555;border-radius:4px;padding:6px 8px;
+    max-height:260px;overflow-y:auto;font-size:11px;color:#ccc;min-width:160px;
+    box-shadow:0 4px 12px rgba(0,0,0,.7)}
+.col-filter-menu.open{display:block}
+.col-filter-menu label{display:flex;align-items:center;gap:5px;padding:2px 0;cursor:pointer;white-space:nowrap}
+.col-filter-menu input[type="checkbox"]{accent-color:#5f5;margin:0}
+.col-filter-menu .cfm-count{color:#666;font-size:10px;margin-left:auto;flex-shrink:0}
+.cfm-actions{display:flex;gap:8px;padding-top:4px;border-top:1px solid #333;margin-top:4px}
+.cfm-actions button{flex:1;padding:2px;background:#222;color:#aaa;border:1px solid #444;
+    border-radius:2px;font-size:10px;cursor:pointer;font-family:inherit}
+.cfm-actions button:hover{border-color:#888;color:#fff}
+.col-filter-badge{display:none;background:#5f5;color:#000;font-size:9px;border-radius:50%;
+    width:14px;height:14px;line-height:14px;text-align:center;margin-left:3px;vertical-align:middle;font-weight:bold}
+
 /* === Table (auto-layout so text wraps) ==================================== */
 table{width:100%;border-collapse:collapse;table-layout:auto}
 th,td{padding:4px 8px;border:1px solid #222;word-wrap:break-word;text-overflow:ellipsis}
@@ -250,19 +270,32 @@ let sortKey='dns_name', sortAsc=false;
 let filterText='';
 let showUnreachable=true;
 let pageSize=50, page=1;
-let filterType='', filterStatus='any', filterLang='';
+// Column filters: Set of allowed values per column key. Undefined = all values pass.
+let colFilters = {};
+
+// Columns eligible for multi-value dropdown filters (low cardinality)
+const FILTERABLE_COLS = new Set(['_status', 'content_type', 'detected_lang']);
+
+// Open menu tracking
+let openFilterMenu = null;
 
 function filteredRows(){
   return ENTRIES.filter(r=>{
     if(!showUnreachable&&!r.reachable)return false;
-    if(filterType&&r.content_type!==filterType)return false;
-    if(filterLang&&r.detected_lang!==filterLang)return false;
-    if(filterStatus==='1'&&!r.reachable)return false;
-    if(filterStatus==='0'&&r.reachable)return false;
+    // Column filters
+    for(const [key, allowed] of Object.entries(colFilters)){
+      let val;
+      if(key==='_status') val = r._status;
+      else val = r[key];
+      if(val===undefined||val===null) val='';
+      if(!allowed.has(String(val))) return false;
+    }
+    // Text search includes detected_lang now
     if(filterText){
       const q=filterText.toLowerCase();
-      const hay=[r.dns_name,r.title,r.content_type,r.content_summary].join(' ').toLowerCase();
-      if(hay.indexOf(q)===-1)return false;
+      const hay=[r.dns_name,r.title,r.content_type,r.content_summary,
+                 r.detected_lang].join(' ').toLowerCase();
+      if(hay.indexOf(q)===-1) return false;
     }
     return true;
   });
@@ -284,10 +317,18 @@ function render(){
   if(page>total)page=total;
   const slice=rows.slice((page-1)*pageSize,page*pageSize);
 
-  // Header
+  // Header — with column filter buttons for eligible columns
   let h=''; for(const c of COLS){
     const cls=sortKey===c.key?(sortAsc?'sort-asc':'sort-desc'):'';
-    h+=`<th class="${cls}" data-key="${c.key}">${esc(c.label)}</th>`;
+    const isFilterable = FILTERABLE_COLS.has(c.key);
+    const hasActiveFilter = colFilters[c.key] && colFilters[c.key].size > 0;
+    const badgeStyle = hasActiveFilter ? 'style="display:inline"' : '';
+    h+=`<th class="${cls}" data-key="${c.key}"><span>${esc(c.label)}</span>`;
+    if(isFilterable){
+      h+=`<button class="col-filter-btn" data-col="${c.key}" title="Filter by ${esc(c.label)}">▼</button>`;
+      h+=`<span class="col-filter-badge" ${badgeStyle}>●</span>`;
+    }
+    h+=`</th>`;
   }
   document.getElementById('head').innerHTML=h;
 
@@ -321,36 +362,29 @@ function render(){
 
   // Stats
   const ok=ENTRIES.filter(r=>r.reachable).length, down=ENTRIES.length-ok;
+  const colFilterCount = Object.keys(colFilters).length;
   document.getElementById('stats').innerHTML=
     `<span>Total: ${ENTRIES.length}</span><span class="ok">Reachable: ${ok}</span>` +
-    `<span class="down">Unreachable: ${down}</span><span>Showing: ${rows.length} filtered</span>`;
+    `<span class="down">Unreachable: ${down}</span><span>Showing: ${rows.length} filtered` +
+    (colFilterCount ? ` (${colFilterCount} col filter${colFilterCount>1?'s':''})` : '') + `</span>`;
 
-  // Highlight active filters
+  // Highlight active filters in header bar too
   const advBtn=document.getElementById('adv-toggle');
-  if(filterType||filterLang||filterStatus!=='any'){
+  if(colFilterCount){
     advBtn.classList.add('filter-active');}else{advBtn.classList.remove('filter-active');}
 }
 
 function goPage(n){page=n;render();}
 
 // ---------------------------------------------------------------------------
-// Event listeners
+// Event listeners (non-head; head is handled below in column-filter section)
 // ---------------------------------------------------------------------------
-document.getElementById('head').addEventListener('click',e=>{
-  const th=e.target.closest&&e.target.closest('th');if(!th)return;
-  const key=th.dataset.key;if(sortKey===key)sortAsc=!sortAsc;else{sortKey=key;sortAsc=true;}
-  page=1;render();});
-
 document.getElementById('filter').addEventListener('input',e=>{filterText=e.target.value;page=1;render();});
 document.getElementById('show-unreachable').checked=true;
 document.getElementById('show-unreachable').addEventListener('change',e=>{showUnreachable=e.target.checked;page=1;render();});
 
 document.getElementById('pageSize').value=pageSize;
 document.getElementById('pageSize').addEventListener('change',e=>{pageSize=parseInt(e.target.value);page=1;render();});
-
-document.getElementById('filter-type').addEventListener('change',e=>{filterType=e.target.value;page=1;render();});
-document.getElementById('filter-lang').addEventListener('change',e=>{filterLang=e.target.value;page=1;render();});
-document.getElementById('filter-status').addEventListener('change',e=>{filterStatus=e.target.value;page=1;render();});
 
 // Advanced toggle
 document.getElementById('adv-toggle').addEventListener('click',()=>{
@@ -362,9 +396,12 @@ document.getElementById('reset-btn').addEventListener('click',()=>{
   showUnreachable=true;document.getElementById('show-unreachable').checked=true;
   pageSize=50;document.getElementById('pageSize').value='50';
   sortKey='dns_name';sortAsc=false;page=1;
-  filterType='';document.getElementById('filter-type').value='';
-  filterLang='';document.getElementById('filter-lang').value='';
-  filterStatus='any';document.getElementById('filter-status').value='any';
+  colFilters={};
+  // Clear advanced dropdowns too (still useable in panel)
+  document.getElementById('filter-type').value='';
+  document.getElementById('filter-lang').value='';
+  document.getElementById('filter-status').value='any';
+  closeAllFilterMenus();
   render();});
 
 // ---------------------------------------------------------------------------
@@ -587,6 +624,141 @@ function renderChart(){
     }
   });
 })();
+
+// ---------------------------------------------------------------------------
+// Column-level Excel-style filters
+// ---------------------------------------------------------------------------
+function closeAllFilterMenus(){
+  document.querySelectorAll('.col-filter-menu').forEach(m=>m.remove());
+  openFilterMenu=null;
+}
+
+// Display name for values in filter menus
+function colDisplayVal(key, val){
+  if(key==='_status') return val;
+  if(val && val!=='en') return val.toUpperCase();
+  return val||'(none)';
+}
+
+// Build and show the dropdown menu for a given column key
+function openColumnFilterMenu(colKey, btnEl){
+  closeAllFilterMenus();
+  const colDef = COLS.find(c=>c.key===colKey);
+  if(!colDef) return;
+
+  // Collect unique values from current dataset (all entries, not just filtered)
+  const valCounts = {};
+  for(const r of ENTRIES){
+    let v;
+    if(colKey==='_status') v = String(r._status);
+    else v = String(r[colKey] ?? '');
+    valCounts[v] = (valCounts[v]||0)+1;
+  }
+  const sortedVals = Object.keys(valCounts).sort((a,b)=>{
+    // Put (none) at end
+    if(!a&&b) return 1; if(a&&!b) return -1;
+    return a.localeCompare(b);
+  });
+
+  // Default: all checked
+  const currentSet = colFilters[colKey];
+  const totalVals = sortedVals.length;
+  let activeVals = new Set(sortedVals);
+  if(currentSet && currentSet.size < totalVals){
+    activeVals = new Set(currentSet);
+  }
+
+  // Build menu DOM
+  const menu = document.createElement('div');
+  menu.className = 'col-filter-menu open';
+
+  // "Select All" checkbox
+  let html = `<label style="font-weight:bold;border-bottom:1px solid #333;padding-bottom:4px;margin-bottom:2px">`;
+  html += `<input type="checkbox" class="cfm-select-all" ${activeVals.size===totalVals?'checked':''}> Select All</label>`;
+
+  for(const v of sortedVals){
+    const label = colDisplayVal(colKey, v);
+    const isChecked = activeVals.has(v)?'checked':'';
+    const count = valCounts[v];
+    html += `<label><input type="checkbox" class="cfm-val" data-val="${v}" ${isChecked}>${esc(label)}<span class="cfm-count">${count}</span></label>`;
+  }
+
+  html += `<div class="cfm-actions">`;
+  html += `<button class="cfm-apply">Apply (${activeVals.size})</button>`;
+  html += `<button class="cfm-clear">Clear Filter</button>`;
+  html += `</div>`;
+  menu.innerHTML = html;
+
+  // Position: right below the button, anchored to TH
+  const th = btnEl.closest('th');
+  if(!th) return;
+  const rect = th.getBoundingClientRect();
+  menu.style.top = (rect.bottom - th.parentElement.getBoundingClientRect().top + 2)+'px';
+  th.appendChild(menu);
+
+  // "Select All" logic
+  const saCb = menu.querySelector('.cfm-select-all');
+  const valCbs = menu.querySelectorAll('.cfm-val');
+  function syncAll(){
+    const allChecked = [...valCbs].every(cb=>cb.checked);
+    saCb.checked = allChecked;
+    // Update apply button count
+    const applyBtn = menu.querySelector('.cfm-apply');
+    if(applyBtn) applyBtn.textContent = `Apply (${[...valCbs].filter(cb=>cb.checked).length})`;
+  }
+  saCb.addEventListener('click', e => {
+    const state = !saCb.checked; // will flip on event
+    valCbs.forEach(cb => cb.checked = saCb.checked);
+    syncAll();
+  });
+  valCbs.forEach(cb => cb.addEventListener('change', syncAll));
+
+  // Apply button
+  menu.querySelector('.cfm-apply').addEventListener('click', () => {
+    const chosen = [...valCbs].filter(cb=>cb.checked).map(cb=>cb.dataset.val);
+    if(chosen.length === totalVals){
+      delete colFilters[colKey];
+    } else {
+      colFilters[colKey] = new Set(chosen);
+    }
+    closeAllFilterMenus();
+    page = 1; render();
+  });
+
+  // Clear filter button
+  menu.querySelector('.cfm-clear').addEventListener('click', () => {
+    delete colFilters[colKey];
+    closeAllFilterMenus();
+    page = 1; render();
+  });
+
+  openFilterMenu = menu;
+}
+
+// Click handler for th elements — delegate to filter buttons or sort
+document.getElementById('head').addEventListener('click', e => {
+  // Check if a filter button was clicked
+  const fbtn = e.target.closest('.col-filter-btn');
+  if(fbtn){
+    e.stopPropagation();
+    const colKey = fbtn.dataset.col;
+    fbtn.classList.toggle('open');
+    openColumnFilterMenu(colKey, fbtn);
+    return;
+  }
+  // Regular sort click (skip badges)
+  if(e.target.closest('.col-filter-badge')) return;
+  const th=e.target.closest&&e.target.closest('th');if(!th)return;
+  const key=th.dataset.key;if(sortKey===key)sortAsc=!sortAsc;else{sortKey=key;sortAsc=true;}
+  page=1;render();closeAllFilterMenus();
+});
+
+// Close menus when clicking outside
+document.addEventListener('click', e => {
+  if(!e.target.closest('.col-filter-menu') && !e.target.closest('.col-filter-btn')){
+    closeAllFilterMenus();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Init

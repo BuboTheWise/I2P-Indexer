@@ -25,8 +25,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any as TypingAny
 
-import socks  # required by SOCKS5 proxy path
-
 from src.addressbook import AddressBookCatalog, _hex_to_b32_addr
 from src.config import I2PConfig
 from src.i2p_proxy import ProxyBackend, fetch_i2p

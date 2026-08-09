@@ -20,7 +20,6 @@ Key capabilities:
 | Python | 3.11+ |
 | httpx | 0.28.x |
 | PySocks | 1.7.x |
-| socksio | 1.0.x |
 | protobuf | ≥5.29.0 |
 | pytest | ≥9.1.1 |
 
@@ -139,7 +138,16 @@ python -m src.integration --sweep 10
 
 # Scan with default (5 target hits)
 python -m src.integration --sweep 5
+
+# Use SOCKS5 proxy instead of HTTP proxy
+python -m src.integration --sweep 10 --proxy socks5
 ```
+
+The `--proxy` flag selects which I2P backend handles the HTTP requests:
+| Flag value | Backend |
+|---|---|
+| `http-proxy` (default) | Connects to the I2P router's **HTTP proxy** (default port 4444). The primary fast path — uses Python's `urllib.request` with a `ProxyHandler`. |
+| `socks5` | Connects through the router's **SOCKS5 proxy** (default port 7656). Requires `PySocks`; monkey-patches `socket.socket` for each request. Useful when HTTP proxy is unavailable but SOCKS5 works. |
 
 Output:
 

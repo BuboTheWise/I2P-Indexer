@@ -91,7 +91,7 @@ All content processing — including language detection, classification, summari
 ## 6. Future Work (Out of Scope for MVP)
 
 - LLM-powered re-classification of `content_summary` fields post-probe (**only using local models — NFR-07**)
-- Local offline translation engine (**strictly on-device** — cloud translation is prohibited by NFR-07; viable options: quantized MarianMT, `transformers` with GGUF/ONNX backends, or bundled dictionary-based systems)
+- **Translation is live via `translate_summaries.py`** — connects to a local Ollama instance (HY-MT2 model), runs as a standalone pass decoupled from probe sweeps. Still fully on-device per NFR-07. Future enhancements could include configurable models and batch parallel translation.
 - Parallel probe execution (current design is sequential for reliability)
 - Automatic destination discovery beyond the known list (crawling new links from fetched pages)
 - Web UI for browsing the SQLite database contents

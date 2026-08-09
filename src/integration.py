@@ -1913,11 +1913,6 @@ def _do_probe(
     ``robots_policy`` when set, filters discovered links against Disallow rules
         and adds robots_txt flags for blocked or fully-blocked destinations.
     """
-    # Configure ollama translation if available in config
-    from src.translation import set_ollama_url
-    if config and config.ollama_url:
-        set_ollama_url(config.ollama_url)
-
     start = time.monotonic()
     try:
         resp = fetch_i2p(url, via="http-proxy", timeout=timeout, config=config)

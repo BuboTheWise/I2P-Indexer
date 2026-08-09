@@ -208,7 +208,7 @@ def build_translation_summary(original_summary: str, translated_line: str, sourc
         <remaining_original_lines...>
     """
     lang_name = _LANG_NAMES.get(source_lang, "")
-    preamble = f"[detected_language: {source_lang}{'(' + lang_name + ')' if lang_name else ''}]"
+    preamble = f"[detected_language: {source_lang}{f' ({lang_name})' if lang_name else ''}]"
 
     lines = original_summary.split("\n")
     content_lines = [l.strip() for l in lines if l.strip()]

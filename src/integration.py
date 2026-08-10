@@ -658,6 +658,7 @@ class DiscoveryDB:
                 ab.found_links,
                 ab.flags,
                 ab.needs_review,
+                ab.deep_analysis,
                 r.bandwidth_kbps,
                 r.caps    AS router_caps,
                 ls.num_leases
@@ -681,6 +682,7 @@ class DiscoveryDB:
                     found_links,
                     flags,
                     needs_review,
+                    deep_analysis,
                     ROW_NUMBER() OVER (
                         PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
                         ORDER BY probed_at DESC
@@ -930,6 +932,25 @@ class DiscoveryDB:
 
                     ELSE ab.dns_name || ' (no content data)'
                 END AS content_summary,
+                /* ── deep analysis site_type (LLM-classified) ── */
+                CASE
+                    WHEN ab.deep_analysis IS NOT NULL
+                         AND LENGTH(COALESCE(ab.deep_analysis, '')) > 50
+                    THEN TRIM(REPLACE(
+                        json_extract(ab.deep_analysis, '$.site_type'), CHAR(10), '· ')
+                    )
+                    ELSE NULL
+                END AS deep_site_type,
+                /* ── deep analysis purpose (LLM-classified) ── */
+                CASE
+                    WHEN ab.deep_analysis IS NOT NULL
+                         AND LENGTH(COALESCE(ab.deep_analysis, '')) > 50
+                    THEN REPLACE(
+                        SUBSTR(json_extract(ab.deep_analysis, '$.purpose'), 1, 200),
+                        CHAR(10), ' · '
+                    )
+                    ELSE NULL
+                END AS deep_purpose,
                 ab.ident_hash_hex,
                 ab.b32_addr,
                 ab.status_code,
@@ -944,6 +965,7 @@ class DiscoveryDB:
                 ab.found_links,
                 ab.flags,
                 ab.needs_review,
+                ab.deep_analysis,
                 r.bandwidth_kbps,
                 r.caps    AS router_caps,
                 ls.num_leases
@@ -967,6 +989,7 @@ class DiscoveryDB:
                     found_links,
                     flags,
                     needs_review,
+                    deep_analysis,
                     ROW_NUMBER() OVER (
                         PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
                         ORDER BY probed_at DESC
@@ -1016,6 +1039,7 @@ class DiscoveryDB:
                 and "needs_review" in view_sql
                 and "currently unreachable" in view_sql
                 and "(originally %s)" in view_sql
+                and "deep_site_type" in view_sql
             )
             if stable:
                 return

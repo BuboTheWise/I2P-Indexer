@@ -79,7 +79,7 @@ thead .sort-asc::after{content:' &uarr;'>}thead .sort-desc::after{content:' &dar
 /* Column minimum widths */
   col.c-status{min-width:48px;}col.c-type{min-width:70px;max-width:160px;}
   col.c-site{min-width:120px;}col.c-title{min-width:100px;}
-  col.c-summary{min-width:150px;}
+  col.c-summary{min-width:150px;}col.c-site-type{min-width:80px;max-width:140px;}
   col.c-rt{min-width:48px;}col.c-size{min-width:48px;}
   col.c-lang{min-width:42px;}col.c-time{min-width:130px;}col.c-links{min-width:28px;}
 
@@ -158,7 +158,7 @@ a.no-std{color:inherit;text-decoration:none}.no-std:hover{color:#ccc}
 <div class="tab-pane active" id="browse-table">
   <!-- Basic controls -->
   <div class="controls">
-    <input type="text" id="filter" placeholder="Search dns / title / type / summary ..." autofocus>
+    <input type="text" id="filter" placeholder="Search dns / title / type / site type / summary ..." autofocus>
     <label style="font-size:11px;display:flex;align-items:center;gap:4px;white-space:nowrap">
       <input type="checkbox" id="show-unreachable"> show down</label>
     <label style="font-size:11px">rows <select id="pageSize">
@@ -185,7 +185,7 @@ a.no-std{color:inherit;text-decoration:none}.no-std:hover{color:#ccc}
   <table id="grid" role="grid">
     <colgroup>
       <col class="c-status"><col class="c-type"><col class="c-site">
-      <col class="c-title"><col class="c-summary"><col class="c-rt">
+      <col class="c-title"><col class="c-summary"><col class="c-site-type"><col class="c-rt">
       <col class="c-size"><col class="c-lang"><col class="c-time"><col class="c-links">
     </colgroup>
     <thead id="head"></thead><tbody id="body"></tbody>
@@ -238,6 +238,7 @@ const COLS=[
   {key:'dns_name',     label:'Site'},
   {key:'title',        label:'Title'},
   {key:'content_summary',label:'Summary'},
+  {key:'deep_site_type',label:'Site Type'},
   {key:'response_time_sec',label:'Response Time'},
   {key:'body_length',  label:'Size'},
   {key:'detected_lang',label:'Language'},
@@ -274,7 +275,7 @@ let pageSize=50, page=1;
 let colFilters = {};
 
 // Columns eligible for multi-value dropdown filters (low cardinality)
-const FILTERABLE_COLS = new Set(['_status', 'content_type', 'detected_lang']);
+const FILTERABLE_COLS = new Set(['_status', 'content_type', 'deep_site_type', 'detected_lang']);
 
 // Open menu tracking
 let openFilterMenu = null;
@@ -293,7 +294,7 @@ function filteredRows(){
     // Text search includes detected_lang now
     if(filterText){
       const q=filterText.toLowerCase();
-      const hay=[r.dns_name,r.title,r.content_type,r.content_summary,
+      const hay=[r.dns_name,r.title,r.content_type,r.deep_site_type,r.content_summary,
                  r.detected_lang].join(' ').toLowerCase();
       if(hay.indexOf(q)===-1) return false;
     }
@@ -344,6 +345,7 @@ function render(){
     b+=`<td title="${esc((r.content_summary||'').replace(/"/g,'&quot;'))}">${esc(r.title||'')}</td>`;
     const summary=esc(r.content_summary||'—');
     b+=`<td title="${esc((r.content_summary||'').replace(/"/g,'&quot;'))}">${summary}</td>`;
+    b+=`<td>${esc(r.deep_site_type||'')}</td>`;
     b+=`<td>${hiRT(r.response_time_sec)}</td>`;
     b+=`<td>${hiBytes(r.body_length)}</td>`;
     const langLabel=r.detected_lang&&r.detected_lang!=='en'?r.detected_lang.toUpperCase():'';
@@ -461,6 +463,8 @@ document.getElementById('body').addEventListener('click',e=>{
       <span class="detail-label">Body Size:</span><span>${hiBytes(entry.body_length)}</span>
       <span class="detail-label">Status Code:</span><span>${entry.status_code||0}</span>
       <span class="detail-label">Summary:</span><span style="white-space:pre-wrap">${esc(entry.content_summary||'(none)')}</span>
+      <span class="detail-label">Site Type:</span><span>${esc(entry.deep_site_type||'(not analyzed)')}</span>
+      <span class="detail-label">Purpose:</span><span style="white-space:pre-wrap">${esc((entry.deep_purpose||'(not analyzed)').substring(0,300))}</span>
     </div>
     ${linksH?`<details open style="margin-top:8px"><summary style="cursor:pointer;color:#5f5;font-size:11px">Discovered Links (${dl.length})</summary>${linksH}</details>`:''}
     ${flagsH?`<details style="margin-top:8px"><summary style="cursor:pointer;color:#5f5;font-size:11px">Flags (${fl.length})</summary>${flagsH}</details>`:''}

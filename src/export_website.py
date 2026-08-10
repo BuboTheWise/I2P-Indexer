@@ -50,6 +50,7 @@ def _transform_row(row: dict[str, Any]) -> dict[str, Any]:
         "title": row.get("title", "") or "",
         "content_type": row.get("content_type", "") or "",
         "content_summary": (summary if summary else "Unidentified").replace("\n", " "),
+        "deep_site_type": row.get("deep_site_type", "") or "",
         "detected_lang": row.get("detected_lang", "") or "",
         "reachable": bool(row.get("reachable", False)),
         "last_probed_utc": row.get("last_probed_utc", "") or "",
@@ -99,7 +100,7 @@ thead .sort-asc::after{{content:' ▲'}} thead .sort-desc::after{{content:' ▼'
 /* Column minimum widths */
   col.c-status{{min-width:48px;}}col.c-type{{min-width:70px;max-width:160px;}}
   col.c-site{{min-width:120px;}}col.c-title{{min-width:100px;}}
-  col.c-summary{{min-width:150px;}}
+  col.c-summary{{min-width:150px;}}col.c-site-type{{min-width:80px;max-width:140px;}}
   col.c-rt{{min-width:48px;}}col.c-size{{min-width:48px;}}col.c-lang{{min-width:42px;}}
   col.c-time{{min-width:130px;}}col.c-probe{{min-width:28px;}}
 
@@ -144,6 +145,7 @@ td.unreachable{{color:#666;opacity:.55}}
     <col class="c-site">
     <col class="c-title">
     <col class="c-summary">
+    <col class="c-site-type">
     <col class="c-rt">
     <col class="c-size">
     <col class="c-lang">
@@ -169,7 +171,8 @@ const COLS = [
   {{key:'dns_name',    label:'Site'}},
   {{key:'title',       label:'Title'}},
   {{key:'content_summary',label:'Summary'}},
-  {{key:'_rt',         label:'Response Time'}},
+  {{key:'deep_site_type',label:'Site Type'}},
+  {{key:'_rt',          label:'Response Time'}},
   {{key:'_size',       label:'Size'}},
   {{key:'detected_lang',label:'Language'}},
   {{key:'last_probed_utc',label:'Last Probed'}},
@@ -194,7 +197,7 @@ function visibleRow(){{
     if(!showUnreachable && !r.reachable) return false;
     if(filterText){{
       const q = filterText.toLowerCase();
-      const haystack = [r.dns_name,r.title,r.content_type,r.content_summary]
+      const haystack = [r.dns_name,r.title,r.content_type,r.deep_site_type,r.content_summary]
                        .join(' ').toLowerCase();
       if(haystack.indexOf(q) === -1) return false;
     }}
@@ -239,7 +242,8 @@ function render(){{
     b += `<td style="overflow:visible;white-space:normal">${{esc(r.dns_name)}}</td>`;
     b += `<td title="${{esc((r.content_summary||'').replace(/"/g,'&quot;'))}}">${{esc(r.title||'')}}</td>`;
     const summary = esc(r.content_summary || '—');
-    b += `<td title="${{esc((r.content_summary||'').replace(/"/g,'&quot;'))}}">${{summary}}</td>`;
+    b += `<td title="${{esc((r.content_summary||'').replace(/"/g,'&quot;'))}}">`+`${{summary}}</td>`;
+    b += `<td>${{esc(r.deep_site_type||'')}}</td>`;
     b += `<td>${{esc(r._rt||'')}}</td>`;
     b += `<td>${{esc(r._size||'')}}</td>`;
     const langLabel = r.detected_lang && r.detected_lang !== 'en' ? r.detected_lang.toUpperCase() : '';
@@ -606,6 +610,8 @@ def _query_entries(db_path: str) -> list[dict]:
                 "title": r.get("title", "") or "",
                 "content_type": r.get("content_type", "") or "",
                 "content_summary": (r.get("content_summary") or "").replace("\n", " "),
+                "deep_site_type": r.get("deep_site_type", "") or "",
+                "deep_purpose": (r.get("deep_purpose", "") or "").replace("\n", " "),
                 "reachable": bool(r.get("reachable", False)),
                 "last_probed_utc": r.get("last_probed_utc", "") or "",
                 "response_time_sec": r.get("response_time_sec") or 0,

@@ -742,6 +742,20 @@ class DiscoveryDB:
             self._conn.commit()
             logger.info("Added detected_lang column to discoveries table")
 
+        if "deep_analysis" not in col_info:
+            cur.execute(
+                "ALTER TABLE discoveries ADD COLUMN deep_analysis TEXT DEFAULT ''"
+            )
+            self._conn.commit()
+            logger.info("Added deep_analysis column to discoveries table")
+
+        if "body_html" not in col_info:
+            cur.execute(
+                "ALTER TABLE discoveries ADD COLUMN body_html TEXT DEFAULT ''"
+            )
+            self._conn.commit()
+            logger.info("Added body_html column to discoveries table")
+
         # Ensure unique constraint for upsert-based dedup (ident_hash_hex + probe_mode).
         # Existing databases will have duplicate rows from repeated sweeps, so we need
         # to collapse them before adding the unique index. The strategy:
@@ -833,6 +847,11 @@ class DiscoveryDB:
         if "provenance_chain" not in existing_cols:
             cur.execute(
                 "ALTER TABLE targets ADD COLUMN provenance_chain TEXT DEFAULT ''"
+            )
+        # Deep analysis tracking — timestamp of last LLM analysis pass
+        if "last_analyzed_at" not in existing_cols:
+            cur.execute(
+                "ALTER TABLE targets ADD COLUMN last_analyzed_at REAL DEFAULT 0"
             )
         self._conn.commit()
 

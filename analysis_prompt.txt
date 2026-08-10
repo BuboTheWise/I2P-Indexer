@@ -1,0 +1,11 @@
+Answer in JSON with three keys: site_type, purpose, sections.
+
+site_type: Classify this website into one category: forum, wiki, blog, file_archive, marketplace, news, mail_server, chat_room, search_engine, tracker, tool, database, mirror, other.
+
+purpose: In one sentence, describe what this website does or provides. Keep it brief and factual.
+
+sections: List up to 3 key headings or distinct sections visible on the page. Return as an array of strings.
+
+The body text below is the HTML content of a website crawled from I2P:
+
+{{BODY}}

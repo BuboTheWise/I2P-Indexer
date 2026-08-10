@@ -28,6 +28,7 @@ Stores the result of each probe attempt. One row per fetch — retries over time
 | `flags` | TEXT | Yes | `'[]'` | Free-form JSON array for arbitrary analysis notes (robots.txt quirks, tech stack fingerprints, contact signals) |
 | `deep_analysis` | TEXT | Yes | `''` | JSON text from LLM deep analysis pass (site type, purpose, sections). Empty when not yet analyzed. Written by `src/deep_analysis.py`. Prompt loaded from `analysis_prompt.txt` on disk — editable without modifying Python source. |
 | `error_msg` | TEXT | Yes | `''` | Error description on failure |
+| `body_html` | TEXT | Yes | `''` | Cached HTML body for LLM deep analysis pipelines. Populated during probe or fetched on-demand via `src/deep_analysis.py` proxy client. |
 | `probed_at` | REAL | Yes | `strftime('%s','now')` | Unix timestamp of probe |
 
 ### Flags JSON structure (WIP — heuristics coming in v2)

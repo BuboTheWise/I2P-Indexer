@@ -236,14 +236,14 @@ python3 -m src.deep_analysis --mode reachable
 # Prioritize sites that haven't been analyzed (or oldest first)
 python3 -m src.deep_analysis --mode stale
 
-# Analyze a specific site by identity hash
-python3 -m src.deep_analysis --hash A3B2C1D0E5F4...
+# Never-analyzed mode: only sites that have never been analyzed
+python3 -m src.deep_analysis --mode never_analyzed
+
+# Override Ollama endpoint and model
+python3 -m src.deep_analysis --ollama-url http://192.168.1.50:11434 --ollama-model qwen3:8b
 
 # Limit to 20 sites per run
 python3 -m src.deep_analysis --mode reachable --limit 20
-
-# Use a custom model (default is HY-MT2)
-python3 -m src.deep_analysis --ollama-model qwen3:8b
 ```
 
 Default model is `RogerBen/HY-MT2-1.8B:latest` (same as translation). Override via `--ollama-model` CLI flag or `OLLAMA_MODEL` environment variable for future migration to larger models. Analysis timestamp tracked per target (`last_analyzed_at`) enables stale-detection: sites probed 30+ days ago can be re-analyzed.

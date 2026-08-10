@@ -13,6 +13,9 @@ megabytes of raw HTML in SQLite.
 """
 from __future__ import annotations
 
+import sys
+sys.path.insert(0, ".")  # Allow 'src.*' imports when run
+
 import argparse
 import json
 import logging

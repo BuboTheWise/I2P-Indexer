@@ -320,7 +320,7 @@ class {classname}(BaseExtractor):
         hits = 0
 {fingerprint_checks}
 
-        return hits >= 2
+        return hits >= 1
 
     def extract(
         self,
@@ -687,11 +687,10 @@ def _suggest_fingerprint_fixes(
     suggestions: List[str] = []
     body_lower = sample_body.lower()
 
-    # Check if the threshold is too high
-    if "hits >= 2" in code or "hits >=3" in code:
+    # Check if the threshold is too high (legacy check for old extractors)
+    if "hits >=3" in code:
         suggestions.append(
-            "Lower the hit threshold from 'hits >= 2' to 'hits >= 1' — "
-            "the sample may only trigger one fingerprint pattern"
+            "Lower the hit threshold from 'hits >= 3' to 'hits >= 1'"
         )
 
     # Check if Content-Type header was available but not used

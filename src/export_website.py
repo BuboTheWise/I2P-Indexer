@@ -627,6 +627,10 @@ def _query_entries(db_path: str) -> list[dict]:
                 "detected_lang": detected_lang,
                 "found_links": (r.get("found_links") or "[]"),
                 "flags": flags_val,
+                "interest_score": r.get("interest_score"),
+                "interest_reasons": (r.get("interest_reasons", "") or ""),
+                "content_depth": r.get("content_depth") or 0.0,
+                "stability_index": r.get("stability_index") or 0.0,
             })
 
         return entries

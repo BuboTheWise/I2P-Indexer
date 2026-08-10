@@ -1,5 +1,5 @@
 You are analyzing a website crawled from I2P. Respond in JSON with these keys:
-site_type, purpose, sections, details.
+site_type, purpose, sections, details, interest_score, interest_reasons.
 
 site_type: Choose ONE: forum, wiki, blog, file_archive, marketplace, news, mail_server, chat_room, search_engine, tracker, tool, database, mirror, service_directory, other.
 
@@ -13,10 +13,22 @@ details: Array of short factual observations (max 4). Only include facts that ar
 - Technical details visible on page: download links, API references, hosting info, language/locale indicators
 - Currency symbols, pricing, or payment methods if present
 
+interest_score: Integer 1-10. Rate how worth-exploring this site is based on originality and substance.
+Criteria:
+  - 9-10: Active community with original content, unique tools/software, significant cultural value, substantial depth
+  - 7-8: Substantial original content with clear purpose — not just mirroring clearnet
+  - 5-6: Standard forum/blog/wiki with some unique elements but mostly generic
+  - 3-4: Thin content, likely a mirror, wrapper, or re-host of clearnet material
+  - 1-2: Stub, error page, under construction, minimal landing page
+
+interest_reasons: Array of 2-3 short phrases explaining the score. Be specific.
+Examples: ["active community forum with discussion", "software download site", "clearnet content mirror", "stub/under construction"]
+
 RULES:
 1. If the page has less than ~300 characters of visible text, set details to ["Very minimal content — appears to be a stub, landing page, or under construction"].
 2. Do NOT invent features, sections, or services that are not mentioned in the text.
 3. A numerical string like "Build 196746f" is a version hash, not currency.
 4. Be conservative — it is better to say "content too sparse to determine" than to guess.
+5. Score honestly. Most I2P sites are mirrors/stubs. Don't inflate just because the site is on I2P.
 
 Content:{{BODY}}

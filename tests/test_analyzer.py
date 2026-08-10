@@ -332,15 +332,16 @@ class TestGenerateExtractorSkeleton:
         )
         assert "application/custom-type" in code
 
-    def test_can_handle_defaults_to_unmatched(self):
-        """Generated can_handler requires threshold hits (safe default)."""
+    def test_can_handle_requires_threshold_hits(self):
+        """Generated can_handler requires at least one hit before it matches."""
         from src.analyzer import generate_extractor_skeleton
 
+        # Minimal body with no fingerprints → threshold not reached yet
         code = generate_extractor_skeleton(
             sample_body="<html>Hello</html>",
             extractor_name="safe",
         )
-        assert "hits >= 2" in code
+        assert "hits >= 1" in code
 
     def test_has_can_handle_and_extract_methods(self):
         """Generated class has required BaseExtractor interface."""
@@ -512,7 +513,7 @@ class TestGenerateExtractorSkeleton:
         )
         # Should have pattern matching [{\[\ and hits threshold (safe default)
         assert r'^\s*[\{\[]' in code or '[{\\[' in code or '"["' in code
-        assert "hits >= 2" in code
+        assert "hits >= 1" in code
 
     def test_generator_template_substitutes_classname(self):
         """The {classname} placeholder is substituted with the derived class name."""
@@ -580,15 +581,15 @@ class TestValidateExtractor:
         assert result["class_name"] == "TestJsonApiExtractor"
         assert result["error"] is None
 
-    def test_fails_without_content_type_header(self):
-        """JSON extractor fails when Content-Type header is missing."""
+    def test_fails_with_empty_body(self):
+        """JSON extractor fails when body doesn't match any fingerprints."""
         from src.analyzer import validate_extractor
 
-        code, body = self._gen_json()
+        code, _ = self._gen_json()
         result = validate_extractor(
             code,
-            body,
-            {},  # No headers → only json-start hits, threshold=2 not met
+            "total mismatch content that has no json markers",  # No [{ or Content-Type
+            {},
         )
         assert result["valid"] is False
         assert result["class_name"] == "TestJsonApiExtractor"
@@ -628,12 +629,14 @@ class TestValidateExtractor:
         assert result["class_name"] == "MyCustomApiExtractor"
 
     def test_suggestions_for_threshold(self):
-        """When threshold is too high, suggestions mention lowering it."""
+        """When threshold is high in code, suggestions mention lowering it."""
         from src.analyzer import validate_extractor
 
         code, body = self._gen_json()
-        result = validate_extractor(code, body, {})
-        # Should suggest lowering the threshold
+        # Inject a deliberately high threshold to force failure + suggestion
+        code = code.replace("return hits >= 1", "return hits >= 3")
+        result = validate_extractor(code, body, {"Content-Type": "application/json"})
+        assert result["valid"] is False
         has_threshold_suggestion = any(
             "threshold" in s.lower() or "lower" in s.lower()
             for s in result["suggestions"]

@@ -664,6 +664,10 @@ class DiscoveryDB:
                 ab.found_links,
                 ab.flags,
                 ab.needs_review,
+                CASE WHEN ab.deep_analysis IS NOT NULL AND LENGTH(COALESCE(ab.deep_analysis,'')) > 50 THEN CAST(REPLACE(json_extract(ab.deep_analysis, '$.interest_score'), 'null', '') AS INTEGER) ELSE NULL END AS interest_score,
+                CASE WHEN ab.deep_analysis IS NOT NULL AND LENGTH(COALESCE(ab.deep_analysis,'')) > 50 THEN json_extract(ab.deep_analysis, '$.interest_reasons') ELSE NULL END AS interest_reasons,
+                CAST(ROUND(CASE WHEN COALESCE(ab.found_links, '[]') = '[]' OR ab.body_length IS NULL OR ab.body_length <= 0 THEN 0.0 ELSE ((1 + (LENGTH(ab.found_links) - LENGTH(replace(ab.found_links, ',', ''))) / 2) * LOG(1 + MAX(ab.body_length, 1) / 1000.0)) END, 2) AS REAL) AS content_depth,
+                CAST(ROUND(CASE WHEN ab.response_time_sec IS NULL OR ab.response_time_sec <= 0 THEN 0.0 ELSE COALESCE(r.bandwidth_kbps, 0) * COALESCE(ls.num_leases, 0) / (ab.response_time_sec + 1.0) END, 2) AS REAL) AS stability_index,
                 ab.deep_analysis,
                 r.bandwidth_kbps,
                 r.caps    AS router_caps,
@@ -982,6 +986,10 @@ class DiscoveryDB:
                 ab.found_links,
                 ab.flags,
                 ab.needs_review,
+                CASE WHEN ab.deep_analysis IS NOT NULL AND LENGTH(COALESCE(ab.deep_analysis,'')) > 50 THEN CAST(REPLACE(json_extract(ab.deep_analysis, '$.interest_score'), 'null', '') AS INTEGER) ELSE NULL END AS interest_score,
+                CASE WHEN ab.deep_analysis IS NOT NULL AND LENGTH(COALESCE(ab.deep_analysis,'')) > 50 THEN json_extract(ab.deep_analysis, '$.interest_reasons') ELSE NULL END AS interest_reasons,
+                CAST(ROUND(CASE WHEN COALESCE(ab.found_links, '[]') = '[]' OR ab.body_length IS NULL OR ab.body_length <= 0 THEN 0.0 ELSE ((1 + (LENGTH(ab.found_links) - LENGTH(replace(ab.found_links, ',', ''))) / 2) * LOG(1 + MAX(ab.body_length, 1) / 1000.0)) END, 2) AS REAL) AS content_depth,
+                CAST(ROUND(CASE WHEN ab.response_time_sec IS NULL OR ab.response_time_sec <= 0 THEN 0.0 ELSE COALESCE(r.bandwidth_kbps, 0) * COALESCE(ls.num_leases, 0) / (ab.response_time_sec + 1.0) END, 2) AS REAL) AS stability_index,
                 ab.deep_analysis,
                 r.bandwidth_kbps,
                 r.caps    AS router_caps,
@@ -1063,6 +1071,7 @@ class DiscoveryDB:
             stable = (
                 "flags" in view_sql
                 and "needs_review" in view_sql
+                and "interest_score" in view_sql
                 and "currently unreachable" in view_sql
                 and "(originally %s)" in view_sql
                 and "deep_site_type" in view_sql

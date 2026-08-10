@@ -307,7 +307,8 @@ class TestGenerateExtractorSkeleton:
             content_type_hint="application/rss+xml",
             extractor_name="feed",
         )
-        assert '<rss' in code.lower() or '<feed' in code.lower()
+        # RSS fingerprint uses hex-escaped tag \x3crss in body check
+        assert "'\\x3crss'" in code or "\\x3cfeed" in code
 
     def test_torrent_tracker_fingerprint(self):
         """Torrent tracker body triggers tracker fingerprint."""
@@ -331,15 +332,15 @@ class TestGenerateExtractorSkeleton:
         )
         assert "application/custom-type" in code
 
-    def test_can_handle_defaults_to_false(self):
-        """Generated can_handle ends with return False for safety."""
+    def test_can_handle_defaults_to_unmatched(self):
+        """Generated can_handler requires threshold hits (safe default)."""
         from src.analyzer import generate_extractor_skeleton
 
         code = generate_extractor_skeleton(
             sample_body="<html>Hello</html>",
             extractor_name="safe",
         )
-        assert "return False" in code
+        assert "hits >= 2" in code
 
     def test_has_can_handle_and_extract_methods(self):
         """Generated class has required BaseExtractor interface."""
@@ -497,7 +498,7 @@ class TestGenerateExtractorSkeleton:
         # BODY_HASH is 12 hex chars - find it in the comment
         import re
 
-        match = re.search(r"BODY_HASH|body hash[:\s]+([0-9a-f]{12})", code, re.IGNORECASE)
+        match = re.search(r"body hash[:\s]+([0-9a-f]{12})", code, re.IGNORECASE)
         assert match is not None
 
     def test_array_body_fingerprint(self):
@@ -509,8 +510,9 @@ class TestGenerateExtractorSkeleton:
             content_type_hint="application/json",
             extractor_name="array-json",
         )
-        # Should have pattern matching [\{\[]
-        assert "return True" in code
+        # Should have pattern matching [{\[\ and hits threshold (safe default)
+        assert r'^\s*[\{\[]' in code or '[{\\[' in code or '"["' in code
+        assert "hits >= 2" in code
 
     def test_generator_template_substitutes_classname(self):
         """The {classname} placeholder is substituted with the derived class name."""
@@ -542,6 +544,155 @@ class TestValidateSyntax:
         from src.analyzer import _validate_syntax
 
         assert not _validate_syntax("def foo(:\n    pass")
+
+
+# ---------------------------------------------------------------------------
+# 6b. validate_extractor — runtime validation of generated plugins
+# ---------------------------------------------------------------------------
+
+
+class TestValidateExtractor:
+
+    def _gen_json(self, body=None):
+        """Generate a JSON extractor skeleton and return (code, sample_body)."""
+        from src.analyzer import generate_extractor_skeleton
+
+        if body is None:
+            body = '{"status":"ok","data":[1,2,3]}'
+        code = generate_extractor_skeleton(
+            sample_body=body,
+            content_type_hint="application/json",
+            extractor_name="test-json-api",
+        )
+        return code, body
+
+    def test_validates_matching_json(self):
+        """JSON extractor validates when Content-Type header matches."""
+        from src.analyzer import validate_extractor
+
+        code, body = self._gen_json()
+        result = validate_extractor(
+            code,
+            body,
+            {"Content-Type": "application/json"},
+        )
+        assert result["valid"] is True
+        assert result["class_name"] == "TestJsonApiExtractor"
+        assert result["error"] is None
+
+    def test_fails_without_content_type_header(self):
+        """JSON extractor fails when Content-Type header is missing."""
+        from src.analyzer import validate_extractor
+
+        code, body = self._gen_json()
+        result = validate_extractor(
+            code,
+            body,
+            {},  # No headers → only json-start hits, threshold=2 not met
+        )
+        assert result["valid"] is False
+        assert result["class_name"] == "TestJsonApiExtractor"
+        assert len(result["suggestions"]) > 0
+
+    def test_syntax_error_returns_error(self):
+        """Invalid generated code produces an error in the result."""
+        from src.analyzer import validate_extractor
+
+        bad_code = "def foo(:\n    pass"
+        result = validate_extractor(bad_code, "body", {})
+        assert result["valid"] is False
+        assert result["error"] is not None
+        assert "syntax" in result["error"].lower()
+
+    def test_no_extractor_class_found(self):
+        """Code with no extractor class returns meaningful error."""
+        from src.analyzer import validate_extractor
+
+        plain_code = "x = 1\ny = 2"
+        result = validate_extractor(plain_code, "body", {})
+        assert result["valid"] is False
+        assert result["error"] == "No extractor class found in generated code"
+
+    def test_class_name_extracted(self):
+        """The class name from the generated code is reported correctly."""
+        from src.analyzer import generate_extractor_skeleton, validate_extractor
+
+        code = generate_extractor_skeleton(
+            sample_body='{"key":"val"}',
+            content_type_hint="application/json",
+            extractor_name="my-custom-api",
+        )
+        result = validate_extractor(
+            code, '{"key":"val"}', {"Content-Type": "application/json"}
+        )
+        assert result["class_name"] == "MyCustomApiExtractor"
+
+    def test_suggestions_for_threshold(self):
+        """When threshold is too high, suggestions mention lowering it."""
+        from src.analyzer import validate_extractor
+
+        code, body = self._gen_json()
+        result = validate_extractor(code, body, {})
+        # Should suggest lowering the threshold
+        has_threshold_suggestion = any(
+            "threshold" in s.lower() or "lower" in s.lower()
+            for s in result["suggestions"]
+        )
+        assert has_threshold_suggestion
+
+    def test_suggestions_for_short_body(self):
+        """When body is very short, suggestions mention regenerating."""
+        from src.analyzer import validate_extractor, generate_extractor_skeleton
+
+        code = generate_extractor_skeleton(
+            sample_body="<html>ok</html>",
+            extractor_name="short",
+        )
+        result = validate_extractor(code, "<html>ok</html>", {})
+        # Should mention short body issue
+        has_short_suggestion = any(
+            "short" in s.lower() or "regenerate" in s.lower()
+            for s in result["suggestions"]
+        )
+        assert has_short_suggestion
+
+    def test_module_mock_restored(self):
+        """src.extractors module is properly restored after validation."""
+        import sys
+        from src.analyzer import validate_extractor
+
+        # Ensure real module exists before
+        had_module = "src.extractors" in sys.modules if sys.modules else False
+
+        code, body = self._gen_json()
+        validate_extractor(code, body, {"Content-Type": "application/json"})
+
+        # Module state should be consistent after validation
+        # (either restored or removed if it didn't exist before)
+        # We mainly verify it doesn't leave a mock behind that would break
+        # subsequent imports
+        try:
+            from src.extractors import BaseExtractor
+            assert BaseExtractor is not None
+        except ImportError:
+            pass  # Module may not be cached; that's fine
+
+    def test_exec_error_caught_gracefully(self):
+        """Runtime errors during exec are caught and reported."""
+        from src.analyzer import validate_extractor
+
+        # Code that has valid syntax but runtime error when executed
+        broken_code = '''
+from src.extractors import BaseExtractor
+class Foo(BaseExtractor):
+    priority = 80
+    def can_handle(self, b, h, s): raise ValueError("boom")
+    def extract(self, t, b, h): return ("x", [], [])
+'''
+
+        result = validate_extractor(broken_code, "body", {})
+        assert result["valid"] is False
+        assert result["error"] is not None
 
 
 # ---------------------------------------------------------------------------

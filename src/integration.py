@@ -1237,6 +1237,41 @@ class DiscoveryDB:
         cur.execute(sql, params)
         return [(r[0], r[1]) for r in cur.fetchall()]
 
+    def get_flagged_destinations_with_hints(self, limit: int | None = None) -> list[dict[str, str]]:
+        """Return flagged destinations with content_type hints from the last probe.
+
+        Extends get_flagged_destinations() by including content_type and title
+        from the most recent discovery record.  The content_type bucket serves as
+        a hint for extractor naming and fingerprint detection during skeleton
+        generation.
+
+        Args:
+            limit: Optional maximum number of destinations to return.
+
+        Returns:
+            List of dicts with keys: hash_hex, dns_name, b32_addr, content_type,
+            title (all strings, empty string when not available).
+        """
+        cur = self._conn.cursor()
+        if limit is not None and limit < 0:
+            raise ValueError(f"limit must be non-negative, got {limit}")
+        sql = "SELECT ident_hash_hex, dns_name, b32_addr, content_type, title FROM address_book WHERE needs_review = 1"
+        params: list[int | str] = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        cur.execute(sql, params)
+        results = []
+        for row in cur.fetchall():
+            results.append({
+                "hash_hex": row[0],
+                "dns_name": row[1] or "",
+                "b32_addr": row[2] or "",
+                "content_type": row[3] or "",
+                "title": row[4] or "",
+            })
+        return results
+
     def clear_needs_review(self, ident_hash_hex: str) -> int:
         """Clear needs_review flag on the most recent discovery for a destination.
 

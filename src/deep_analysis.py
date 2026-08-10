@@ -97,38 +97,33 @@ def strip_html(html_text: str) -> str:
 # Body fetching via I2P proxy (re-fetch at analysis time)
 # ---------------------------------------------------------------------------
 
-def get_i2p_proxy_config(db_path: str) -> Optional[tuple]:
-    """Get I2P proxy host and port from DB config.
+def get_i2p_proxy_config(db_path: str) -> tuple:
+    """Get I2P proxy host and port.
 
-    Returns (host, port) tuple or None if not configured.
+    Returns (host, port) tuple using I2PConfig defaults (localhost:4444).
+    Falls back to DB i2p_config table if it exists.
     """
-    import urllib.request
+    from src.config import I2PConfig
 
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
+    # Try DB first
     try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
         cur.execute("SELECT value FROM i2p_config WHERE key = 'proxy_host'")
         row = cur.fetchone()
-        if not row:
-            return None
-        proxy_host = row[0]
-
-        cur.execute("SELECT value FROM i2p_config WHERE key = 'proxy_port'")
-        row = cur.fetchone()
-        if not row:
-            return None
-        try:
-            proxy_port = int(row[0])
-        except (ValueError, TypeError) as e:
-            logger.debug(f"Invalid proxy_port value in config: {row[0]!r} ({e})")
-            return None
-
-        return (proxy_host, proxy_port)
-    except Exception as e:
-        logger.debug(f"Failed to get proxy config: {e}")
-        return None
-    finally:
+        if row:
+            cur.execute("SELECT value FROM i2p_config WHERE key = 'proxy_port'")
+            port_row = cur.fetchone()
+            if port_row:
+                conn.close()
+                return (row[0], int(port_row[0]))
         conn.close()
+    except Exception:
+        pass
+
+    # Fall back to I2PConfig defaults
+    cfg = I2PConfig()
+    return cfg.http
 
 
 def fetch_body_via_proxy(
@@ -137,23 +132,11 @@ def fetch_body_via_proxy(
     b32_addr: str,
     dns_name: str,
 ) -> Optional[str]:
-    """Fetch the full HTML body of a reachable site via the I2P proxy.
+    """Fetch the body of one I2P destination via the proxy client."""
+    from src.i2p_proxy import fetch_i2p
 
-    Returns raw HTML on success, None on failure after retries.
-    """
-    import urllib.request
-
-    # Build proxy URI (SOCKS5 HTTP proxy)
-    proxy_url = f"socks5h://{host}:{port}"
-    proxy_handler = urllib.request.ProxyHandler({
-        "http": proxy_url,
-        "https": proxy_url,
-    })
-    opener = urllib.request.build_opener(proxy_handler)
-
-    # Try DNS name first if available, fall back to b32
     urls_to_try = []
-    if dns_name and dns_name != b32_addr:
+    if dns_name:
         urls_to_try.append(f"http://{dns_name}")
     if b32_addr and len(b32_addr) >= 10:
         urls_to_try.append(f"http://{b32_addr}")
@@ -163,24 +146,16 @@ def fetch_body_via_proxy(
         while attempt < _retry_max_attempts:
             attempt += 1
             try:
-                req = urllib.request.Request(url, timeout=_I2P_FETCH_TIMEOUT)
-                with opener.open(req) as resp:
-                    raw = resp.read()
-                    # Try UTF-8 first, fall back to latin-1
-                    try:
-                        return raw.decode("utf-8")
-                    except UnicodeDecodeError:
-                        return raw.decode("latin-1")
-            except (URLError, socket.timeout) as exc:
-                logger.debug(f"Fetch attempt {attempt} failed for {url}: {exc}")
-                if attempt < _retry_max_attempts:
-                    delay = _retry_base_delay * (2 ** (attempt - 1))
-                    time.sleep(delay)
+                res = fetch_i2p(url, timeout=_I2P_FETCH_TIMEOUT)
+                if res.status == 200:
+                    return res.text
             except Exception as exc:
-                # Catch-all for SSLError, TypeError, etc. — log and break
-                logger.debug(f"Fetch error for {url}: {exc}")
-                break
-
+                logger.debug(f"Fetch attempt {attempt}: {exc}")
+                if attempt < _retry_max_attempts:
+                    time.sleep(_retry_base_delay * (2 ** (attempt - 1)))
+            else:
+                return None
+        break
     return None
 
 
@@ -334,18 +309,21 @@ def update_analysis(
     probe_mode: str,
     analysis_json: str,
 ) -> None:
-    """Store deep analysis result in the discoveries table via UPSERT."""
+    """Store deep analysis result in the discoveries table via UPDATE.
+
+    Updates any qualifying discovery row for this destination (all probe modes).
+    """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
     try:
         query = """
-            INSERT INTO discoveries (ident_hash_hex, probe_mode, deep_analysis)
-            VALUES (?, ?, ?)
-            ON CONFLICT(ident_hash_hex, probe_mode)
-            DO UPDATE SET deep_analysis = excluded.deep_analysis
+            UPDATE discoveries
+            SET deep_analysis = ?
+            WHERE ident_hash_hex = ?
+              AND (deep_analysis IS NULL OR LENGTH(deep_analysis) = 0)
         """
-        cur.execute(query, (ident_hash_hex, probe_mode, analysis_json))
+        cur.execute(query, (analysis_json, ident_hash_hex))
 
         # Update last_analyzed_at on targets for tracking
         if ident_hash_hex and len(ident_hash_hex) >= 10:
@@ -421,10 +399,10 @@ def main() -> None:
         logger.error(f"Prompt file not found: {args.prompt}")
         sys.exit(1)
 
-    # Get I2P proxy config
+    # Get I2P proxy config (always available via I2PConfig defaults)
     proxy_cfg = get_i2p_proxy_config(db_path)
-    if not proxy_cfg:
-        logger.warning("No I2P proxy configured in DB — body fetch will fail")
+    host, port = proxy_cfg
+    logger.info(f"Using I2P proxy: {host}:{port}")
 
     # Get pending analyses
     try:
@@ -444,11 +422,8 @@ def main() -> None:
     for row in pending:
         ident_hash, b32_addr, dns_name = row
 
-        # Fetch body via proxy if configured
-        body_html = None
-        if proxy_cfg:
-            host, port = proxy_cfg
-            body_html = fetch_body_via_proxy(host, port, b32_addr, dns_name)
+        # Fetch body via proxy
+        body_html = fetch_body_via_proxy(host, port, b32_addr, dns_name)
 
         if not body_html or len(body_html) < 100:
             logger.debug(f"Skipping {ident_hash[:8]}... — no/insufficient body")

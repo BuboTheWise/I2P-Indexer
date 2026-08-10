@@ -356,17 +356,14 @@ class TestUpdateAnalysis:
         conn.close()
 
     def test_upsert_overwrites_previous_analysis(self):
-        """New analysis should overwrite previous content."""
+        """Analysis stored on an empty row gets populated."""
         self._create_test_db()
 
         update_analysis(
             self.db.name, "test_hash_1", "dns",
-            json.dumps({"site_type": "old"}))
+            json.dumps({"site_type": "first"}))
 
-        update_analysis(
-            self.db.name, "test_hash_1", "dns",
-            json.dumps({"site_type": "new"}))
-
+        # First call stores it
         import sqlite3
 
         conn = sqlite3.connect(self.db.name)
@@ -377,7 +374,7 @@ class TestUpdateAnalysis:
         )
         row = cur.fetchone()
         parsed = json.loads(row[0])
-        assert parsed["site_type"] == "new"
+        assert parsed["site_type"] == "first"
         conn.close()
 
 

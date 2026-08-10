@@ -43,18 +43,24 @@ class TestHTMLStripping:
     def test_strip_script_tags(self):
         html = "<script>alert('xss')</script><p>Real content</p>"
         result = strip_html(html)
-        assert "alert" in result  # stripper keeps data from script
+        assert "alert" not in result  # script content is skipped
+        assert "Real content" in result
+
+    def test_strip_style_tags(self):
+        html = "<style>.x{color:red}</style><p>Real content</p>"
+        result = strip_html(html)
+        assert "color" not in result  # style content is skipped
         assert "Real content" in result
 
     def test_strip_unicode(self):
         html = "<p>Héllo Wörld — 你好</p>"
         assert strip_html(html) == "Héllo Wörld — 你好"
 
-    def test_strip_limits_to_4096_chars(self):
+    def test_strip_limits_to_8192_chars(self):
         long_text = "A " * 3000  # ~12000 chars after join
         html = f"<p>{long_text}</p>"
         result = strip_html(html)
-        assert len(result) <= 4096
+        assert len(result) <= 8192
 
     def test_strip_short_content(self):
         short = "<p>Hi</p>"

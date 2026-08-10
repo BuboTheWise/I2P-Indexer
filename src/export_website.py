@@ -611,6 +611,7 @@ def _query_entries(db_path: str) -> list[dict]:
 
             entries.append({
                 "dns_name": r.get("dns_name", "") or "",
+                "b32_addr": r.get("b32_addr", "") or "",
                 "title": r.get("title", "") or "",
                 "content_type": r.get("content_type", "") or "",
                 "content_summary": (r.get("content_summary") or "").replace("\n", " "),

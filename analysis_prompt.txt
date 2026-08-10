@@ -1,11 +1,22 @@
-Answer in JSON with three keys: site_type, purpose, sections.
+You are analyzing a website crawled from I2P. Respond in JSON with these keys:
+site_type, purpose, sections, details.
 
-site_type: Classify this website into one category: forum, wiki, blog, file_archive, marketplace, news, mail_server, chat_room, search_engine, tracker, tool, database, mirror, other.
+site_type: Choose ONE: forum, wiki, blog, file_archive, marketplace, news, mail_server, chat_room, search_engine, tracker, tool, database, mirror, service_directory, other.
 
-purpose: In one sentence, describe what this website does or provides. Keep it brief and factual.
+purpose: One sentence — what does this site do or provide?
 
-sections: List up to 3 key headings or distinct sections visible on the page. Return as an array of strings.
+sections: Array of up to 5 visible section headings or menu items from the page. Use exactly what appears on the page, not inferred categories.
 
-The body text below is the HTML content of a website crawled from I2P:
+details: Array of short factual observations (max 4). Only include facts that are directly supported by text in the HTML body:
+- Specific software, product, or service names mentioned
+- Names of people, organizations, or handles identified as authors/maintainers  
+- Technical details visible on page: download links, API references, hosting info, language/locale indicators
+- Currency symbols, pricing, or payment methods if present
 
-{{BODY}}
+RULES:
+1. If the page has less than ~300 characters of visible text, set details to ["Very minimal content — appears to be a stub, landing page, or under construction"].
+2. Do NOT invent features, sections, or services that are not mentioned in the text.
+3. A numerical string like "Build 196746f" is a version hash, not currency.
+4. Be conservative — it is better to say "content too sparse to determine" than to guess.
+
+Content:{{BODY}}

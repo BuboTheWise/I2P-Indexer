@@ -59,8 +59,19 @@ class _HTMLStripper(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self._pieces: list[str] = []
+        self._skip: bool = False
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in ("style", "script", "noscript"):
+            self._skip = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("style", "script", "noscript"):
+            self._skip = False
 
     def handle_data(self, data: str) -> None:
+        if self._skip:
+            return
         cleaned = " ".join(data.split())
         if cleaned:
             self._pieces.append(cleaned)
@@ -90,7 +101,7 @@ def strip_html(html_text: str) -> str:
     """Remove HTML tags, keep visible text."""
     stripper = _HTMLStripper()
     stripper.feed(html_text)
-    return stripper.text()[:4096]  # Keep prompt tokens manageable
+    return stripper.text()[:8192]  # Sufficient context without blowing token budget
 
 
 # ---------------------------------------------------------------------------

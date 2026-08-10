@@ -172,6 +172,8 @@ const COLS = [
   {{key:'title',       label:'Title'}},
   {{key:'content_summary',label:'Summary'}},
   {{key:'deep_site_type',label:'Site Type'}},
+  {{key:'deep_purpose',   label:'Purpose'}},
+  {{key:'deep_analyzed_at',label:'Analysed'}},
   {{key:'_rt',          label:'Response Time'}},
   {{key:'_size',       label:'Size'}},
   {{key:'detected_lang',label:'Language'}},
@@ -197,7 +199,7 @@ function visibleRow(){{
     if(!showUnreachable && !r.reachable) return false;
     if(filterText){{
       const q = filterText.toLowerCase();
-      const haystack = [r.dns_name,r.title,r.content_type,r.deep_site_type,r.content_summary]
+      const haystack = [r.dns_name,r.title,r.content_type,r.deep_site_type,r.deep_purpose,r.content_summary]
                        .join(' ').toLowerCase();
       if(haystack.indexOf(q) === -1) return false;
     }}
@@ -244,6 +246,8 @@ function render(){{
     const summary = esc(r.content_summary || '—');
     b += `<td title="${{esc((r.content_summary||'').replace(/"/g,'&quot;'))}}">`+`${{summary}}</td>`;
     b += `<td>${{esc(r.deep_site_type||'')}}</td>`;
+    b += `<td title="${{esc((r.deep_purpose||'').replace(/"/g,'&quot;')))}}">${{esc((r.deep_purpose||'').substring(0,150))}}</td>`;
+    b += `<td>${{esc(r.deep_analyzed_at||'')}}</td>`;
     b += `<td>${{esc(r._rt||'')}}</td>`;
     b += `<td>${{esc(r._size||'')}}</td>`;
     const langLabel = r.detected_lang && r.detected_lang !== 'en' ? r.detected_lang.toUpperCase() : '';
@@ -612,6 +616,8 @@ def _query_entries(db_path: str) -> list[dict]:
                 "content_summary": (r.get("content_summary") or "").replace("\n", " "),
                 "deep_site_type": r.get("deep_site_type", "") or "",
                 "deep_purpose": (r.get("deep_purpose", "") or "").replace("\n", " "),
+                "deep_analyzed_at": r.get("deep_analyzed_at", "") or "",
+                "deep_analysis_json": r.get("deep_analysis", ""),
                 "reachable": bool(r.get("reachable", False)),
                 "last_probed_utc": r.get("last_probed_utc", "") or "",
                 "response_time_sec": r.get("response_time_sec") or 0,

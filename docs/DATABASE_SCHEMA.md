@@ -26,6 +26,7 @@ Stores the result of each probe attempt. One row per fetch — retries over time
 | `last_modified` | TEXT | Yes | `''` | HTTP `Last-Modified` header value (if present) |
 | `found_links` | TEXT | Yes | `'[]'` | JSON array of `.i2p` hostnames found in page content |
 | `flags` | TEXT | Yes | `'[]'` | Free-form JSON array for arbitrary analysis notes (robots.txt quirks, tech stack fingerprints, contact signals) |
+| `deep_analysis` | TEXT | Yes | `''` | JSON text from LLM deep analysis pass (site type, purpose, sections). Empty when not yet analyzed. Written by `src/deep_analysis.py`. Prompt loaded from `analysis_prompt.txt` on disk — editable without modifying Python source. |
 | `error_msg` | TEXT | Yes | `''` | Error description on failure |
 | `probed_at` | REAL | Yes | `strftime('%s','now')` | Unix timestamp of probe |
 
@@ -67,6 +68,7 @@ The authoritative target list for discovery sweeps. All probing sources (well-kn
 | `last_updated_at` | REAL | No | `0` | Unix timestamp of last upsert / refresh |
 | `consecutive_failures` | INTEGER | No | `0` | Count of consecutive probe failures — resets to 0 on success |
 | `backoff_until` | REAL | No | `0` | Unix timestamp until which this target is excluded from sweeps. Uses exponential backoff: 60s → 300s → 1800s → 7200s → 43200s → capped at 604800s (7 days) |
+| `last_analyzed_at` | REAL | No | `0` | Unix timestamp of last LLM deep analysis. Zero means never analyzed. Updated by `src/deep_analysis.py`. Enables stale-analysis detection. |
 
 ### Auto-seeding flow
 

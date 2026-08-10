@@ -764,6 +764,137 @@ class TestAnalyzerCli:
 
             os.unlink(out_path)
 
+    def test_generate_out_dir_writes_extractor_and_test(self):
+        """generate --out-dir writes both .py module and companion test file."""
+        import tempfile, shutil, os, pathlib
+
+        out_dir = tempfile.mkdtemp(suffix="_ext_plugins")
+        try:
+            stdout, stderr, code = self._run(
+                "generate",
+                "--body", "<rss><channel><item><title>Feed</title></item></channel></rss>",
+                "--name", "test_rss_feed",
+                "--out-dir", out_dir,
+            )
+            assert code == 0
+
+            # Check extractor module was written
+            mod_file = pathlib.Path(out_dir) / "test_rss_feed_extractor.py"
+            assert mod_file.exists(), f"Extractor not found: {mod_file}"
+            with open(mod_file) as f:
+                content = f.read()
+            assert "BaseExtractor" in content
+            assert "can_handle" in content
+            assert "rss_feed" in content.lower()
+
+            # Check companion test file was written
+            test_file = pathlib.Path(out_dir) / "test_test_rss_feed_extractor.py"
+            assert test_file.exists(), f"Test not found: {test_file}"
+            with open(test_file) as f:
+                tc = f.read()
+            assert "TestCanHandle" in tc
+            assert "TestExtract" in tc
+            assert "import pytest" in tc
+
+            # Verify both files are syntactically valid Python
+            compile(mod_file.read_text(), str(mod_file), "exec")
+            compile(test_file.read_text(), str(test_file), "exec")
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+    def test_generate_out_dir_with_relative_path(self):
+        """--out-dir resolves relative paths against src/."""
+        import tempfile, pathlib, os, shutil
+
+        # Use a sub-directory inside the project for safety
+        rel_dir = "src/temp_test_ext"
+        try:
+            stdout, stderr, code = self._run(
+                "generate",
+                "--body", "<html><body>Test page</body></html>",
+                "--name", "simple_html",
+                "--out-dir", rel_dir,
+            )
+            assert code == 0
+            full_path = pathlib.Path("/home/stefan/Projects/I2P-Indexer/src/temp_test_ext")
+            mod_file = full_path / "simple_html_extractor.py"
+            assert mod_file.exists(), f"Extractor not found at {mod_file}"
+        finally:
+            shutil.rmtree(
+                "/home/stefan/Projects/I2P-Indexer/src/temp_test_ext",
+                ignore_errors=True,
+            )
+
+    def test_generate_out_dir_creates_directory(self):
+        """--out-dir creates the directory if it doesn't exist."""
+        import tempfile, pathlib, shutil
+
+        out_dir = tempfile.mkdtemp(suffix="_ext_plugins")
+        nested = pathlib.Path(out_dir) / "nested" / "subdir"
+        try:
+            stdout, stderr, code = self._run(
+                "generate",
+                "--body", "<div>Hello world</div>",
+                "--name", "nested_test",
+                "--out-dir", str(nested),
+            )
+            assert code == 0
+            assert (nested / "nested_test_extractor.py").exists()
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+    def test_generate_out_dir_proper_naming_convention(self):
+        """Module name follows snake_case convention with _extractor suffix."""
+        import tempfile, pathlib, shutil
+
+        out_dir = tempfile.mkdtemp(suffix="_ext_plugins")
+        try:
+            # Name with special chars should become clean module names
+            stdout, stderr, code = self._run(
+                "generate",
+                "--body", '{"json": true}',
+                "--name", "My-Custom_Extractor v2!",
+                "--out-dir", out_dir,
+            )
+            assert code == 0
+
+            # Module should be named with clean snake_case + _extractor suffix
+            files = list(pathlib.Path(out_dir).glob("*.py"))
+            assert len(files) == 2, f"Expected 2 files, got: {[f.name for f in files]}"
+            mod_file = sorted(files)[0]
+            assert "my_custom_extractor" in mod_file.stem
+            assert mod_file.stem.endswith("_extractor")
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+    def test_generate_out_dir_test_compiles(self):
+        """Generated test file is syntactically valid and importable structure."""
+        import tempfile, pathlib, shutil
+
+        out_dir = tempfile.mkdtemp(suffix="_ext_plugins")
+        try:
+            stdout, stderr, code = self._run(
+                "generate",
+                "--body", "<?xml version='1.0'?><data><item>Test</item></data>",
+                "--name", "xml_data",
+                "--out-dir", out_dir,
+            )
+            assert code == 0
+
+            test_file = pathlib.Path(out_dir) / "test_xml_data_extractor.py"
+            # Should compile without errors
+            py_src = test_file.read_text()
+            try:
+                compile(py_src, str(test_file), "exec")
+            except SyntaxError as e:
+                assert False, f"Generated test has syntax error: {e}"
+
+            # Test should have proper pytest structure
+            assert "@pytest.fixture" in py_src
+            assert "def test_" in py_src
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+
 
 # ---------------------------------------------------------------------------
 # 8. COMMON_PATHS sanity checks

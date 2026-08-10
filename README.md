@@ -225,6 +225,31 @@ This creates a self-healing cycle: sweep finds gaps → analyzer inspects and ge
 
 Every probe automatically detects the page's language using `langid` (~1 MB CPU model, zero network traffic). Non-English pages get an `[detected_language: XX (LanguageName)]` tag in their summary for auditability. No LLM or proxy call is made at probe time — detection runs locally and synchronously alongside content extraction.
 
+### Local Deep Analysis with Ollama (decoupled)
+
+Deep analysis runs as a **separate step** after probing, via `src/deep_analysis.py`. Instead of the basic keyword-based classification from probe time, an LLM examines each site's content and produces a structured summary: site type, one-sentence purpose description, and key sections. Results are stored in the database for later queries.
+
+```bash
+# Analyze all reachable sites with missing or stale analysis
+python3 -m src.deep_analysis --mode reachable
+
+# Prioritize sites that haven't been analyzed (or oldest first)
+python3 -m src.deep_analysis --mode stale
+
+# Analyze a specific site by identity hash
+python3 -m src.deep_analysis --hash A3B2C1D0E5F4...
+
+# Limit to 20 sites per run
+python3 -m src.deep_analysis --mode reachable --limit 20
+
+# Use a custom model (default is HY-MT2)
+python3 -m src.deep_analysis --ollama-model qwen3:8b
+```
+
+Default model is `RogerBen/HY-MT2-1.8B:latest` (same as translation). Override via `--ollama-model` CLI flag or `OLLAMA_MODEL` environment variable for future migration to larger models. Analysis timestamp tracked per target (`last_analyzed_at`) enables stale-detection: sites probed 30+ days ago can be re-analyzed.
+
+The analysis prompt lives in `analysis_prompt.txt` at the project root — edit it directly to change what the LLM extracts (fields, depth, language). Use `--prompt` to specify an alternate prompt file.
+
 ### Local Translation with Ollama (decoupled)
 
 Translation runs as a **separate step** after probing, via `translate_summaries.py`. This prevents translation latency from blocking the sweep worker and lets you target specific languages:

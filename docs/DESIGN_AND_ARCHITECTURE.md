@@ -138,6 +138,47 @@ The tagged summary lines are joined with `"\n"` and stored in `content_summary`.
 
 The `address_book` view exposes `detected_lang_direct` (the latest non-null `detected_lang`) as a standalone column for programmatic filtering. Human-readable summaries include `(originally XX)` annotations — e.g., `... [forum] (originally de) 20.5KB in 5.4s — ...`.
 
+### Deep Analysis Pipeline (post-probe, decoupled)
+
+```
+python3 -m src.deep_analysis --mode reachable [--limit N]
+    │
+    ├─► get_pending_analyses(db_path, mode)          # reachable + missing/stale analysis
+    │
+    ├─► analyze_site(body_text, ollama_url, model)   # Ollama /api/generate
+    │   → {site_type, purpose, sections}              # structured JSON
+    │
+    └─► update_analysis(db_path, hash_hex, result_json, timestamp)
+        → UPSERT deep_analysis column + last_analyzed_at
+```
+
+Deep analysis runs as a **separate script** outside the probe sweep loop. This prevents Ollama latency from blocking probe workers and keeps probe logs clean. The architecture mirrors `translate_summaries.py`: decoupled batch job, local-only LLM, graceful fallback on failure.
+
+| Entrypoint | Purpose | Depends On |
+|---|---|---|
+| `get_pending_analyses(db_path, mode)` | Query targets needing analysis by mode (`reachable`, `stale`). Returns list of `(hash_hex, body_text)` pairs. | `DiscoveryDB` |
+| `analyze_site(body_text, url, model)` | Strip HTML tags, truncate to 4096 chars, POST to Ollama `/api/generate`. Retry with cooldown on error. | `urllib.request`, local Ollama |
+| `update_analysis(db_path, hash_hex, analysis_json, timestamp)` | Store JSON text in `deep_analysis` column; update `last_analyzed_at` epoch on targets table | `DiscoveryDB.sql_execute` |
+
+**Configuration:**
+
+| Setting | Default | Configurable Via | Purpose |
+|---|---|---|---|
+| Model name | `RogerBen/HY-MT2-1.8B:latest` | `--ollama-model` CLI flag, `OLLAMA_MODEL` env var | Future-proof model swapping without code changes |
+| Ollama URL | `http://localhost:11434` | `--ollama-url` CLI flag, `OLLAMA_URL` env var | Match translation script convention |
+| Request timeout | 30s | Code constant (can parameterize later) | Prevent hanging on slow inference |
+| Body text limit | 4096 chars after tag strip | Code constant | Keep prompt tokens manageable for small models |
+| Analysis prompt | `analysis_prompt.txt` in project root | `--prompt` CLI flag | Editable on-disk prompt template. Users tweak analysis behavior (fields, depth, language) without modifying Python source. Default shipped with repo covers site_type/purpose/sections. |
+
+**Design rationale:**
+
+| Choice | Reason |
+|---|---|
+| Decoupled from probe sweep | Same reason as translation: Ollama latency (2-5s) would multiply I2P latency (already 5-30s per site). Batch processing is efficient. |
+| Default to HY-MT2 but configurable model | HY-MT2 is available now; `--ollama-model` flag and env var enable switching to larger models without touching code. |
+| Store results as JSON text in discoveries | No schema migration needed for new fields — just parse the JSON when reading. Keeps it flexible as analysis prompt evolves. |
+| Track `last_analyzed_at` on targets | Enables "stale analysis" detection. Sites probed 30+ days ago can be re-analyzed without re-probing. |
+
 ### Configuration and thresholds
 
 | Setting | Source | Value | Purpose |

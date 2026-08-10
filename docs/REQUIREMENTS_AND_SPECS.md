@@ -25,6 +25,15 @@ All probe results shall be stored in a SQLite database (`indexer.db`) with WAL j
 ### FR-05: Content Classification and Language Detection
 On successful fetch, the system shall classify page content into a bucket (forum, wiki, blog, etc.) via offline keyword matching and generate a sentence-length summary. The system detects non-English content using `langid` (local, ~1 MB model) and stores ISO 639-1 language codes in the `detected_lang` column for structured filtering. **No external API or LLM call is made at probe time** — all processing is local per NFR-07.
 
+### FR-10: Deep Site Analysis (post-probe, decoupled)
+The system shall provide an optional deep-analysis pass that sends cached page bodies to a **locally hosted LLM** (via Ollama `/api/generate`) and stores structured analysis results in the database. The analysis produces: site type classification, one-sentence purpose description, and key headings/sections. Runs as a standalone script (`src/deep_analysis.py`), decoupled from probe sweeps — similar pattern to `translate_summaries.py`. Default model is `RogerBen/HY-MT2-1.8B:latest`; configurable via CLI flag or environment variable for future migration to larger models. Per-request timeout defaults to 30s. Results stored as JSON text in a new `deep_analysis` column on the `discoveries` table; targets table gains `last_analyzed_at` timestamp (epoch seconds, 0 = never analyzed).
+
+**Analysis modes:**
+- `--mode reachable`: analyze all currently-reachable sites with stale or missing analysis
+- `--mode stale`: prioritize targets with oldest `last_analyzed_at` (or == 0)
+- `--hash <hex>`: analyze a single destination by identity hash
+- `--limit N`: cap processing count per run
+
 ### FR-06: Addressbook Parsing
 The system shall scan the I2P `netdb/` directory for `.rtr` and `.ls64` binary files, parse them into `RouterInfo` and `LeaseSetInfo` dataclasses, and persist metadata to `routers` and `leasesets` tables.
 
@@ -88,9 +97,9 @@ All content processing — including language detection, classification, summari
 | SAM API | Port 9025 not exposed by Docker configuration; SAM client exists but is unusable |
 | Java web console | CSRF-protected AJAX-loaded data at port 7657 — **not scrapable** via curl |
 
-## 6. Future Work (Out of Scope for MVP)
+### 6. Future Work (Out of Scope for MVP)
 
-- LLM-powered re-classification of `content_summary` fields post-probe (**only using local models — NFR-07**)
+- **Deep site analysis is in progress via `src/deep_analysis.py`** — uses local Ollama (HY-MT2 default, configurable model), runs decoupled from probes similar to translation. Produces structured JSON: site type, purpose, key sections. Results stored in `deep_analysis` column on discoveries table with `last_analyzed_at` tracking on targets.
 - **Translation is live via `translate_summaries.py`** — connects to a local Ollama instance (HY-MT2 model), runs as a standalone pass decoupled from probe sweeps. Still fully on-device per NFR-07. Future enhancements could include configurable models and batch parallel translation.
 - Parallel probe execution (current design is sequential for reliability)
 - Automatic destination discovery beyond the known list (crawling new links from fetched pages)

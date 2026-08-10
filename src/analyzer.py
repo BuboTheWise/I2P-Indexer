@@ -475,6 +475,100 @@ def _validate_syntax(code: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 3c. File naming + test-skeleton helpers for --out-dir
+# ---------------------------------------------------------------------------
+
+
+def _extractor_module_name(extractor_name: str) -> str:
+    """Return the file stem for a generated extractor plugin."""
+    clean = re.sub(r"[^a-zA-Z0-9]", "_", extractor_name).lower()
+    clean = re.sub(r"_+", "_", clean).strip("_") or "custom"
+    return f"{clean}_extractor"
+
+
+def _extractor_class_name(extractor_name: str) -> str:
+    """Return the class name that ``generate_extractor_skeleton`` produces."""
+    return "".join(w.capitalize() for w in extractor_name.replace("-", " ").split()) + "Extractor"
+
+
+def _generate_test_skeleton(
+    extractor_name: str,
+    sample_body: str,
+) -> str:
+    """Generate a minimal pytest test file for a generated extractor."""
+    module = _extractor_module_name(extractor_name)
+    classname = _extractor_class_name(extractor_name)
+    truncated_sample = repr(sample_body[:4096])
+    return (
+        f'"""Tests for {module} - auto-generated alongside the extractor."""\n'
+        'import pytest\n'
+        'from src.extractors import BaseExtractor\n'
+        '\n'
+        f'from {module} import {classname}\n'
+        '\n'
+        '\n'
+        '@pytest.fixture()\n'
+        'def ext():\n'
+        f'    return {classname}()\n'
+        '\n'
+        '\n'
+        'class TestCanHandle:\n'
+        '    """Positive and negative can_handle() checks."""\n'
+        '\n'
+        '    def test_is_registered_extractor(self, ext):\n'
+        '        assert isinstance(ext, BaseExtractor)\n'
+        '\n'
+        '    def test_matches_sample_payload(self, ext):\n'
+        '        """The same body that triggered generation should claim-match."""\n'
+        f'        sample = {truncated_sample}\n'
+        '        assert ext.can_handle(sample, {}, 200) is True\n'
+        '\n'
+        '    def test_rejects_empty_body(self, ext):\n'
+        '        assert ext.can_handle("", {}, 200) is False\n'
+        '\n'
+        '\n'
+        'class TestExtract:\n'
+        '    """Basic sanity on extract()."""\n'
+        '\n'
+        '    def test_returns_triple(self, ext):\n'
+        '        ct, lines, links = ext.extract("Title", "sample body text", {})\n'
+        '        assert isinstance(ct, str)\n'
+        '        assert isinstance(lines, list)\n'
+        '        assert isinstance(links, list)\n'
+    )
+
+
+def _write_extractor_with_test(
+    code: str,
+    test_code: str,
+    out_dir: pathlib.Path,
+    extractor_name: str,
+):
+    """Write an extractor module and its companion test file to *out_dir*."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    module_name = _extractor_module_name(extractor_name)
+    mod_file = out_dir / f"{module_name}.py"
+    test_file = out_dir / f"test_{module_name}.py"
+
+    try:
+        with open(mod_file, "w") as f:
+            f.write(code)
+    except Exception as e:
+        raise RuntimeError(f"Cannot write extractor to {mod_file}: {e}") from e
+
+    try:
+        with open(test_file, "w") as f:
+            f.write(test_code)
+    except Exception as e:
+        print(
+            f"  Could not write test file to {{test_file}}: {{e}}",
+            file=sys.stderr,
+        )
+
+    return mod_file, test_file
+
+
+# ---------------------------------------------------------------------------
 # 3b. validate_extractor — runtime validation of generated plugins
 # ---------------------------------------------------------------------------
 
@@ -1009,8 +1103,16 @@ def main() -> None:
         help="Classifier name (used for class naming)",
     )
     gen_p.add_argument("--validate", action="store_true", help="Validate generated code at runtime against the sample body")
-    gen_p.add_argument("--out", type=str, default="", help="Write to file instead of stdout")
-
+    gen_p.add_argument("--out", type=str, default="", help="Write extractor to a single file instead of stdout")
+    gen_p.add_argument(
+        "--out-dir",
+        type=str,
+        default="",
+        help=(
+            "Directory to write the generated extractor module and companion test file. "
+            "Defaults to src/ext_plugins/ inside this project when omitted."
+        ),
+    )
     # ── all-flagged (wired → generate pipeline) ──
     af_p = sub.add_parser(
         "all-flagged",
@@ -1076,7 +1178,20 @@ def main() -> None:
                     print(f"    → {s}", file=sys.stderr)
 
         out_path = getattr(args, "out", "") or ""
-        if out_path:
+        out_dir_str = getattr(args, "out_dir", getattr(args, "out-dir", "")) or ""
+
+        if out_dir_str:
+            # --out-dir: resolve relative to project root (parent of src/)
+            out_dir = pathlib.Path(out_dir_str)
+            if not out_dir.is_absolute():
+                out_dir = pathlib.Path(__file__).parent.parent / out_dir
+            test_code = _generate_test_skeleton(args.name, args.body)
+            mod_file, test_file = _write_extractor_with_test(
+                code, test_code, out_dir, args.name
+            )
+            print(f"  Written extractor → {mod_file}")
+            print(f"  Written test     → {test_file}")
+        elif out_path:
             with open(str(out_path), "w") as f:
                 f.write(code)
             print(f"  Written to {out_path}")

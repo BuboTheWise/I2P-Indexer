@@ -205,18 +205,23 @@ The view uses a two-tier dedup strategy:
 
 A site probed via both `test.i2p` and its raw b32 address appears as two rows — they represent distinct entry points. Two probes for the same DNS name collapse into one (the latest).
 
-### Columns (19 total) — human-readable first, technical at end
+**Cross-probe coalescing:** `b32_addr` and `i2p_dns_name` are aggregated across all probe modes (`b32` and `dns`) using SQL window functions (`MAX(...) OVER (PARTITION BY ...)`). This means even if the most recent probe is DNS-only, the row still carries the b32 address from an earlier b32-mode probe — and vice versa. Every reachable site in the view has both identifiers populated.
+
+### Columns (24 total) — human-readable first, technical at end
 
 | Column | Source | Description |
 |---|---|---|
-| `dns_name` | computed (`CASE`) | Human-readable identity label |
+| `dns_name` | computed (`CASE` + window coalesce) | Human-readable identity label — coalesced across probe modes |
 | `content_type` | computations | Computed content classification |
 | `reachable` | discoveries (latest) | 1 = UP, 0 = DOWN |
 | `last_probed_utc` | computed (`datetime()`) | Human-readable UTC timestamp |
 | `content_summary` | computations | Natural-language summary (may include `[detected_language: XX]` prefix) |
+| `deep_site_type` | JSONEXTRACT on `deep_analysis` | LLM-classified site type (e.g., `"news site"`, `"forum"`) |
+| `deep_purpose` | JSONEXTRACT on `deep_analysis` | LLM-generated purpose summary (truncated to 200 chars) |
+| `deep_analyzed_at` | correlated subquery | Timestamp of most recent deep analysis run (`MAX(probed_at)` where `deep_analysis IS NOT NULL`) |
 | `detected_lang` | discoveries (latest) | ISO 639-1 language code — empty string for English/undetermined |
 | `ident_hash_hex` | discoveries → routers/leasesets join | SHA-1 destination hash |
-| `b32_addr` | discoveries | Base32 address |
+| `b32_addr` | window coalesce across probes | Base32 address — always populated if any probe resolved it |
 | `status_code` | discoveries (latest) | HTTP status code or 0 |
 | `body_length` | discoveries (latest) | Response body size in bytes |
 | `title` | discoveries (latest) | Extracted page title |
@@ -226,11 +231,19 @@ A site probed via both `test.i2p` and its raw b32 address appears as two rows �
 | `content_hash` | discoveries (latest) | SHA-256 hash of response body |
 | `last_modified` | discoveries (latest) | HTTP Last-Modified header |
 | `found_links` | discoveries (latest) | JSON array of `.i2p` hostnames |
+| `flags` | discoveries (latest) | JSON array of analysis notes (robots.txt, tech stack, etc.) |
+| `needs_review` | discoveries (latest) | Boolean flag for destinations flagged for manual review |
+| `deep_analysis` | discoveries (latest) | Full JSON payload from LLM deep analysis pass |
 | `bandwidth_kbps` | routers (LEFT JOIN) | Advertised bandwidth |
 | `router_caps` | routers (LEFT JOIN) | Capability string (e.g., `"fR4"`) |
 | `num_leases` | leasesets (LEFT JOIN) | Active lease count |
 
 **(TODO — pending kanban t_bb57910d:** add `source` and `source_site` from targets table for provenance tracing in the web UI.)
+
+**Browse UI features (v0.4.6+):**
+- Clickable "Visit" links (`dns_name` and `b32_addr`) in expanded detail panels — open I2P destinations directly when browser proxy is configured.
+- Collapsible raw JSON analysis panel (`deep_analysis`) for on-demand inspection without DOM bloat.
+- Filter sidebar with "Site Type" dropdown and "Analysed After" date picker.
 
 ### Programmatic access
 

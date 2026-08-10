@@ -688,9 +688,9 @@ def _suggest_fingerprint_fixes(
     body_lower = sample_body.lower()
 
     # Check if the threshold is too high (legacy check for old extractors)
-    if "hits >=3" in code:
+    if re.search(r"hits\s*>=\s*[2-9]", code):
         suggestions.append(
-            "Lower the hit threshold from 'hits >= 3' to 'hits >= 1'"
+            "Lower the hit threshold to 'hits >= 1'"
         )
 
     # Check if Content-Type header was available but not used

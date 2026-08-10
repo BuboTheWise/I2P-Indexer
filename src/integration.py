@@ -671,8 +671,17 @@ class DiscoveryDB:
             FROM (
                 SELECT
                     ident_hash_hex,
-                    b32_addr,
-                    CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END AS dns_name,
+                    MAX(COALESCE(NULLIF(b32_addr, ''), NULL)) OVER (
+                        PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
+                    ) AS b32_addr,
+                    COALESCE(
+                        MAX(COALESCE(NULLIF(i2p_dns_name, ''), NULL)) OVER (
+                            PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
+                        ),
+                        MAX(COALESCE(NULLIF(b32_addr, ''), NULL)) OVER (
+                            PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
+                        )
+                    ) AS dns_name,
                     reachable,
                     status_code,
                     body_length,
@@ -980,8 +989,17 @@ class DiscoveryDB:
             FROM (
                 SELECT
                     ident_hash_hex,
-                    b32_addr,
-                    CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END AS dns_name,
+                    MAX(COALESCE(NULLIF(b32_addr, ''), NULL)) OVER (
+                        PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
+                    ) AS b32_addr,
+                    COALESCE(
+                        MAX(COALESCE(NULLIF(i2p_dns_name, ''), NULL)) OVER (
+                            PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
+                        ),
+                        MAX(COALESCE(NULLIF(b32_addr, ''), NULL)) OVER (
+                            PARTITION BY CASE WHEN i2p_dns_name != '' THEN i2p_dns_name ELSE b32_addr END
+                        )
+                    ) AS dns_name,
                     reachable,
                     status_code,
                     body_length,
@@ -1049,6 +1067,7 @@ class DiscoveryDB:
                 and "(originally %s)" in view_sql
                 and "deep_site_type" in view_sql
                 and "deep_analyzed_at" in view_sql
+                and "MAX(COALESCE(NULLIF" in view_sql
             )
             if stable:
                 return

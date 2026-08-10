@@ -476,6 +476,8 @@ document.getElementById('body').addEventListener('click',e=>{
   const det=`<tr class="detail-row"><td colspan="${COLS.length}">
     <div class="detail-grid">
       <span class="detail-label">DNS:</span><span>${esc(entry.dns_name)}</span>
+      <span class="detail-label">Visit (name):</span><a href="http://${esc(entry.dns_name)}" target="_blank" rel="noopener" style="color:#5f5">${esc(entry.dns_name)?'http://'+entry.dns_name:'—'}</a>
+      <span class="detail-label">Visit (b32):</span><a href="http://${esc(entry.b32_addr)}.b32.i2p" target="_blank" rel="noopener" style="color:#5f5">${esc(entry.b32_addr)?'http://'+entry.b32_addr+'.b32.i2p':'—'}</a>
       <span class="detail-label">Title:</span><span>${esc(entry.title||'(none)')}</span>
       <span class="detail-label">Type:</span><span>${esc(entry.content_type||'unknown')}</span>
       <span class="detail-label">Reachable:</span><span class="${entry.reachable?'ok':'down'}">${entry.reachable?'YES':'NO'}</span>

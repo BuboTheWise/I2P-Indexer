@@ -561,7 +561,7 @@ def _write_extractor_with_test(
             f.write(test_code)
     except Exception as e:
         print(
-            f"  Could not write test file to {{test_file}}: {{e}}",
+            f"  Could not write test file to {test_file}: {e}",
             file=sys.stderr,
         )
 

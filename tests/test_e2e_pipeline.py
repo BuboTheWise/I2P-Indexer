@@ -43,7 +43,7 @@ def _make_db_flagged(
         conn.execute(
             "INSERT INTO discoveries ("
             "ident_hash_hex, b32_addr, i2p_dns_name, probe_mode, reachable, "
-            "status_code, content_type, title_text, needs_review, probed_at"
+            "status_code, content_type, title, needs_review, probed_at"
             ") VALUES (?, ?, ?, 'b32', 1, ?, ?, ?, 1, ?)",
             (
                 e["hash_hex"],
@@ -136,7 +136,6 @@ class TestGenerateExtractorsPipeline:
         for r in results:
             assert r.body_length > 0
             assert r.code_lines > 0
-            assert not r.error or not r.error
 
     @patch("src.analyzer.fetch_i2p")
     def test_pipeline_dry_run_does_not_write(self, mock_fetch, tmp_path):
@@ -147,4 +146,8 @@ class TestGenerateExtractorsPipeline:
         mock_fetch.return_value = _mock_response(200)
 
         with patch("src.integration.DEFAULT_DB_PATH", db_file):
-            results = generate_execut
+            results = generate_extractors_pipeline(limit=None, dry_run=True)
+
+        assert len(results) == 2
+        for r in results:
+            assert not r.written_path, "dry_run should not write files"

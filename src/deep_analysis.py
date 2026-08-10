@@ -38,11 +38,17 @@ _DEFAULT_PROMPT_PATH = str(Path(__file__).parent.parent / "analysis_prompt.txt")
 
 _ollama_error: bool = False
 _ollama_error_time: float = 0.0
-_OLLAMA_COOLDOWN_S: float = 300
+# Shorter cooldown so transient failures don't block an entire batch.
+# A single stalled model call shouldn't kill a 50-site run.
+_OLLAMA_COOLDOWN_S: float = 60
 _retry_max_attempts: int = 3
 # Base delay higher than translation.py (1.0 vs 0.5) since deep analysis
 # runs offline and benefits from longer pauses between slow LLM calls.
 _retry_base_delay: float = 1.0
+
+# Default timeout for Ollama generate calls (seconds). Individual calls scale
+# up based on body text size in call_ollama().
+_DEFAULT_OLLAMA_TIMEOUT: float = 60.0
 
 # Timeout for fetching body via I2P proxy (generous for slow tunnels)
 _I2P_FETCH_TIMEOUT = 60.0
@@ -191,6 +197,10 @@ def call_ollama(
     """Send analysis request to Ollama with retry logic.
 
     Returns raw response text on success, None on failure after retries.
+
+    Timeout scales with body size — small models need more time for large prompts.
+    Max timeout capped at 120s to avoid hanging indefinitely. Each 1000 chars of
+    body text adds ~0.5s to the base timeout (60s default).
     """
     global _ollama_error, _ollama_error_time
 
@@ -198,10 +208,14 @@ def call_ollama(
 
     _try_clear_ollama_error()
     if _ollama_error:
-        logger.debug("Ollama in cooldown — skipping")
+        logger.warning("Ollama in cooldown — skipping")
         return None
 
     final_prompt = prompt_template.replace("{{BODY}}", body_text)
+
+    # Scale timeout with prompt size: base + 0.5s per 1000 chars of body text
+    effective_timeout = min(timeout + len(body_text) / 2000, 120.0)
+
     attempt = 0
     while attempt < _retry_max_attempts:
         attempt += 1
@@ -217,7 +231,7 @@ def call_ollama(
                 data=payload,
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
                 data = json.loads(resp.read())
 
             result = data.get("response", "").strip()
@@ -382,6 +396,11 @@ def parse_args() -> argparse.Namespace:
         help=f"Model name (default: {_DEFAULT_MODEL})",
     )
     parser.add_argument(
+        "--timeout", type=float, default=_DEFAULT_OLLAMA_TIMEOUT,
+        help=f"Ollama call timeout in seconds. Scales with body size (max 120s). "
+             f"(default: {_DEFAULT_OLLAMA_TIMEOUT})",
+    )
+    parser.add_argument(
         "--prompt", default=_DEFAULT_PROMPT_PATH,
         help=f"Path to prompt template file (default: {_DEFAULT_PROMPT_PATH})",
     )
@@ -449,6 +468,7 @@ def main() -> None:
             prompt_template=prompt_template,
             ollama_url=args.ollama_url,
             model=args.ollama_model,
+            timeout=args.timeout,
         )
 
         if result:

@@ -80,6 +80,7 @@ thead .sort-asc::after{content:' &uarr;'>}thead .sort-desc::after{content:' &dar
   col.c-status{min-width:48px;}col.c-type{min-width:70px;max-width:160px;}
   col.c-site{min-width:120px;}col.c-title{min-width:100px;}
   col.c-summary{min-width:150px;}col.c-site-type{min-width:80px;max-width:140px;}
+  col.c-purpose{min-width:80px;max-width:200px;}col.c-analysed{min-width:90px;max-width:110px;}
   col.c-rt{min-width:48px;}col.c-size{min-width:48px;}
   col.c-lang{min-width:42px;}col.c-time{min-width:130px;}col.c-links{min-width:28px;}
 
@@ -178,6 +179,12 @@ a.no-std{color:inherit;text-decoration:none}.no-std:hover{color:#ccc}
       <div class="filter-group"><label>Language:</label>
         <select id="filter-lang"><option value="">all languages</option></select></div>
     </div>
+    <div class="filter-row" style="margin-top:6px">
+      <div class="filter-group"><label>Site Type:</label>
+        <select id="filter-site-type"><option value="">all types</option></select></div>
+      <div class="filter-group"><label>Analysed After:</label>
+        <input type="text" id="filter-analysed-after" placeholder="YYYY-MM-DD" style="width:120px;font-size:11px"></div>
+    </div>
   </div>
 
   <!-- Table -->
@@ -185,7 +192,7 @@ a.no-std{color:inherit;text-decoration:none}.no-std:hover{color:#ccc}
   <table id="grid" role="grid">
     <colgroup>
       <col class="c-status"><col class="c-type"><col class="c-site">
-      <col class="c-title"><col class="c-summary"><col class="c-site-type"><col class="c-rt">
+      <col class="c-title"><col class="c-summary"><col class="c-site-type"><col class="c-purpose"><col class="c-analysed"><col class="c-rt">
       <col class="c-size"><col class="c-lang"><col class="c-time"><col class="c-links">
     </colgroup>
     <thead id="head"></thead><tbody id="body"></tbody>
@@ -221,12 +228,14 @@ function escId(s){return (typeof s==='string')?s.replace(/[^\w.-]/g,'_'):''}
 // Populate filter options
 // ---------------------------------------------------------------------------
 (function initFilterOptions(){
-  const types=new Set(), langs=new Set();
-  for(const r of ENTRIES){if(r.content_type)types.add(r.content_type); if(r.detected_lang&&r.detected_lang!=='en')langs.add(r.detected_lang)}
+  const types=new Set(), langs=new Set(), siteTypes=new Set();
+  for(const r of ENTRIES){if(r.content_type)types.add(r.content_type); if(r.detected_lang&&r.detected_lang!=='en')langs.add(r.detected_lang); if(r.deep_site_type)siteTypes.add(r.deep_site_type)}
   const fs=document.getElementById('filter-type');
   for(const t of[...types].sort()){const o=document.createElement('option');o.value=t;o.textContent=t;fs.appendChild(o)}
   const fl=document.getElementById('filter-lang');
   for(const l of[...langs].sort()){const o=document.createElement('option');o.value=l;o.textContent=l.toUpperCase();fl.appendChild(o)}
+  const fst=document.getElementById('filter-site-type');
+  if(fst){for(const t of[...siteTypes].sort()){const o=document.createElement('option');o.value=t;o.textContent=t;fst.appendChild(o)}}
 })();
 
 // ---------------------------------------------------------------------------
@@ -239,6 +248,8 @@ const COLS=[
   {key:'title',        label:'Title'},
   {key:'content_summary',label:'Summary'},
   {key:'deep_site_type',label:'Site Type'},
+  {key:'deep_purpose',   label:'Purpose'},
+  {key:'deep_analyzed_at',label:'Analysed'},
   {key:'response_time_sec',label:'Response Time'},
   {key:'body_length',  label:'Size'},
   {key:'detected_lang',label:'Language'},
@@ -281,6 +292,8 @@ const FILTERABLE_COLS = new Set(['_status', 'content_type', 'deep_site_type', 'd
 let openFilterMenu = null;
 
 function filteredRows(){
+  const siteTypeVal = document.getElementById('filter-site-type')?.value || '';
+  const analysedAfter = document.getElementById('filter-analysed-after')?.value || '';
   return ENTRIES.filter(r=>{
     if(!showUnreachable&&!r.reachable)return false;
     // Column filters
@@ -291,10 +304,14 @@ function filteredRows(){
       if(val===undefined||val===null) val='';
       if(!allowed.has(String(val))) return false;
     }
-    // Text search includes detected_lang now
+    // Site type filter
+    if(siteTypeVal && r.deep_site_type!==siteTypeVal) return false;
+    // Analysed after filter
+    if(analysedAfter && (r.deep_analyzed_at||'')<analysedAfter) return false;
+    // Text search includes detected_lang and deep_purpose now
     if(filterText){
       const q=filterText.toLowerCase();
-      const hay=[r.dns_name,r.title,r.content_type,r.deep_site_type,r.content_summary,
+      const hay=[r.dns_name,r.title,r.content_type,r.deep_site_type,r.deep_purpose,r.content_summary,
                  r.detected_lang].join(' ').toLowerCase();
       if(hay.indexOf(q)===-1) return false;
     }
@@ -346,6 +363,10 @@ function render(){
     const summary=esc(r.content_summary||'—');
     b+=`<td title="${esc((r.content_summary||'').replace(/"/g,'&quot;'))}">${summary}</td>`;
     b+=`<td>${esc(r.deep_site_type||'')}</td>`;
+    b+=`<td title="${esc((r.deep_purpose||"").replace(/"/g,"\&quot;"))}">${esc((r.deep_purpose||"").substring(0,120))}</td>`;
+
+    b+=`<td>${esc(r.deep_analyzed_at||"")}</td>`;
+
     b+=`<td>${hiRT(r.response_time_sec)}</td>`;
     b+=`<td>${hiBytes(r.body_length)}</td>`;
     const langLabel=r.detected_lang&&r.detected_lang!=='en'?r.detected_lang.toUpperCase():'';
@@ -465,7 +486,9 @@ document.getElementById('body').addEventListener('click',e=>{
       <span class="detail-label">Summary:</span><span style="white-space:pre-wrap">${esc(entry.content_summary||'(none)')}</span>
       <span class="detail-label">Site Type:</span><span>${esc(entry.deep_site_type||'(not analyzed)')}</span>
       <span class="detail-label">Purpose:</span><span style="white-space:pre-wrap">${esc((entry.deep_purpose||'(not analyzed)').substring(0,300))}</span>
+      <span class="detail-label">Analysed:</span><span>${esc(entry.deep_analyzed_at||"(not analyzed)")}</span>
     </div>
+    ${entry.deep_analysis_json ? `<details style="margin-top:8px"><summary style="cursor:pointer;color:#5f5;font-size:11px">Raw Analysis JSON</summary><pre style="background:#1a1a2e;padding:6px;border-radius:4px;max-height:200px;overflow:auto;font-size:10px;white-space:pre-wrap">${esc(typeof entry.deep_analysis_json==='string'?entry.deep_analysis_json:JSON.stringify(entry.deep_analysis_json,null,2))}</pre></details>` : ''}
     ${linksH?`<details open style="margin-top:8px"><summary style="cursor:pointer;color:#5f5;font-size:11px">Discovered Links (${dl.length})</summary>${linksH}</details>`:''}
     ${flagsH?`<details style="margin-top:8px"><summary style="cursor:pointer;color:#5f5;font-size:11px">Flags (${fl.length})</summary>${flagsH}</details>`:''}
   </td></tr>`;

@@ -644,6 +644,12 @@ class DiscoveryDB:
                 ab.reachable,
                 datetime(ab.last_probed_at, 'unixepoch') AS last_probed_utc,
                 ab.content_summary,
+                CASE WHEN ab.deep_analysis IS NOT NULL AND LENGTH(COALESCE(ab.deep_analysis,'')) > 50
+                     THEN TRIM(REPLACE(json_extract(ab.deep_analysis, '$.site_type'), CHAR(10),'· ')) ELSE NULL END AS deep_site_type,
+                CASE WHEN ab.deep_analysis IS NOT NULL AND LENGTH(COALESCE(ab.deep_analysis,'')) > 50
+                     THEN REPLACE(SUBSTR(json_extract(ab.deep_analysis, '$.purpose'), 1,200), CHAR(10),'· ') ELSE NULL END AS deep_purpose,
+                (SELECT datetime(MAX(d2.probed_at),'unixepoch') FROM discoveries d2 
+                  WHERE d2.ident_hash_hex = ab.ident_hash_hex AND LENGTH(d2.deep_analysis)>50) AS deep_analyzed_at,
                 ab.ident_hash_hex,
                 ab.b32_addr,
                 ab.status_code,
@@ -951,6 +957,8 @@ class DiscoveryDB:
                     )
                     ELSE NULL
                 END AS deep_purpose,
+                (SELECT datetime(MAX(d2.probed_at),'unixepoch') FROM discoveries d2 
+                  WHERE d2.ident_hash_hex = ab.ident_hash_hex AND LENGTH(d2.deep_analysis)>50) AS deep_analyzed_at,
                 ab.ident_hash_hex,
                 ab.b32_addr,
                 ab.status_code,
@@ -1040,6 +1048,7 @@ class DiscoveryDB:
                 and "currently unreachable" in view_sql
                 and "(originally %s)" in view_sql
                 and "deep_site_type" in view_sql
+                and "deep_analyzed_at" in view_sql
             )
             if stable:
                 return

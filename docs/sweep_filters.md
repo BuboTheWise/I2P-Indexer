@@ -88,7 +88,20 @@ This ordering applies regardless of which filter mode is active. The filter redu
 
 ## Recommended Cron Schedules
 
-These schedules assume a reasonably stable I2P connection and moderate database size (~500-3000 targets). Adjust `--delay` based on your network conditions and database size.
+### Pipeline orchestrator (recommended)
+
+Since v0.4, `pipeline.sh` wraps all steps — probe, translate, deep analysis, extraction, export — into composable actions. Use this instead of calling individual scripts from cron:
+
+```bash
+# Daily refresh: reachable sweep → translate → analyze → export
+hermes kanban create --assignee '<agent-profile>' -- 'cd /path/to/I2P-Indexer && bash pipeline.sh daily -v'
+```
+
+For classic cron, see [pipeline.sh docs](https://github.com/BuboTheWise/I2P-Indexer#layered-pipeline-cron-ready). All settings (delays, limits, Ollama URL) are configurable at the top of `pipeline.sh`.
+
+### Individual scripts (advanced)
+
+These schedules assume a reasonably stable I2P connection and moderate database size (~500-3000 targets).
 
 ### Minimal (two jobs)
 

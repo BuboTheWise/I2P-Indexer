@@ -9,6 +9,9 @@ indexer.db
 indexer.db-shm
 indexer.db-wal
 
+# Pipeline logs (runtime artifacts)
+logs/
+
 # Probe results / scraped content (runtime output)
 results/
 

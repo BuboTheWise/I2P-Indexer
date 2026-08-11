@@ -15,7 +15,7 @@ cd "$PROJECT"
 DB="./indexer.db"
 
 # Output directory for the exported website — change to your webroot
-OUTPUT_DIR="/path/to/webroot"
+OUTPUT_DIR="/root/I2P/webroot/"
 
 # Ollama API endpoint (local LM for translation and deep analysis)
 OLLAMA_URL="http://localhost:11434"
@@ -39,8 +39,16 @@ TRANSLATE_LIMIT=50
 LOGDIR="./logs"
 
 ###############################################################################
-# INTERNAL — initialize venv and create directories
+# INTERNAL — parse arguments, initialize venv and directories
 ###############################################################################
+
+VERBOSE=false
+while getopts "v" opt; do
+    case "$opt" in
+        v) VERBOSE=true ;;
+    esac
+done
+shift $((OPTIND - 1))
 
 if [ -f "$PROJECT/.venv/bin/python3" ]; then
     PYTHON="$PROJECT/.venv/bin/python3"
@@ -53,7 +61,19 @@ fi
 mkdir -p "$LOGDIR"
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGDIR/pipeline.log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGDIR/pipeline.log" >&2
+}
+
+# Run a command, writing output to LOGDIR/<logfile>.
+# If VERBOSE is set, also stream output live to the terminal.
+run_cmd() {
+    local logfile="$1"; shift
+    if $VERBOSE; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running: $*" >&2
+        "$@" 2>&1 | tee -a "$LOGDIR/$logfile"
+    else
+        "$@" >> "$LOGDIR/$logfile" 2>&1
+    fi
 }
 
 ###############################################################################
@@ -62,27 +82,27 @@ log() {
 
 probe_all() {
     log "LAYER 1: Full sweep of all targets"
-    $PYTHON probe_sweep.py --sweep-filter all --db "$DB" --delay "$PROBE_DELAY" \
-        >> "$LOGDIR/probe_all.log" 2>&1
+    run_cmd probe_all.log $PYTHON probe_sweep.py --sweep-filter all \
+        --db "$DB" --delay "$PROBE_DELAY"
 }
 
 probe_reachable() {
     log "LAYER 1: Reachable-only health check"
-    $PYTHON probe_sweep.py --sweep-filter reachable_only --db "$DB" \
-        --delay "$PROBE_REACHABLE_DELAY" >> "$LOGDIR/probe_reachable.log" 2>&1
+    run_cmd probe_reachable.log $PYTHON probe_sweep.py --sweep-filter reachable_only \
+        --db "$DB" --delay "$PROBE_REACHABLE_DELAY"
 }
 
 probe_new_imports() {
     log "LAYER 1: Load addressbook, probe never_probed entries"
-    $PYTHON probe_sweep.py --load-address-book --sweep-filter never_probed \
-        --db "$DB" >> "$LOGDIR/probe_new.log" 2>&1
+    run_cmd probe_new.log $PYTHON probe_sweep.py --load-address-book \
+        --sweep-filter never_probed --db "$DB"
 }
 
 probe_stale() {
     local HOURS="${1:-$STALE_HOURS}"
     log "LAYER 1: Stale catch-up (>$HOURS hours)"
-    $PYTHON probe_sweep.py --sweep-filter stale --min-age-hours "$HOURS" \
-        --db "$DB" >> "$LOGDIR/probe_stale.log" 2>&1
+    run_cmd probe_stale.log $PYTHON probe_sweep.py --sweep-filter stale \
+        --min-age-hours "$HOURS" --db "$DB"
 }
 
 ###############################################################################
@@ -91,8 +111,8 @@ probe_stale() {
 
 translate_summaries() {
     log "LAYER 2: Translate non-English summaries"
-    $PYTHON translate_summaries.py --ollama-url "$OLLAMA_URL" \
-        --limit "$TRANSLATE_LIMIT" >> "$LOGDIR/translate.log" 2>&1
+    run_cmd translate.log $PYTHON translate_summaries.py --ollama-url "$OLLAMA_URL" \
+        --limit "$TRANSLATE_LIMIT"
 }
 
 ###############################################################################
@@ -101,14 +121,14 @@ translate_summaries() {
 
 analyze_reachable() {
     log "LAYER 3: Deep analysis of reachable sites"
-    $PYTHON src/deep_analysis.py --mode reachable --limit "$ANALYSIS_LIMIT" \
-        >> "$LOGDIR/analyze_reachable.log" 2>&1
+    run_cmd analyze_reachable.log $PYTHON src/deep_analysis.py --mode reachable \
+        --limit "$ANALYSIS_LIMIT"
 }
 
 analyze_stale() {
     log "LAYER 3: Re-analyze old entries with updated prompt fields"
-    $PYTHON src/deep_analysis.py --mode stale --limit "$ANALYSIS_LIMIT" \
-        >> "$LOGDIR/analyze_stale.log" 2>&1
+    run_cmd analyze_stale.log $PYTHON src/deep_analysis.py --mode stale \
+        --limit "$ANALYSIS_LIMIT"
 }
 
 ###############################################################################
@@ -119,11 +139,10 @@ generate_extractors() {
     local CONFIRM="${1:-dry-run}"
     if [ "$CONFIRM" = "dry" ]; then
         log "LAYER 4: Dry-run extractor generation for flagged sites"
-        $PYTHON src/analyzer.py all-flagged >> "$LOGDIR/extractor_gen.log" 2>&1
+        run_cmd extractor_gen.log $PYTHON src/analyzer.py all-flagged
     else
         log "LAYER 4: Write extractors to disk and clear flags"
-        $PYTHON src/analyzer.py all-flagged --confirm \
-            >> "$LOGDIR/extractor_gen_confirm.log" 2>&1
+        run_cmd extractor_gen_confirm.log $PYTHON src/analyzer.py all-flagged --confirm
     fi
 }
 
@@ -134,8 +153,7 @@ generate_extractors() {
 export_ui() {
     local OUTDIR="${1:-$OUTPUT_DIR}"
     log "LAYER 5: Export address book with interest scores to $OUTDIR/"
-    $PYTHON probe_sweep.py export --output-dir "$OUTDIR" --db "$DB" \
-        >> "$LOGDIR/export.log" 2>&1
+    run_cmd export.log $PYTHON probe_sweep.py export --output-dir "$OUTDIR" --db "$DB"
 }
 
 ###############################################################################

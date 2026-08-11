@@ -2353,6 +2353,8 @@ def discover_addresses(
         if limit:
             targets = targets[:limit]
 
+        logger.info("Probe queue: %d target(s), delay=%.1fs", len(targets), probe_delay)
+
         # ── Probe each target (one at a time — I2P is slow) ─────────
         results: list[DiscoveryResult] = []
 

@@ -58,6 +58,9 @@ else
     PYTHON="/usr/bin/python3"
 fi
 
+# Force unbuffered output so verbose streaming works in real time
+export PYTHONUNBUFFERED=1
+
 mkdir -p "$LOGDIR"
 
 log() {

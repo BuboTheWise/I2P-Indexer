@@ -1,18 +1,47 @@
 #!/usr/bin/env bash
 # I2P Indexer — Layered Pipeline
-# Edit OUTPUT_DIR at the top, then use:
+# Edit the variables below, then run:
 #   bash pipeline.sh <action>
-# Run from project root, or set the path explicitly.
 
 set -euo pipefail
-
 PROJECT="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT"
+
+###############################################################################
+# CONFIGURABLES — edit these before scheduling
+###############################################################################
+
+# Database path (relative or absolute)
+DB="./indexer.db"
 
 # Output directory for the exported website — change to your webroot
 OUTPUT_DIR="/path/to/webroot"
 
-# Activate the project venv if it exists (needed for cron/manual runs)
+# Ollama API endpoint (local LM for translation and deep analysis)
+OLLAMA_URL="http://localhost:11434"
+
+# Seconds between each probe request during full sweeps
+PROBE_DELAY=8
+
+# Seconds between probes for reachable-only health check (faster)
+PROBE_REACHABLE_DELAY=3
+
+# Hours threshold for "stale" catch-up (re-probe sites older than this)
+STALE_HOURS=24
+
+# Max sites to analyze per deep_analysis run (lower = shorter runs)
+ANALYSIS_LIMIT=50
+
+# Max summaries to translate per run (lower = shorter runs)
+TRANSLATE_LIMIT=50
+
+# Directory for log files
+LOGDIR="./logs"
+
+###############################################################################
+# INTERNAL — initialize venv and create directories
+###############################################################################
+
 if [ -f "$PROJECT/.venv/bin/python3" ]; then
     PYTHON="$PROJECT/.venv/bin/python3"
 elif command -v python3 >/dev/null 2>&1; then
@@ -20,9 +49,7 @@ elif command -v python3 >/dev/null 2>&1; then
 else
     PYTHON="/usr/bin/python3"
 fi
-DB="./indexer.db"
 
-LOGDIR="$PROJECT/logs"
 mkdir -p "$LOGDIR"
 
 log() {
@@ -31,30 +58,28 @@ log() {
 
 ###############################################################################
 # LAYER 1 — PROBE SWEEP (network reachability)
-# Reaches out to .i2p destinations via the local proxy, records status/headers/
-# body_length/find_links in the discoveries table.
 ###############################################################################
 
 probe_all() {
     log "LAYER 1: Full sweep of all targets"
-    $PYTHON probe_sweep.py --sweep-filter all --db "$DB" --delay 8 \
+    $PYTHON probe_sweep.py --sweep-filter all --db "$DB" --delay "$PROBE_DELAY" \
         >> "$LOGDIR/probe_all.log" 2>&1
 }
 
 probe_reachable() {
-    log "LAYER 1: Daily reachable-sites health check"
-    $PYTHON probe_sweep.py --sweep-filter reachable_only --db "$DB" --delay 3 \
-        >> "$LOGDIR/probe_reachable.log" 2>&1
+    log "LAYER 1: Reachable-only health check"
+    $PYTHON probe_sweep.py --sweep-filter reachable_only --db "$DB" \
+        --delay "$PROBE_REACHABLE_DELAY" >> "$LOGDIR/probe_reachable.log" 2>&1
 }
 
 probe_new_imports() {
-    log "LAYER 1: Load addressbook, probe only never_probed entries"
+    log "LAYER 1: Load addressbook, probe never_probed entries"
     $PYTHON probe_sweep.py --load-address-book --sweep-filter never_probed \
         --db "$DB" >> "$LOGDIR/probe_new.log" 2>&1
 }
 
 probe_stale() {
-    local HOURS="${1:-24}"
+    local HOURS="${1:-$STALE_HOURS}"
     log "LAYER 1: Stale catch-up (>$HOURS hours)"
     $PYTHON probe_sweep.py --sweep-filter stale --min-age-hours "$HOURS" \
         --db "$DB" >> "$LOGDIR/probe_stale.log" 2>&1
@@ -62,37 +87,32 @@ probe_stale() {
 
 ###############################################################################
 # LAYER 2 — TRANSLATE SUMMARIES (non-English → English via Ollama)
-# Done BEFORE deep analysis so the LLM gets English input for better results.
 ###############################################################################
 
 translate_summaries() {
     log "LAYER 2: Translate non-English summaries"
-    $PYTHON translate_summaries.py --ollama-url http://localhost:11434 \
-        --limit 50 >> "$LOGDIR/translate.log" 2>&1
+    $PYTHON translate_summaries.py --ollama-url "$OLLAMA_URL" \
+        --limit "$TRANSLATE_LIMIT" >> "$LOGDIR/translate.log" 2>&1
 }
 
 ###############################################################################
 # LAYER 3 — DEEP ANALYSIS (Ollama JSON for content understanding)
-# Sends page body through local LLM → extracts site_type, purpose,
-# sections, interest_score, interest_reasons into discoveries.deep_analysis.
 ###############################################################################
 
 analyze_reachable() {
-    log "LAYER 3: Deep analysis of reachable sites (never analyzed or stale)"
-    $PYTHON src/deep_analysis.py --mode reachable --limit 50 \
+    log "LAYER 3: Deep analysis of reachable sites"
+    $PYTHON src/deep_analysis.py --mode reachable --limit "$ANALYSIS_LIMIT" \
         >> "$LOGDIR/analyze_reachable.log" 2>&1
 }
 
 analyze_stale() {
     log "LAYER 3: Re-analyze old entries with updated prompt fields"
-    $PYTHON src/deep_analysis.py --mode stale --limit 50 \
+    $PYTHON src/deep_analysis.py --mode stale --limit "$ANALYSIS_LIMIT" \
         >> "$LOGDIR/analyze_stale.log" 2>&1
 }
 
 ###############################################################################
 # LAYER 4 — EXTRACTOR GENERATION (for flagged/needs_review sites)
-# Probes flagged destinations and generates BaseExtractor plugin skeletons.
-# Use --dry-run first to preview, then --confirm to write files.
 ###############################################################################
 
 generate_extractors() {
@@ -109,7 +129,6 @@ generate_extractors() {
 
 ###############################################################################
 # LAYER 5 — EXPORT (generate browse UI / address book files)
-# Creates HTML + TXT from the address_book view, including interest scores.
 ###############################################################################
 
 export_ui() {
@@ -138,7 +157,7 @@ run_full_pipeline() {
 }
 
 run_daily_refresh() {
-    log "DAILY REFRESH: reachable sweep + translate + quick analysis pass"
+    log "DAILY REFRESH: reachable sweep + translate + analysis + export"
     probe_reachable
     translate_summaries
     analyze_reachable
@@ -146,8 +165,8 @@ run_daily_refresh() {
 }
 
 run_stale_catchup() {
-    log "STALE CATCHUP: re-probe old sites + translate + re-analyze with new prompt fields"
-    probe_stale 24
+    log "STALE CATCHUP: re-probe old sites + translate + re-analyze"
+    probe_stale "$STALE_HOURS"
     translate_summaries
     analyze_stale
 }
@@ -163,13 +182,13 @@ case "${1:-help}" in
     probe-all)  probe_all ;;
     probe-reach) probe_reachable ;;
     probe-new)  probe_new_imports ;;
-    probe-stale) probe_stale "${2:-24}" ;;
+    probe-stale) probe_stale "${2:-$STALE_HOURS}" ;;
     analyze)    analyze_reachable ;;
     re-analyze) analyze_stale ;;
     translate)  translate_summaries ;;
     extractors-dry) generate_extractors dry ;;
     extractors) generate_extractors write ;;
-    export)     export_ui "${2:-website}" ;;
+    export)     export_ui "${2:-$OUTPUT_DIR}" ;;
     help|*)
         cat <<EOF
 Usage: $0 <action> [options]
@@ -183,7 +202,7 @@ Layer commands:
   probe-all     L1 — Full sweep of all targets
   probe-reach   L1 — Reachable-only health check
   probe-new     L1 — Load addressbook, probe never_probed entries
-  probe-stale [H] L1 — Stale catch-up (default 24h)
+  probe-stale [H] L1 — Stale catch-up (default $STALE_HOURS h)
 
   analyze       L3 — Deep analysis of reachable/never-analyzed sites
   re-analyze    L3 — Re-analyze old entries with updated prompt fields
@@ -192,16 +211,13 @@ Layer commands:
   extractors-dry L4 — Preview extractor generation for flagged sites
   extractors      L4 — Write extractors and clear flags
 
-  export [DIR]    L5 — Export address book HTML/TXT to DIR (default: $OUTPUT_DIR)
+  export [DIR]    L5 — Export address book HTML/TXT to DIR (default: \$OUTPUT_DIR)
 
 Schedule with system cron or hermes kanban:
 
-  System cron examples (adjust PROJECT path):
-    # Daily reachable refresh at 04:00
+  System cron examples (adjust path):
     0 4 * * * /path/to/I2P-Indexer/pipeline.sh daily
-    # Weekly full pipeline on Sunday 02:00
     0 2 * * 0 /path/to/I2P-Indexer/pipeline.sh full
-    # Stale catch-up every 6 hours
     0 */6 * * * /path/to/I2P-Indexer/pipeline.sh stale
 
   Or queue via kanban (runs on cthugha):

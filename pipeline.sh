@@ -36,6 +36,9 @@ ANALYSIS_LIMIT=50
 # Max summaries to translate per run (lower = shorter runs)
 TRANSLATE_LIMIT=50
 
+# Max targets for reachable-only health check (use 0 or unset for all)
+PROBE_REACHABLE_COUNT=20
+
 # Directory for log files
 LOGDIR="./logs"
 
@@ -44,12 +47,10 @@ LOGDIR="./logs"
 ###############################################################################
 
 VERBOSE=false
-while getopts "v" opt; do
-    case "$opt" in
-        v) VERBOSE=true ;;
-    esac
+ACTION="${1:-help}"
+for arg in "$@"; do
+    [ "$arg" = "-v" ] && VERBOSE=true
 done
-shift $((OPTIND - 1))
 
 echo "pipeline.sh v${VERSION}" >&2
 
@@ -75,8 +76,11 @@ log() {
 run_cmd() {
     local logfile="$1"; shift
     if $VERBOSE; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running: $*" >&2
-        "$@" 2>&1 | tee -a "$LOGDIR/$logfile"
+        echo "[${FUNCNAME[1]}] Streaming to $logfile ..." >&2
+        "$@" 2>&1 | stdbuf -oL tee -a "$LOGDIR/$logfile"
+        local rc=${PIPESTATUS[0]}
+        echo "[${FUNCNAME[1]}] DONE (rc=$rc) — see $LOGDIR/$logfile" >&2
+        return $rc
     else
         "$@" >> "$LOGDIR/$logfile" 2>&1
     fi
@@ -87,15 +91,30 @@ run_cmd() {
 ###############################################################################
 
 probe_all() {
+    local COUNT="${1:-}"
     log "LAYER 1: Full sweep of all targets"
-    run_cmd probe_all.log $PYTHON probe_sweep.py --sweep-filter all \
-        --db "$DB" --delay "$PROBE_DELAY"
+    if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+        run_cmd probe_all.log $PYTHON probe_sweep.py --sweep-filter all \
+            --db "$DB" --delay "$PROBE_DELAY" --count "$COUNT"
+    else
+        run_cmd probe_all.log $PYTHON probe_sweep.py --sweep-filter all \
+            --db "$DB" --delay "$PROBE_DELAY"
+    fi
 }
 
 probe_reachable() {
-    log "LAYER 1: Reachable-only health check"
-    run_cmd probe_reachable.log $PYTHON probe_sweep.py --sweep-filter reachable_only \
-        --db "$DB" --delay "$PROBE_REACHABLE_DELAY"
+    local COUNT="${1:-$PROBE_REACHABLE_COUNT}"
+    # Pre-flight: show target count instantly before network I/O
+    local TOTAL
+    TOTAL=$($PYTHON -c "import sqlite3; c=sqlite3.connect('$DB'); print(c.execute('select count(*) from address_book where reachable=1').fetchone()[0])" 2>/dev/null || echo "?")
+    log "LAYER 1: Reachable-only health check (limit=${COUNT}, ~${TOTAL} reachable in DB)"
+    if [ "$COUNT" -gt 0 ] 2>/dev/null; then
+        run_cmd probe_reachable.log $PYTHON probe_sweep.py --sweep-filter reachable_only \
+            --db "$DB" --delay "$PROBE_REACHABLE_DELAY" --count "$COUNT"
+    else
+        run_cmd probe_reachable.log $PYTHON probe_sweep.py --sweep-filter reachable_only \
+            --db "$DB" --delay "$PROBE_REACHABLE_DELAY"
+    fi
 }
 
 probe_new_imports() {
@@ -199,7 +218,7 @@ run_stale_catchup() {
 # CLI interface — pass action name as first arg
 ###############################################################################
 
-case "${1:-help}" in
+case "$ACTION" in
     full)       run_full_pipeline ;;
     daily)      run_daily_refresh ;;
     stale)      run_stale_catchup ;;

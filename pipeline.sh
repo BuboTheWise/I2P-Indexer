@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # I2P Indexer — Layered Pipeline
+VERSION="0.4.6"
 # Edit the variables below, then run:
 #   bash pipeline.sh <action>
 
@@ -49,6 +50,8 @@ while getopts "v" opt; do
     esac
 done
 shift $((OPTIND - 1))
+
+echo "pipeline.sh v${VERSION}" >&2
 
 if [ -f "$PROJECT/.venv/bin/python3" ]; then
     PYTHON="$PROJECT/.venv/bin/python3"
@@ -211,8 +214,10 @@ case "${1:-help}" in
     extractors) generate_extractors write ;;
     export)     export_ui "${2:-$OUTPUT_DIR}" ;;
     help|*)
+        echo "I2P Indexer Pipeline v${VERSION} — Layered Cron Orchestrator"
         cat <<EOF
-Usage: $0 <action> [options]
+
+Usage: $0 <action> [options] [-v]
 
 Actions (layered pipeline):
   full          Run all layers (probe → translate → analyze → extract → export)

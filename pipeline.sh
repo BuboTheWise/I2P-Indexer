@@ -265,8 +265,8 @@ Schedule with system cron or hermes kanban:
     0 2 * * 0 /path/to/I2P-Indexer/pipeline.sh full
     0 */6 * * * /path/to/I2P-Indexer/pipeline.sh stale
 
-  Or queue via kanban (runs on cthugha):
-    hermes kanban create --assignee cthugha \
+  Or queue via kanban (runs on your agent profile):
+    hermes kanban create --assignee '<agent-profile>' \
       --body 'bash pipeline.sh daily' "Daily I2P refresh"
 EOF
         ;;

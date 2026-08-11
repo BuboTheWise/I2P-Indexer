@@ -328,7 +328,18 @@ src/                    ← core library
 probe_sweep.py          ← CLI entry point: sweep, export, target management
 translate_summaries.py  ← CLI entry point: batch-translate non-English summaries
 pipeline.sh             ← Layered cron orchestrator (probe → translate → analyze → export)
-tests/                  ← unit + integration tests (~820 cases)
+tests/                  ← unit + integration tests (~821 cases)
+
+### Verbose Mode
+
+Add `-v` to any pipeline action to stream live, per-site progress to your terminal:
+
+```bash
+./pipeline.sh probe-reach -v
+./pipeline.sh daily -v
+```
+
+The script reports version, pre-flight target counts (from SQLite), and each site's probe/analysis status in real time. Logs are written to `./logs/<step>.log` for post-mortem review.
 docs/                   ← architecture, schema reference, design decisions
 ```
 

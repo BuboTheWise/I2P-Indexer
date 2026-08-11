@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # I2P Indexer — Layered Pipeline
-# Place in /home/stefan/Projects/I2P-Indexer/pipeline.sh
+# Edit OUTPUT_DIR at the top, then use:
+#   bash pipeline.sh <action>
 # Run from project root, or set the path explicitly.
 
 set -euo pipefail
 
-PROJECT="/home/stefan/Projects/I2P-Indexer"
+PROJECT="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT"
+
+# Output directory for the exported website — change to your webroot
+OUTPUT_DIR="/path/to/webroot"
 
 # Activate the project venv if it exists (needed for cron/manual runs)
 if [ -f "$PROJECT/.venv/bin/python3" ]; then
@@ -109,7 +113,7 @@ generate_extractors() {
 ###############################################################################
 
 export_ui() {
-    local OUTDIR="${1:-website}"
+    local OUTDIR="${1:-$OUTPUT_DIR}"
     log "LAYER 5: Export address book with interest scores to $OUTDIR/"
     $PYTHON probe_sweep.py export --output-dir "$OUTDIR" --db "$DB" \
         >> "$LOGDIR/export.log" 2>&1
@@ -127,7 +131,7 @@ run_full_pipeline() {
     translate_summaries
     analyze_reachable
     generate_extractors dry
-    export_ui website
+    export_ui
     log "========================================"
     log "FULL PIPELINE COMPLETE"
     log "========================================"
@@ -138,7 +142,7 @@ run_daily_refresh() {
     probe_reachable
     translate_summaries
     analyze_reachable
-    export_ui website
+    export_ui
 }
 
 run_stale_catchup() {
@@ -188,17 +192,17 @@ Layer commands:
   extractors-dry L4 — Preview extractor generation for flagged sites
   extractors      L4 — Write extractors and clear flags
 
-  export [DIR]    L5 — Export address book HTML/TXT to DIR (default: website)
+  export [DIR]    L5 — Export address book HTML/TXT to DIR (default: $OUTPUT_DIR)
 
 Schedule with system cron or hermes kanban:
 
-  System cron examples:
+  System cron examples (adjust PROJECT path):
     # Daily reachable refresh at 04:00
-    0 4 * * * /home/stefan/Projects/I2P-Indexer/pipeline.sh daily
+    0 4 * * * /path/to/I2P-Indexer/pipeline.sh daily
     # Weekly full pipeline on Sunday 02:00
-    0 2 * * 0 /home/stefan/Projects/I2P-Indexer/pipeline.sh full
+    0 2 * * 0 /path/to/I2P-Indexer/pipeline.sh full
     # Stale catch-up every 6 hours
-    0 */6 * * * /home/stefan/Projects/I2P-Indexer/pipeline.sh stale
+    0 */6 * * * /path/to/I2P-Indexer/pipeline.sh stale
 
   Or queue via kanban (runs on cthugha):
     hermes kanban create --assignee cthugha \

@@ -111,36 +111,35 @@ Output:
 
 Each row is the most recent probe for that identity (DNS name preferred, b32 address fallback). The view joins with `routers` and `leasesets` metadata automatically.
 
-### Custom target list
+### Target list management
 
 Targets live in the **`targets` table**, not in Python code. Seed them programmatically or via CLI:
 
 ```python
-from src.integration import discover_addresses, DiscoveryDB
+from src.integration import upsert_target
 
-db = DiscoveryDB("indexer.db")
-db.upsert_targets([
-    ("A3B2C1D0E5F4...", "my-secure-forum.i2p"),      # (hash, dns) tuple -> b32-first
-    ("", "other-site.i2p"),                             # DNS-only fallback
-])
-
-# discover_addresses reads from the targets table when no args given
-results = discover_addresses()  # probes all entries in targets table
+upsert_target("A3B2C1D0E5F4...", "my-secure-forum.i2p")  # hash + dns -> b32-first
+upsert_target("", "other-site.i2p")                       # DNS-only fallback
 ```
 
-### Sweep mode (--sweep N)
+### Sweep filters (--sweep-filter)
 
-Probe targets repeatedly until `N` online sites are found. Minimal output, one line per new site:
+Probe only a subset of targets:
 
 ```bash
-# Find 10 reachable sites
-python -m src.integration --sweep 10
+python3 probe_sweep.py --sweep-filter all                 # full sweep
+python3 probe_sweep.py --sweep-filter reachable_only      # health check
+python3 probe_sweep.py --sweep-filter never_probed        # new imports
+python3 probe_sweep.py --sweep-filter stale --min-age-hours 24   # stale catch-up
 
-# Scan with default (5 target hits)
-python -m src.integration --sweep 5
+# Limit to N targets, add delay between probes
+python3 probe_sweep.py --count 10 --delay 8
 
-# Use SOCKS5 proxy instead of HTTP proxy
-python -m src.integration --sweep 10 --proxy socks5
+# Load addressbook before sweeping (seeds new targets from linked sites)
+python3 probe_sweep.py --load-address-book --sweep-filter never_probed
+
+# Import SUSI DNS export and sweep everything in one shot
+python3 probe_sweep.py --import-export data/address_book_export.txt
 ```
 
 The `--proxy` flag selects which I2P backend handles the HTTP requests:
@@ -201,25 +200,25 @@ When no extractor claims a response, the destination is flagged `needs_review` i
 
 ### Analyzer — The Feedback Loop
 
-The **analyzer** (`analyzer.py`) closes the extraction gap by inspecting destinations that existing extractors could not classify properly:
+The **analyzer** (`src/analyzer.py`) closes the extraction gap by probing flagged destinations and generating extractors:
 
 1. The sweeper flags a destination as `needs_review=True` when no extractor matches or the result is low quality.
-2. You run `python analyzer.py --inspect <ident_hash>` to probe deeply (full body dump, structural analysis, LLM-assisted classification).
-3. The analyzer generates a new extractor `.py` module tailored to that site's DOM patterns and writes it into `src/ext_plugins/`.
+2. Run `python3 src/analyzer.py all-flagged` to probe all flagged sites (dry-run preview).
+3. Add `--confirm --limit 5` to generate & write actual extractor modules to `src/ext_plugins/`.
 4. On the next sweep, the new extractor is auto-loaded — no config edits, no daemon restart.
 
 ```bash
-# Inspect a flagged destination by its identity hash
-python analyzer.py --inspect A3B2C1D0E5F4...
+# Probe all flagged destinations and preview generated extractors (dry-run)
+python3 src/analyzer.py all-flagged
 
-# List all destinations needing review
-python analyzer.py --list-reviews
+# Generate and write extractors for up to 5 flagged sites
+python3 src/analyzer.py all-flagged --confirm --limit 5
 
-# Auto-generate an extractor for the top N unclassified sites
-python analyzer.py --auto-generate --top 5
+# Generate an extractor from a raw body sample
+python3 src/analyzer.py generate --body "$(cat sample.html)" --validate
 ```
 
-This creates a self-healing cycle: sweep finds gaps → analyzer inspects and generates extractors → next sweep covers more ground.
+This creates a self-healing cycle: sweep finds gaps → analyzer probes and generates extractors → next sweep covers more ground.
 
 ### Language Detection
 
@@ -227,28 +226,23 @@ Every probe automatically detects the page's language using `langid` (~1 MB CPU 
 
 ### Local Deep Analysis with Ollama (decoupled)
 
-Deep analysis runs as a **separate step** after probing, via `src/deep_analysis.py`. Instead of the basic keyword-based classification from probe time, an LLM examines each site's content and produces a structured summary: site type, one-sentence purpose description, and key sections. Results are stored in the database for later queries.
+Deep analysis runs as a **separate step** after probing, via `src/deep_analysis.py`. Feeds each site's HTML body through a local LLM and extracts structured metadata (`site_type`, `purpose`, sections, `interest_score` 1-5):
 
 ```bash
-# Analyze all reachable sites with missing or stale analysis
-python3 -m src.deep_analysis --mode reachable
+# Analyze reachable sites with missing or stale analysis
+python3 src/deep_analysis.py --mode reachable
 
-# Prioritize sites that haven't been analyzed (or oldest first)
-python3 -m src.deep_analysis --mode stale
+# Re-analyze old entries (30+ days since last analysis)
+python3 src/deep_analysis.py --mode stale
 
-# Never-analyzed mode: only sites that have never been analyzed
-python3 -m src.deep_analysis --mode never_analyzed
+# Only sites that have never been analyzed
+python3 src/deep_analysis.py --mode never_analyzed
 
-# Override Ollama endpoint and model
-python3 -m src.deep_analysis --ollama-url http://192.168.1.50:11434 --ollama-model qwen3:8b
-
-# Limit to 20 sites per run
-python3 -m src.deep_analysis --mode reachable --limit 20
+# Limit to 20 sites, override model
+python3 src/deep_analysis.py --mode reachable --limit 20 --ollama-model qwen3:8b
 ```
 
-Default model is `RogerBen/HY-MT2-1.8B:latest` (same as translation). Override via `--ollama-model` CLI flag or `OLLAMA_MODEL` environment variable for future migration to larger models. Analysis timestamp tracked per target (`last_analyzed_at`) enables stale-detection: sites probed 30+ days ago can be re-analyzed.
-
-The analysis prompt lives in `analysis_prompt.txt` at the project root — edit it directly to change what the LLM extracts (fields, depth, language). Use `--prompt` to specify an alternate prompt file.
+Default model is `RogerBen/HY-MT2-1.8B:latest`. Override via `--ollama-model` CLI flag or `LLM_MODEL` environment variable. Prompt lives in `analysis_prompt.txt` at the project root — edit it directly to change extracted fields.
 
 ### Local Translation with Ollama (decoupled)
 
@@ -269,6 +263,32 @@ python3 translate_summaries.py --ollama-url http://other-host:11434
 ```
 
 Requires **Ollama** running locally with `RogerBen/HY-MT2-1.8B:latest` (~1GB VRAM). Translated summaries preserve original text as `[original: ...]` for auditability. Already-translated entries are skipped (idempotent). All translation stays on-device — no content leaves the host (NFR-07).
+
+### Layered Pipeline (cron-ready)
+
+Orchestrate all steps in one script (`pipeline.sh`):
+
+```bash
+# Full pipeline: probe → translate → analyze → extract → export
+bash pipeline.sh full
+
+# Daily refresh: reachable sweep + translate + analyze + export
+bash pipeline.sh daily
+
+# Stale catch-up: re-probe old sites + re-analyze
+bash pipeline.sh stale
+
+# Run individual layers
+bash pipeline.sh probe-all
+bash pipeline.sh analyze
+bash pipeline.sh translate
+bash pipeline.sh export /var/www/eepsite
+
+# Verbose mode — stream per-site progress to terminal
+bash pipeline.sh daily -v
+```
+
+All configuration (delays, limits, Ollama URL, output dir) is in variables at the top of `pipeline.sh`. See [CRON_SCHEDULING.md](docs/CRON_SCHEDULING.md) for scheduling with system cron or kanban.
 
 ### Website / Eepsite Export
 
@@ -298,18 +318,21 @@ src/                    ← core library
   addressbook.py        ← AddressBookCatalog: scan netdb, parse .rtr/.ls64
   config.py             ← I2PConfig: proxy endpoints and ports
   i2p_proxy.py          ← ProxyClient + SAM Client + fetch_i2p() helper
-  |  integration.py        ← probe loop, SQLite store, content classification
-  |  extractors.py         ← BaseExtractor interface, registry, plugin discovery, orchestrator
-  |  translation.py        ← Language detection (langid), tagging, and local Ollama translation
-  |  ext_plugins/          ← auto-discovered extractor modules (gitignored)
-  export_website.py     ← HTML grid + TXT host-list generators for eepsite export
-analyzer.py             ← feedback-loop CLI: inspects flagged destinations, generates extractors
-tests/                  ← unit + integration tests (100+ cases)
+  integration.py        ← probe loop, SQLite store, content classification
+  extractors.py         ← BaseExtractor interface, registry, plugin discovery
+  translation.py        ← Language detection (langid), tagging, Ollama translate
+  deep_analysis.py      ← LLM-powered site analysis (interest_score, purpose, sections)
+  analyzer.py           ← Feedback loop: probes flagged sites, generates extractors
+  export_website.py     ← HTML/TXT generators for I2P eepsite hosting
+  ext_plugins/          ← auto-discovered extractor modules (gitignored)
+probe_sweep.py          ← CLI entry point: sweep, export, target management
+translate_summaries.py  ← CLI entry point: batch-translate non-English summaries
+pipeline.sh             ← Layered cron orchestrator (probe → translate → analyze → export)
+tests/                  ← unit + integration tests (~820 cases)
 docs/                   ← architecture, schema reference, design decisions
-scripts/                ← ad-hoc scripts (not version controlled)
 ```
 
-**Probe strategy:** The indexer uses a B32-first approach — if a target has a valid identity hash it probes `*.b32.i2p` directly. Only when B32 fails does it fall back to DNS resolution via the I2P router. This dramatically reduces probe time since most dead DNS endpoints take 60s to timeout.
+**Probe strategy:** B32-first — probes `*.b32.i2p` directly via identity hash. Falls back to DNS only when B32 fails or no hash exists. Reduces probe time by skipping 60s DNS timeouts on dead targets.
 
 ## Testing
 

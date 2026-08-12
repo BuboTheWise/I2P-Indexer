@@ -80,7 +80,7 @@ thead .sort-asc::after{content:' &uarr;'>}thead .sort-desc::after{content:' &dar
   col.c-status{min-width:48px;}col.c-type{min-width:70px;max-width:160px;}
   col.c-site{min-width:120px;}col.c-title{min-width:100px;}
   col.c-summary{min-width:150px;}col.c-site-type{min-width:80px;max-width:140px;}
-  col.c-purpose{min-width:80px;max-width:200px;}col.c-analysed{min-width:90px;max-width:110px;}
+  col.c-purpose{min-width:80px;max-width:200px;}col.c-interest{min-width:65px;max-width:80px;}col.c-analysed{min-width:90px;max-width:110px;}
   col.c-rt{min-width:48px;}col.c-size{min-width:48px;}
   col.c-lang{min-width:42px;}col.c-time{min-width:130px;}col.c-links{min-width:28px;}
   col.c-interest{min-width:48px;}
@@ -193,8 +193,8 @@ a.no-std{color:inherit;text-decoration:none}.no-std:hover{color:#ccc}
   <table id="grid" role="grid">
     <colgroup>
       <col class="c-status"><col class="c-type"><col class="c-site">
-      <col class="c-title"><col class="c-summary"><col class="c-site-type"><col class="c-purpose"><col class="c-analysed"><col class="c-rt">
-      <col class="c-size"><col class="c-lang"><col class="c-time"><col class="c-links"><col class="c-interest">
+      <col class="c-title"><col class="c-summary"><col class="c-site-type"><col class="c-purpose"><col class="c-interest"><col class="c-analysed"><col class="c-rt">
+      <col class="c-size"><col class="c-lang"><col class="c-time"><col class="c-links">
     </colgroup>
     <thead id="head"></thead><tbody id="body"></tbody>
   </table>
@@ -250,13 +250,13 @@ const COLS=[
   {key:'content_summary',label:'Summary'},
   {key:'deep_site_type',label:'Site Type'},
   {key:'deep_purpose',   label:'Purpose'},
+  {key:'interest_score',label:'Interest'},
   {key:'deep_analyzed_at',label:'Analysed'},
   {key:'response_time_sec',label:'Response Time'},
   {key:'body_length',  label:'Size'},
   {key:'detected_lang',label:'Language'},
   {key:'last_probed_utc',label:'Last Probed'},
   {key:'_linkcount',   label:'Links'},
-  {key:'interest_score',label:'Interest'},
 ];
 
 const hiBytes=v=>{if(!v||v===0)return'';if(v<1024)return v+'B';const k=v/1024;if(k<1024)return k.toFixed(1)+'KB';return(k/1024).toFixed(1)+'MB'};
@@ -375,16 +375,14 @@ function render(){
     b+=`<td title="${esc((r.content_summary||'').replace(/"/g,'&quot;'))}">${summary}</td>`;
     b+=`<td>${esc(r.deep_site_type||'')}</td>`;
     b+=`<td title="${esc((r.deep_purpose||"").replace(/"/g,"\&quot;"))}">${esc((r.deep_purpose||"").substring(0,120))}</td>`;
-
+    b+=`<td style="text-align:center">${interestBadge(r.interest_score)}</td>`;
     b+=`<td>${esc(r.deep_analyzed_at||"")}</td>`;
-
     b+=`<td>${hiRT(r.response_time_sec)}</td>`;
     b+=`<td>${hiBytes(r.body_length)}</td>`;
     const langLabel=r.detected_lang&&r.detected_lang!=='en'?r.detected_lang.toUpperCase():'';
     b+=`<td title="ISO 639-1">${esc(langLabel)}</td>`;
     b+=`<td title="${esc((r.content_summary||'').replace(/"/g,'&quot;'))}">${esc(r.last_probed_utc||'')}</td>`;
     b+=`<td>${r._linkcount}</td>`;
-    b+=`<td style="text-align:center">${interestBadge(r.interest_score)}</td>`;
     b+=`</tr>`;
   }
   document.getElementById('body').innerHTML=b;
@@ -500,9 +498,9 @@ document.getElementById('body').addEventListener('click',e=>{
       <span class="detail-label">Summary:</span><span style="white-space:pre-wrap">${esc(entry.content_summary||'(none)')}</span>
       <span class="detail-label">Site Type:</span><span>${esc(entry.deep_site_type||'(not analyzed)')}</span>
       <span class="detail-label">Purpose:</span><span style="white-space:pre-wrap">${esc((entry.deep_purpose||'(not analyzed)').substring(0,300))}</span>
-      <span class="detail-label">Analysed:</span><span>${esc(entry.deep_analyzed_at||"(not analyzed)")}</span>
       ${interestBadge(entry.interest_score)?`<span class="detail-label">Interest:</span><span>${interestBadge(entry.interest_score)}</span>`:''}
       ${entry.interest_reasons&&entry.interest_reasons!==''?`<span class="detail-label">Reasons:</span><span style="white-space:pre-wrap">${esc(entry.interest_reasons).substring(0,500)}</span>`:''}
+      <span class="detail-label">Analysed:</span><span>${esc(entry.deep_analyzed_at||"(not analyzed)")}</span>
     </div>
     ${entry.deep_analysis_json ? `<details style="margin-top:8px"><summary style="cursor:pointer;color:#5f5;font-size:11px">Raw Analysis JSON</summary><pre style="background:#1a1a2e;padding:6px;border-radius:4px;max-height:200px;overflow:auto;font-size:10px;white-space:pre-wrap">${esc(typeof entry.deep_analysis_json==='string'?entry.deep_analysis_json:JSON.stringify(entry.deep_analysis_json,null,2))}</pre></details>` : ''}
     ${linksH?`<details open style="margin-top:8px"><summary style="cursor:pointer;color:#5f5;font-size:11px">Discovered Links (${dl.length})</summary>${linksH}</details>`:''}

@@ -180,17 +180,10 @@ export_ui() {
     log "LAYER 5: Export address book with interest scores to $OUTDIR/"
     run_cmd export.log $PYTHON probe_sweep.py export --output-dir "$OUTDIR" --db "$DB"
 
-    # List what was exported (cp -v style)
-    local count=0
-    for f in "$OUTDIR"/*; do
-        if [ -f "$f" ]; then
-            local size
-            size=$(wc -c < "$f")
-            log "  Exported: $(basename "$f") ($size bytes)"
-            count=$((count + 1))
-        fi
+    # Replay the file listing from the export output (cp -v style)
+    grep -E '^  (HTML|TXT|UI|IDX):' "$PROJECT/export.log" 2>/dev/null | while read -r line; do
+        log "  $line"
     done
-    log "  ($count file(s) exported to $OUTDIR/)"
 }
 
 ###############################################################################

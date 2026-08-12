@@ -1967,6 +1967,8 @@ class DiscoveryDB:
         """
         with self._lock:
             cur = self._conn.cursor()
+            # LENGTH < 20: minimum I2P base64 destination encoding is ~1.7 chars per byte
+            # of a 3635-byte destination = 4847+ chars, so any valid blob far exceeds 20.
             cur.execute(
                 "UPDATE targets SET dest_data = ?, last_updated_at = ? "
                 "WHERE ident_hash_hex = ? AND LENGTH(dest_data) < 20",

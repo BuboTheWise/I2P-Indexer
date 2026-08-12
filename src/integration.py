@@ -51,6 +51,92 @@ def _truncate(text: str, max_len: int) -> str:
     return text[:max_len] if len(text) > max_len else text
 
 
+# ---------------------------------------------------------------------------
+# Router cache helpers — fetch destination blobs from Java daemon's internal DNS
+# ---------------------------------------------------------------------------
+
+def _fetch_susi_dest_for_hash(
+    ident_hash_hex: str,
+    config: I2PConfig | None = None,
+) -> str | None:
+    """Look up a destination blob in the local router's SUSI DNS cache.
+
+    After probing a .i2p address through the HTTP proxy, the Java daemon has
+    already resolved and cached the full destination data internally.  This
+    function queries ``/susidns/export?book=router`` on port 7657 and extracts
+    the base64 blob matching *ident_hash_hex*.
+
+    Returns the original I2P base64 string (with ``~`` padding) or ``None``
+    when the cache has no entry, the webconsole is unreachable, or a timeout
+    occurs.  Never raises — failures are logged silently so this can be used
+    as a best-effort post-probe enrichment step without risking the probe
+    pipeline.
+
+    Args:
+        ident_hash_hex: 40-char hex identity hash to look up.
+        config: Optional I2PConfig override; defaults to standard config.
+    """
+    cfg = config or I2PConfig()
+    webconsole_port = getattr(cfg, 'webconsole_port', 7657)
+
+    try:
+        import socket
+        sock = socket.create_connection(('127.0.0.1', webconsole_port), timeout=3)
+        sock.sendall(b"GET /susidns/export?book=router HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        response = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+        sock.close()
+
+        # Split headers/body at double newline
+        body_part = response.split(b"\r\n\r\n", 1)[-1].decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    # Parse the export and look for our hash (reuse parse_susi_export logic inline)
+    target_hash = ident_hash_hex.upper()
+    current_b32_raw = ""
+
+    for line in body_part.split("\n"):
+        line = line.rstrip()
+        if not line.strip():
+            continue
+        if line.startswith("#"):
+            comment_text = line[1:].strip()
+            b32_match = re.match(r"^(.+?):\s+(.+?)\.b32\.i2p", comment_text)
+            if b32_match:
+                current_b32_raw = b32_match.group(2).strip()
+            continue
+        if "=" in line:
+            _name, dest_data = line.split("=", 1)
+            dns_name = _name.strip()
+            if not dest_data.strip():
+                continue
+            # Extract base64 blob (before signature marker)
+            if "#!sig=" in dest_data:
+                dest_b64 = dest_data.split("#!sig=", 1)[0].strip()
+            else:
+                dest_b64 = dest_data.strip()
+
+            # Try to decode and compute hash
+            dest_std = dest_b64.replace("~", "_").replace("-", "+").replace("_", "/")
+            pad_needed = len(dest_std) % 4
+            if pad_needed:
+                dest_std += "=" * (4 - pad_needed)
+            try:
+                raw = base64.b64decode(dest_std)
+                entry_hash = raw[:20].hex().upper()
+                if entry_hash == target_hash:
+                    return dest_b64
+            except Exception:
+                continue
+
+    return None
+
+
 def parse_susi_export(path: str | Path) -> list[dict]:
     """Parse a SUSI DNS address book export file (e.g. from /susidns/export?book=router).
 
@@ -58,7 +144,7 @@ def parse_susi_export(path: str | Path) -> list[dict]:
         # DNS_NAME: comment-with-b32-address.b32.i2p
         DNS_NAME=base64_destination_data   [#!sig=...]
 
-    Returns list of dicts with keys: i2p_dns_name, ident_hash_hex, b32_raw, dest_data_len.
+    Returns list of dicts with keys: i2p_dns_name, ident_hash_hex, b32_raw, dest_data_len, dest_b64.
     I2P encodes destination data in a variant of URL-safe base64 that uses `-`, `_` 
     (standard url-safe), AND `~` as an additional substitute for padding chars.
     The parser fixes all three variants before decoding.
@@ -118,6 +204,10 @@ def parse_susi_export(path: str | Path) -> list[dict]:
                     'ident_hash_hex': identity_hash.upper(),
                     'b32_raw': current_b32_raw or _hex_to_b32_addr(identity_hash),
                     'dest_data_len': len(raw),
+                    # Preserve the original I2P base64 blob for susidns export.
+                    # This is the format used by /susidns/export: line.split('=',1)[1]
+                    # before any normalization — identical to what the router expects.
+                    'dest_b64': dest_b64,
                 })
             except Exception:
                 # Skip entries that fail to decode
@@ -874,6 +964,11 @@ class DiscoveryDB:
             cur.execute(
                 "ALTER TABLE targets ADD COLUMN last_analyzed_at REAL DEFAULT 0"
             )
+        # Raw SUSI DNS destination blob (URL-safe base64 with ~ padding) for hosts.txt export
+        if "dest_data" not in existing_cols:
+            cur.execute(
+                "ALTER TABLE targets ADD COLUMN dest_data TEXT DEFAULT ''"
+            )
         self._conn.commit()
 
     def _ensure_susi_sync_table(self) -> None:
@@ -1621,7 +1716,7 @@ class DiscoveryDB:
         from future exports. Rows have `susi_active` (current generation marker) and
         the composite UNIQUE key is (ident_hash_hex, i2p_dns_name).
 
-        Each dict has keys: i2p_dns_name, ident_hash_hex, b32_raw, dest_data_len.
+        Each dict has keys: i2p_dns_name, ident_hash_hex, b32_raw, dest_data_len, dest_b64.
         Returns count of rows inserted or updated.
         """
         with self._lock:
@@ -1649,6 +1744,7 @@ class DiscoveryDB:
                 dns = e.get("i2p_dns_name", "")
                 h = e.get("ident_hash_hex", "").upper()
                 b32 = e.get("b32_raw", "")
+                dest_blob = e.get("dest_b64", "")
                 if not dns:
                     continue
 
@@ -1662,15 +1758,15 @@ class DiscoveryDB:
                 if row:
                     # Exists — reactivate and update
                     cur.execute(
-                        "UPDATE targets SET susi_active = ?, b32_addr = ?, source = ? "
-                        ", last_updated_at = ? WHERE id = ?",
-                        (generation, b32, src, now, row[0]),
+                        "UPDATE targets SET susi_active = ?, b32_addr = ?, source = ?, "
+                        "dest_data = ?, last_updated_at = ? WHERE id = ?",
+                        (generation, b32, src, dest_blob, now, row[0]),
                     )
                 else:
                     # New entry or hash rotation — insert fresh
                     cur.execute(
-                        "INSERT INTO targets (ident_hash_hex, b32_addr, i2p_dns_name, source, susi_active) VALUES (?, ?, ?, ?, ?)",
-                        (h, b32, dns, src, generation),
+                        "INSERT INTO targets (ident_hash_hex, b32_addr, i2p_dns_name, source, susi_active, dest_data) VALUES (?, ?, ?, ?, ?, ?)",
+                        (h, b32, dns, src, generation, dest_blob),
                     )
                 n += 1
 
@@ -1849,6 +1945,35 @@ class DiscoveryDB:
             self._conn.commit()
 
         return added
+
+    def update_target_dest_data(
+        self,
+        ident_hash_hex: str,
+        dest_b64: str,
+    ) -> bool:
+        """Upsert a raw SUSI destination blob into ``targets.dest_data`` for an
+        existing target identified by its identity hash.
+
+        This is called after a successful probe when the router's internal DNS
+        cache has resolved the destination data.  Only overwrites if the current
+        value is empty, so explicit SUSI imports take precedence.
+
+        Args:
+            ident_hash_hex: 40-char hex identity hash.
+            dest_b64: Raw I2P base64 destination blob (with ``~`` padding preserved).
+
+        Returns:
+            True if a row was updated, False if no matching target or already populated.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE targets SET dest_data = ?, last_updated_at = ? "
+                "WHERE ident_hash_hex = ? AND LENGTH(dest_data) < 20",
+                (dest_b64, datetime.now(timezone.utc).timestamp(), ident_hash_hex),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def close(self) -> None:
         """Close the SQLite connection.  Idempotent — safe to call repeatedly."""
@@ -2032,6 +2157,21 @@ def probe_destination(
             i2p_dns_name=i2p_dns_name or best.b32_addr,
             source="probe",
         )
+
+        # ── Enrich with destination blob from router DNS cache ──────────
+        # After a successful probe the Java daemon has already resolved and
+        # cached this destination internally.  Fetch it so hosts.txt exports
+        # contain proper SUSI base64 blobs instead of falling back to
+        # "{b32}.b32.i2p" hostnames (which I2P routers can't import directly).
+        if len(ident_hash_hex) == 40:
+            dest_blob = _fetch_susi_dest_for_hash(ident_hash_hex, config=config)
+            if dest_blob:
+                updated = db.update_target_dest_data(ident_hash_hex, dest_blob)
+                logger.info(
+                    "  [dest] Router cache has destination blob (%dB) for %s%s",
+                    len(dest_blob), ident_hash_hex[:12],
+                    " — upserted" if updated else " — already populated",
+                )
 
     # Auto-seed discovered .i2p links (minus the current site itself)
     if db and best.found_links:

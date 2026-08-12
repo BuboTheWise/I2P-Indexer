@@ -49,3 +49,6 @@ tests/*.db
 # Benchmark scripts — local performance measurements, not part of the library
 benchmark*.py
 *benchmark*.py
+
+# Export logs
+*.log

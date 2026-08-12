@@ -351,7 +351,7 @@ class TestGenerateAddressBookTxt:
         db = _make_sample_db(tmp_path)
         result = generate_address_book_txt(db, str(tmp_path / "output"))
         assert result.is_file()
-        assert result.name == "address_book_hosts.txt"
+        assert result.name == "hosts.txt"
 
     def test_header_lines(self, tmp_path: pathlib.Path):
         db = _make_sample_db(tmp_path)
@@ -360,7 +360,6 @@ class TestGenerateAddressBookTxt:
         assert "# Address book: I2P Indexer" in content
         assert "# Exported:" in content
         assert "# 2 entries" in content
-        assert "# Reachable: 1 | Down: 1" in content
 
     def test_contains_entries(self, tmp_path: pathlib.Path):
         db = _make_sample_db(tmp_path)
@@ -368,19 +367,6 @@ class TestGenerateAddressBookTxt:
         content = result.read_text(encoding="utf-8")
         assert "ok-test.i2p" in content
         assert "down-test.i2p" in content
-
-    def test_reachable_shows_ok(self, tmp_path: pathlib.Path):
-        db = _make_sample_db(tmp_path)
-        result = generate_address_book_txt(db, str(tmp_path / "output"))
-        content = result.read_text(encoding="utf-8")
-        # The reachable entry should have [OK] in its comment line
-        assert "[OK]" in content
-
-    def test_down_shows_down_status(self, tmp_path: pathlib.Path):
-        db = _make_sample_db(tmp_path)
-        result = generate_address_book_txt(db, str(tmp_path / "output"))
-        content = result.read_text(encoding="utf-8")
-        assert "[DOWN]" in content
 
     def test_entries_sorted_by_dns_name(self, tmp_path: pathlib.Path):
         db = _make_sample_db(tmp_path)
@@ -398,12 +384,11 @@ class TestGenerateAddressBookTxt:
         content = result.read_text(encoding="utf-8")
         lines = content.strip().split("\n")
         value_lines = [l for l in lines if not l.startswith("#")]
-        # ok-test has b32, should end with .b32.i2p
+        # Each value line is dns_name=blob (or dns_name= when no blob)
         ok_line = [l for l in value_lines if "ok-test" in l][0]
-        assert ok_line.endswith(".b32.i2p")
-        # down-test has b32
+        assert ok_line.startswith("ok-test.i2p=")
         down_line = [l for l in value_lines if "down-test" in l][0]
-        assert down_line.endswith(".b32.i2p")
+        assert down_line.startswith("down-test.i2p=")
 
     def test_creates_output_directory(self, tmp_path: pathlib.Path):
         db = _make_sample_db(tmp_path)
@@ -411,12 +396,13 @@ class TestGenerateAddressBookTxt:
         result = generate_address_book_txt(db, nested)
         assert result.is_file()
 
-    def test_probed_timestamp_in_comment(self, tmp_path: pathlib.Path):
+    def test_comment_contains_b32_reference(self, tmp_path: pathlib.Path):
         db = _make_sample_db(tmp_path)
         result = generate_address_book_txt(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        # Comment lines should contain "probed=YYYY-MM-DD HH:MM:SS"
-        assert re.search(r"probed=\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", content)
+        # Comment lines contain b32 address reference (b32_addr as stored in DB)
+        assert "#ok-test.i2p: aaaaa.i2p" in content
+        assert "#down-test.i2p: bbbbb.i2p" in content
 
     def test_each_entry_has_comment_and_value_lines(self, tmp_path: pathlib.Path):
         """Each destination produces exactly two lines: comment + value."""
@@ -424,8 +410,8 @@ class TestGenerateAddressBookTxt:
         result = generate_address_book_txt(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
         lines = content.strip().split("\n")
-        # 4 header lines + 2 entries * 2 lines each = 8 lines
-        assert len(lines) == 8
+        # 3 header lines + 2 entries * 2 lines each = 7 lines
+        assert len(lines) == 7
 
     def test_detected_lang_in_transform_row(self, tmp_path: pathlib.Path):
         """detected_lang from address_book view passes through _transform_row."""
@@ -493,15 +479,14 @@ class TestGenerateAddressBookTxt:
         assert value_lines[0] == "no-b32-test.i2p="
 
     def test_empty_database_txt(self, tmp_path: pathlib.Path):
-        """Empty DB produces TXT with only 4 header lines."""
+        """Empty DB produces TXT with only 3 header lines."""
         db = _make_empty_db(tmp_path)
         result = generate_address_book_txt(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
         lines = content.strip().split("\n")
-        # Only the 4 header comment lines, no entries
-        assert len(lines) == 4
+        # Only the 3 header comment lines, no entries
+        assert len(lines) == 3
         assert "# 0 entries" in content
-        assert "# Reachable: 0 | Down: 0" in content
 
 
 # ---------------------------------------------------------------------------

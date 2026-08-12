@@ -16,7 +16,7 @@ cd "$PROJECT"
 DB="./indexer.db"
 
 # Output directory for the exported website — change to your webroot
-OUTPUT_DIR="/root/I2P/webroot/"
+OUTPUT_DIR="/root/I2P/webroot"
 
 # Ollama API endpoint (local LM for translation and deep analysis)
 OLLAMA_URL="http://localhost:11434"

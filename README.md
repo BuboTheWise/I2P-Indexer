@@ -301,12 +301,13 @@ python3 probe_sweep.py export
 python3 probe_sweep.py export --output-dir /var/www/eepsite --db-path indexer.db
 ```
 
-This produces two files in the output directory:
+This produces three files in the output directory:
 
 | File | Purpose |
 |---|---|
-| `address_book.html` | Self-contained HTML page with a dark-themed sortable grid, filtering, and pagination. Embeds all address book rows as JSON — suitable for browsing on any static server or I2P eepsite hosting. Typical size 300–600 KB depending on dataset. |
-| `address_book_hosts.txt` | Plain text host list in `dns=*.b32.i2p` format (matching the SUSI DNS export/hosts format). Each reachable entry gets a comment line with status and probe timestamp. Useful as input for other I2P tools or router imports. Typical size 100–300 KB. |
+| `index.html` | Landing page with links to all exports and project documentation. |
+| `address_book.html` | Self-contained HTML page with a dark-themed sortable grid, filtering, pagination, timeline, and per-entry detail panels with clickable I2P URLs. Embeds all address book rows as JSON — suitable for browsing on any static server or I2P eepsite hosting. Typical size 1–1.5 MB depending on dataset. |
+| `hosts.txt` | Plain text host list in strict SUSI DNS export format (`NAME=base64_blob`). Each entry gets a comment line with the b32 address reference only — no probe timestamps or status tags. Importable by I2P routers and other tools. Typical size 100–400 KB. |
 
 The `website/` directory is in `.gitignore` — generated files are never version controlled.
 

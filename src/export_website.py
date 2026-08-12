@@ -154,7 +154,7 @@ footer{{text-align:center;margin-top:48px;padding:16px;border-top:1px solid #222
 
   <a class="link-card" href="hosts.txt">
     <span class="icon">📋</span>
-    <div><div class="label">Hosts Export</div><div class="desc">Plain text <code>dns=base64_blob</code> format matching SUSI DNS export — importable by I2P routers and other tools.</div></div>
+    <div><div class="label">Hosts Export</div><div class="desc">Plain text <code>NAME=base64_blob</code> format matching SUSI DNS export — importable by I2P routers and other tools.</div></div>
   </a>
 
   <a class="link-card" href="https://github.com/BuboTheWise/I2P-Indexer">

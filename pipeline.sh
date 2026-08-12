@@ -178,10 +178,12 @@ generate_extractors() {
 export_ui() {
     local OUTDIR="${1:-$OUTPUT_DIR}"
     log "LAYER 5: Export address book with interest scores to $OUTDIR/"
+    # Truncate log so grep only sees this run's output
+    : > "$LOGDIR/export.log"
     run_cmd export.log $PYTHON probe_sweep.py export --output-dir "$OUTDIR" --db "$DB"
 
     # Replay the file listing from the export output (cp -v style)
-    grep -E '^  (HTML|TXT|UI|IDX):' "$PROJECT/export.log" 2>/dev/null | while read -r line; do
+    grep -E '^  (HTML|TXT|IDX):' "$LOGDIR/export.log" 2>/dev/null | while read -r line; do
         log "  $line"
     done
 }
@@ -236,7 +238,11 @@ case "$ACTION" in
     translate)  translate_summaries ;;
     extractors-dry) generate_extractors dry ;;
     extractors) generate_extractors write ;;
-    export)     export_ui "${2:-$OUTPUT_DIR}" ;;
+    export)
+        # Strip -v from positional args so it doesn't become $2 (output dir)
+        EXDIR="${2:-}"
+        [ "$EXDIR" = "-v" ] && EXDIR=""
+        export_ui "${EXDIR:-$OUTPUT_DIR}" ;;
     help|*)
         echo "I2P Indexer Pipeline v${VERSION} — Layered Cron Orchestrator"
         cat <<EOF

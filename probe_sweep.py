@@ -90,7 +90,6 @@ from src.export_website import (
     generate_address_book_html,
     generate_address_book_txt,
     generate_index_html,
-    generate_address_book_ui,
 )
 
 from src.addressbook import AddressBookCatalog
@@ -309,16 +308,6 @@ def main():
         default=None,
         help=f"Path to SQLite database (default: {DEFAULT_DB_PATH})",
     )
-    export_parser.add_argument(
-        "--browse-ui",
-        action="store_true",
-        help="Also generate the enhanced interactive browse UI with charts",
-    )
-    export_parser.add_argument(
-        "--ui-filename",
-        default="address_book_ui.html",
-        help="Filename for the enhanced browse UI (default: address_book_ui.html)",
-    )
 
     # ── Global arguments (flat — apply to sweep when no subcommand) --
     p.add_argument(
@@ -496,10 +485,6 @@ def main():
             txt_size = txt_path.stat().st_size
             print(f"  HTML: {html_path} ({html_size:,} bytes)")
             print(f"  TXT:  {txt_path} ({txt_size:,} bytes)")
-            if args.browse_ui:
-                ui_path = generate_address_book_ui(db_path, output_dir, output_filename=args.ui_filename)
-                ui_size = ui_path.stat().st_size
-                print(f"  UI:   {ui_path} ({ui_size:,} bytes)")
             idx_path = generate_index_html(output_dir)
             idx_size = idx_path.stat().st_size
             print(f"  IDX:  {idx_path} ({idx_size:,} bytes)")

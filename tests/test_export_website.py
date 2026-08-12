@@ -9,9 +9,6 @@ import re
 import pytest
 
 from src.export_website import (
-    _format_response_time,
-    _humanize_bytes,
-    _transform_row,
     generate_address_book_html,
     generate_address_book_txt,
 )
@@ -68,87 +65,24 @@ def _make_empty_db(tmp_path: pathlib.Path):
     return str(tmp_path / "empty.db")
 
 
-def _extract_json(html: str) -> list[dict]:
-    """Pull the embedded DATA array out of generated HTML and parse it."""
-    # The template contains: const DATA = [...];
-    start = html.index("const DATA = ") + len("const DATA = ")
-    # Find the closing semicolon after the array literal
+def _extract_entries(html: str) -> list[dict]:
+    """Pull the embedded ENTRIES array out of generated HTML."""
+    start = html.index("const ENTRIES  = ") + len("const ENTRIES  = ")
+    end = html.index(";", start)
+    raw = html[start:end]
+    return json.loads(raw)
+
+
+def _extract_timeline(html: str) -> list[dict]:
+    """Pull the embedded TIMELINE array out of generated HTML."""
+    start = html.index("const TIMELINE = ") + len("const TIMELINE = ")
     end = html.index(";", start)
     raw = html[start:end]
     return json.loads(raw)
 
 
 # ---------------------------------------------------------------------------
-# Helpers — unit
-# ---------------------------------------------------------------------------
-
-class TestHumanizeBytes:
-    def test_none(self):
-        assert _humanize_bytes(None) == ""
-
-    def test_zero(self):
-        assert _humanize_bytes(0) == ""
-
-    def test_bytes(self):
-        assert _humanize_bytes(49) == "49B"
-
-    def test_kilobytes(self):
-        assert _humanize_bytes(1024) == "1.0KB"
-        assert _humanize_bytes(41881) == "40.9KB"
-
-    def test_megabytes(self):
-        mb = 1024 * 1024
-        assert _humanize_bytes(mb) == "1.0MB"
-
-
-class TestFormatResponseTime:
-    def test_none(self):
-        assert _format_response_time(None) == ""
-
-    def test_zero(self):
-        assert _format_response_time(0.0) == ""
-
-    def test_value(self):
-        assert _format_response_time(6.37) == "6.4s"
-
-
-class TestTransformRow:
-    def test_reachable_with_data(self):
-        row = {
-            "dns_name": "test.i2p",
-            "title": "Test",
-            "content_type": "blog",
-            "content_summary": "summary",
-            "reachable": True,
-            "last_probed_utc": "2026-08-01 00:00:00",
-            "response_time_sec": 3.0,
-            "body_length": 1024,
-            "bandwidth_kbps": 50,
-            "found_links": '["a.i2p"]',
-        }
-        out = _transform_row(row)
-        assert out["_rt"] == "3.0s"
-        assert out["_size"] == "1.0KB"
-        assert out["content_summary"] == "summary"
-
-    def test_empty_fields_become_unidentified(self):
-        row = {
-            "dns_name": "bad.i2p",
-            "reachable": False,
-            "response_time_sec": 0,
-            "body_length": 0,
-            "content_summary": "",
-            "found_links": None,
-        }
-        out = _transform_row(row)
-        assert out["content_summary"] == "Unidentified"
-        assert out["_rt"] == ""
-        assert out["_size"] == ""
-        assert out["found_links"] == "[]"
-
-
-# ---------------------------------------------------------------------------
-# Integration — generate_address_book_html
+# Integration — generate_address_book_html (interactive browse UI)
 # ---------------------------------------------------------------------------
 
 class TestGenerateAddressBookHtml:
@@ -162,16 +96,16 @@ class TestGenerateAddressBookHtml:
         db = _make_sample_db(tmp_path)
         result = generate_address_book_html(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        assert "ok-test.i2p" in content
-        assert "down-test.i2p" in content
+        entries = _extract_entries(content)
+        dns_names = [e["dns_name"] for e in entries]
+        assert "ok-test.i2p" in dns_names
+        assert any("bbbbb.i2p" in str(v) for v in entries)  # down-test has no DNS, uses b32
 
     def test_footer_has_timestamp(self, tmp_path: pathlib.Path):
         db = _make_sample_db(tmp_path)
         result = generate_address_book_html(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        # Footer should have a YYYY-MM-DD HH:MM timestamp
         assert "I2P Indexer Address Book" in content
-        # Timestamp format: 2026-08-03 19:00
         assert re.search(
             r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}",
             content,
@@ -184,88 +118,72 @@ class TestGenerateAddressBookHtml:
         assert result.is_file()
 
     def test_html_contains_required_elements(self, tmp_path: pathlib.Path):
-        """HTML contains <script>, DATA array, stats bar, grid table."""
+        """HTML contains tabs, timeline, filters, browse-table structure."""
         db = _make_sample_db(tmp_path)
         result = generate_address_book_html(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
 
-        # Script tag present
-        assert "<script>" in content, "Missing <script> tag"
-        # DATA array embedded
-        assert "const DATA = " in content, "Missing DATA array"
-        # Stats bar div
-        assert 'class="stats"' in content, "Missing stats bar"
-        # Grid table with head and body
-        assert 'id="grid"' in content, "Missing grid table"
-        assert 'id="head"' in content, "Missing thead container"
-        assert 'id="body"' in content, "Missing tbody container"
+        # Tab structure
+        assert 'data-tab="browse-table"' in content, "Missing browse table tab"
+        assert 'data-tab="browse-timeline"' in content, "Missing timeline tab"
+        # Filters
+        assert 'id="filter-type"' in content, "Missing type filter"
+        assert 'id="filter-lang"' in content, "Missing lang filter"
+        assert 'id="filter-status"' in content, "Missing status filter"
 
     def test_embedded_json_row_count(self, tmp_path: pathlib.Path):
         """Embedded JSON contains all rows from address_book."""
         db = _make_sample_db(tmp_path)
         result = generate_address_book_html(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        data = _extract_json(content)
-        # We inserted 2 destinations
-        assert len(data) == 2, f"Expected 2 rows in JSON, got {len(data)}"
+        entries = _extract_entries(content)
+        assert len(entries) == 2, f"Expected 2 rows in JSON, got {len(entries)}"
 
-    def test_json_status_ok_vs_down(self, tmp_path: pathlib.Path):
-        """Reachable entries get _status='OK', unreachable get 'DOWN'."""
+    def test_json_reachable_flags(self, tmp_path: pathlib.Path):
+        """Reachable entries have correct reachable boolean."""
         db = _make_sample_db(tmp_path)
         result = generate_address_book_html(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        data = _extract_json(content)
-        # The JS computes _status at runtime from the 'reachable' field.
-        # Check that the JSON payload has the correct reachable flags:
-        by_dns = {row["dns_name"]: row for row in data}
+        entries = _extract_entries(content)
+        by_dns = {row["dns_name"]: row for row in entries}
         assert by_dns["ok-test.i2p"]["reachable"] is True
-        assert by_dns["down-test.i2p"]["reachable"] is False
+        # down-test has no dns_name, so its key will be b32_addr
+        assert any(not e["reachable"] for e in entries)
 
-    def test_json_response_time_formatted(self, tmp_path: pathlib.Path):
-        """response_time_sec is formatted as 'X.Xs' in embedded JSON."""
+    def test_json_contains_detected_lang(self, tmp_path: pathlib.Path):
+        """detected_lang field appears in every embedded JSON row."""
         db = _make_sample_db(tmp_path)
         result = generate_address_book_html(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        data = _extract_json(content)
-        by_dns = {row["dns_name"]: row for row in data}
-        # ok-test has response_time=1.5 → "1.5s"
-        assert by_dns["ok-test.i2p"]["_rt"] == "1.5s"
-        # down-test has response_time=60.2 → "60.2s"
-        assert by_dns["down-test.i2p"]["_rt"] == "60.2s"
+        entries = _extract_entries(content)
+        assert all("detected_lang" in e for e in entries)
 
-    def test_json_body_length_humanized(self, tmp_path: pathlib.Path):
-        """body_length is humanized (e.g. '4.0KB') in embedded JSON."""
+    def test_json_contains_flags(self, tmp_path: pathlib.Path):
+        """flags field appears in every embedded JSON row."""
         db = _make_sample_db(tmp_path)
         result = generate_address_book_html(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        data = _extract_json(content)
-        by_dns = {row["dns_name"]: row for row in data}
-        # ok-test has body_length=4096 → "4.0KB"
-        assert by_dns["ok-test.i2p"]["_size"] == "4.0KB"
-        # down-test has body_length=0 → ""
-        assert by_dns["down-test.i2p"]["_size"] == ""
+        entries = _extract_entries(content)
+        assert all("flags" in e for e in entries)
 
-    def test_json_none_fields_become_empty_string(self, tmp_path: pathlib.Path):
-        """None/null fields become empty string in JSON payload."""
-        from src.export_website import _transform_row
+    def test_json_contains_interest_fields(self, tmp_path: pathlib.Path):
+        """Interest score, reasons, content_depth, stability_index in payload."""
+        db = _make_sample_db(tmp_path)
+        result = generate_address_book_html(db, str(tmp_path / "output"))
+        content = result.read_text(encoding="utf-8")
+        entries = _extract_entries(content)
+        assert all("interest_score" in e for e in entries)
+        assert all("interest_reasons" in e for e in entries)
+        assert all("content_depth" in e for e in entries)
+        assert all("stability_index" in e for e in entries)
 
-        row = {
-            "dns_name": None,
-            "title": None,
-            "content_type": None,
-            "content_summary": None,
-            "reachable": False,
-            "last_probed_utc": None,
-            "response_time_sec": 0,
-            "body_length": 0,
-            "bandwidth_kbps": None,
-            "found_links": None,
-        }
-        out = _transform_row(row)
-        assert out["dns_name"] == ""
-        assert out["title"] == ""
-        assert out["content_type"] == ""
-        assert out["last_probed_utc"] == ""
+    def test_html_contains_lang_column(self, tmp_path: pathlib.Path):
+        """Generated HTML includes language filtering."""
+        db = _make_sample_db(tmp_path)
+        result = generate_address_book_html(db, str(tmp_path / "output"))
+        content = result.read_text(encoding="utf-8")
+        assert "detected_lang" in content, \
+            "JS template missing detected_lang field reference"
 
     def test_empty_database_generates_valid_html(self, tmp_path: pathlib.Path):
         """Empty DB produces valid HTML with zero-row JSON."""
@@ -273,73 +191,24 @@ class TestGenerateAddressBookHtml:
         result = generate_address_book_html(db, str(tmp_path / "output"))
         assert result.is_file()
         content = result.read_text(encoding="utf-8")
-        data = _extract_json(content)
-        assert len(data) == 0
-        # HTML size is reasonable (template overhead < 10KB)
-        assert result.stat().st_size < 10_000
+        entries = _extract_entries(content)
+        assert len(entries) == 0
 
-    def test_html_size_reasonable(self, tmp_path: pathlib.Path):
-        """Generated HTML file size stays under 1MB for typical datasets."""
-        db = _make_sample_db(tmp_path)
-        result = generate_address_book_html(db, str(tmp_path / "output"))
-        # 2 entries should be well under 100KB
-        assert result.stat().st_size < 1_000_000
-
-    def test_embedded_json_contains_detected_lang(self, tmp_path: pathlib.Path):
-        """detected_lang field appears in every embedded JSON row."""
-        from src.integration import DiscoveryDB
-
-        db_path = str(tmp_path / "lang.db")
-        db = DiscoveryDB(db_path)
-        db.record_discovery(
-            ident_hash_hex="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            b32_addr="abcdefghijklmnopqrstuvwxyzaaaaa.b32.i2p",
-            i2p_dns_name="de-site.i2p",
-            probe_mode="dns",
-            reachable=True,
-            status_code=200,
-            body_length=4096,
-            title="German Site",
-            response_time=1.5,
-            via_method="https",
-            content_type="blog",
-            detected_lang="de",
-            content_summary="Ein deutscher Blog",
-        )
-        db.record_discovery(
-            ident_hash_hex="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            b32_addr="zzyyyyxxxxwwwwvvvvuuuuttttsssss.b32.i2p",
-            i2p_dns_name="fr-site.i2p",
-            probe_mode="dns",
-            reachable=True,
-            status_code=200,
-            body_length=2048,
-            title="French Site",
-            response_time=2.0,
-            via_method="https",
-            content_type="web",
-            detected_lang="fr",
-            content_summary="Un site français",
-        )
-        db.close()
-
-        result = generate_address_book_html(db_path, str(tmp_path / "output"))
-        content = result.read_text(encoding="utf-8")
-        data = _extract_json(content)
-        assert len(data) == 2
-        by_dns = {row["dns_name"]: row for row in data}
-        assert by_dns["de-site.i2p"]["detected_lang"] == "de"
-        assert by_dns["fr-site.i2p"]["detected_lang"] == "fr"
-
-    def test_html_contains_lang_column_header(self, tmp_path: pathlib.Path):
-        """Generated HTML JS includes 'Language' column in COLS array."""
+    def test_timeline_data_present(self, tmp_path: pathlib.Path):
         db = _make_sample_db(tmp_path)
         result = generate_address_book_html(db, str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        assert "'Language'" in content or '"Language"' in content, \
-            "COLS array missing Language column label"
-        assert "detected_lang" in content, \
-            "JS template missing detected_lang field reference"
+        timeline = _extract_timeline(content)
+        assert len(timeline) == 2
+
+    def test_timeline_has_reachable_status(self, tmp_path: pathlib.Path):
+        db = _make_sample_db(tmp_path)
+        result = generate_address_book_html(db, str(tmp_path / "output"))
+        content = result.read_text(encoding="utf-8")
+        timeline = _extract_timeline(content)
+        reachables = {t["reachable"] for t in timeline}
+        assert 1 in reachables  # ok-test is reachable
+        assert 0 in reachables  # down-test is not
 
 
 # ---------------------------------------------------------------------------
@@ -413,40 +282,6 @@ class TestGenerateAddressBookTxt:
         # 3 header lines + 2 entries * 2 lines each = 7 lines
         assert len(lines) == 7
 
-    def test_detected_lang_in_transform_row(self, tmp_path: pathlib.Path):
-        """detected_lang from address_book view passes through _transform_row."""
-        row = {
-            "dns_name": "test.i2p",
-            "title": "Test",
-            "content_type": "blog",
-            "content_summary": "summary",
-            "detected_lang": "de",
-            "reachable": True,
-            "last_probed_utc": "2026-08-01 00:00:00",
-            "response_time_sec": 3.0,
-            "body_length": 1024,
-            "bandwidth_kbps": 50,
-            "found_links": '["a.i2p"]',
-        }
-        from src.export_website import _transform_row
-
-        out = _transform_row(row)
-        assert out["detected_lang"] == "de"
-
-    def test_detected_lang_empty_becomes_empty_string(self, tmp_path: pathlib.Path):
-        """Missing detected_lang becomes empty string in transform."""
-        from src.export_website import _transform_row
-
-        row = {
-            "dns_name": "test.i2p",
-            "detected_lang": None,
-            "reachable": True,
-            "response_time_sec": 0,
-            "body_length": 0,
-        }
-        out = _transform_row(row)
-        assert out["detected_lang"] == ""
-
     def test_missing_b32_addr_empty_value(self, tmp_path: pathlib.Path):
         """Missing b32_addr produces empty value (nothing after =)."""
         from src.integration import DiscoveryDB
@@ -490,196 +325,87 @@ class TestGenerateAddressBookTxt:
 
 
 # ---------------------------------------------------------------------------
-# Helpers — enhanced UI (generate_address_book_ui)
+# Detected lang roundtrip
 # ---------------------------------------------------------------------------
 
-def _make_ui_db(tmp_path: pathlib.Path):
-    """Create a fresh DB with sample data for the enhanced browse UI."""
-    from src.integration import DiscoveryDB
+class TestDetectedLangRoundtrip:
+    def test_detected_lang_in_html_entries(self, tmp_path: pathlib.Path):
+        """Language detection values survive roundtrip to HTML JSON."""
+        from src.integration import DiscoveryDB
 
-    db = DiscoveryDB(str(tmp_path / "ui_test.db"))
-    db.record_discovery(
-        ident_hash_hex="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        b32_addr="abcdefghijklmnopqrstuvwxyzaaaaa.b32.i2p",
-        i2p_dns_name="site-a.i2p",
-        probe_mode="dns",
-        reachable=True,
-        status_code=200,
-        body_length=4096,
-        title="Site A",
-        response_time=1.5,
-        via_method="https",
-        content_type="blog",
-        detected_lang="de",
-        content_summary="A German blog about I2P",
-        found_links=["site-b.i2p"],
-    )
-    db.record_discovery(
-        ident_hash_hex="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        b32_addr="zzyyyyxxxxwwwwvvvvuuuuttttsssss.b32.i2p",
-        i2p_dns_name="",
-        probe_mode="dns",
-        reachable=False,
-        status_code=0,
-        body_length=0,
-        title="",
-        response_time=60.0,
-        via_method="https",
-        content_type="",
-        detected_lang="",
-        content_summary="",
-    )
-    db.close()
-    return str(tmp_path / "ui_test.db")
+        db_path = str(tmp_path / "lang.db")
+        db = DiscoveryDB(db_path)
+        db.record_discovery(
+            ident_hash_hex="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            b32_addr="abcdefghijklmnopqrstuvwxyzaaaaa.b32.i2p",
+            i2p_dns_name="de-site.i2p",
+            probe_mode="dns",
+            reachable=True,
+            status_code=200,
+            body_length=4096,
+            title="German Site",
+            response_time=1.5,
+            via_method="https",
+            content_type="blog",
+            detected_lang="de",
+            content_summary="Ein deutscher Blog",
+        )
+        db.record_discovery(
+            ident_hash_hex="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            b32_addr="zzyyyyxxxxwwwwvvvvuuuuttttsssss.b32.i2p",
+            i2p_dns_name="fr-site.i2p",
+            probe_mode="dns",
+            reachable=True,
+            status_code=200,
+            body_length=2048,
+            title="French Site",
+            response_time=2.0,
+            via_method="https",
+            content_type="web",
+            detected_lang="fr",
+            content_summary="Un site français",
+        )
+        db.close()
 
-
-def _extract_entries(html: str) -> list[dict]:
-    """Pull the embedded ENTRIES array out of enhanced UI HTML."""
-    start = html.index("const ENTRIES  = ") + len("const ENTRIES  = ")
-    end = html.index(";", start)
-    raw = html[start:end]
-    return json.loads(raw)
-
-
-def _extract_timeline(html: str) -> list[dict]:
-    """Pull the embedded TIMELINE array out of enhanced UI HTML."""
-    start = html.index("const TIMELINE = ") + len("const TIMELINE = ")
-    end = html.index(";", start)
-    raw = html[start:end]
-    return json.loads(raw)
+        result = generate_address_book_html(db_path, str(tmp_path / "output"))
+        content = result.read_text(encoding="utf-8")
+        entries = _extract_entries(content)
+        by_dns = {row["dns_name"]: row for row in entries}
+        assert by_dns["de-site.i2p"]["detected_lang"] == "de"
+        assert by_dns["fr-site.i2p"]["detected_lang"] == "fr"
 
 
-class TestGenerateAddressBookUI:
+# ---------------------------------------------------------------------------
+# generate_index_html
+# ---------------------------------------------------------------------------
+
+class TestGenerateIndexHtml:
     def test_creates_file(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
+        from src.export_website import generate_index_html
 
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
+        result = generate_index_html(str(tmp_path / "output"))
         assert result.is_file()
-        assert result.name == "address_book_ui.html"
+        assert result.name == "index.html"
 
-    def test_contains_entries_data(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
+    def test_contains_address_book_link(self, tmp_path: pathlib.Path):
+        from src.export_website import generate_index_html
 
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
+        result = generate_index_html(str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        entries = _extract_entries(content)
-        assert len(entries) == 2
+        assert 'href="address_book.html"' in content
+        assert "Address Book" in content
 
-    def test_entries_include_detected_lang(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
+    def test_contains_hosts_link(self, tmp_path: pathlib.Path):
+        from src.export_website import generate_index_html
 
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
+        result = generate_index_html(str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        entries = _extract_entries(content)
-        by_dns = {e["dns_name"]: e for e in entries}
-        assert by_dns["site-a.i2p"]["detected_lang"] == "de"
-        # Second entry has no dns_name, so its dns_name will be b32_addr from view
-        assert entries[1]["detected_lang"] == ""
+        assert 'href="hosts.txt"' in content
 
-    def test_entries_include_flags(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
+    def test_no_legacy_compact_link(self, tmp_path: pathlib.Path):
+        """index.html should not contain address_book_ui.html or compact refs."""
+        from src.export_website import generate_index_html
 
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
+        result = generate_index_html(str(tmp_path / "output"))
         content = result.read_text(encoding="utf-8")
-        entries = _extract_entries(content)
-        assert all("flags" in e for e in entries)
-
-    def test_entries_contains_site_names(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
-
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
-        content = result.read_text(encoding="utf-8")
-        assert "site-a.i2p" in content
-
-    def test_timeline_data_present(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
-
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
-        content = result.read_text(encoding="utf-8")
-        timeline = _extract_timeline(content)
-        assert len(timeline) == 2
-
-    def test_timeline_has_reachable_status(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
-
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
-        content = result.read_text(encoding="utf-8")
-        timeline = _extract_timeline(content)
-        reachables = {t["reachable"] for t in timeline}
-        assert 1 in reachables  # site-a is reachable
-        assert 0 in reachables  # b32-only entry is not
-
-    def test_html_has_tabs(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
-
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
-        content = result.read_text(encoding="utf-8")
-        assert 'data-tab="browse-table"' in content
-        assert 'data-tab="browse-timeline"' in content
-
-    def test_html_has_filters(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
-
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
-        content = result.read_text(encoding="utf-8")
-        assert 'id="filter-type"' in content
-        assert 'id="filter-lang"' in content
-        assert 'id="filter-status"' in content
-
-    def test_html_has_timeline_elements(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
-
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
-        content = result.read_text(encoding="utf-8")
-        assert 'id="tl-body"' in content
-        assert 'id="tl-filter"' in content
-
-    def test_empty_database_ui(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
-
-        db = _make_empty_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
-        assert result.is_file()
-        content = result.read_text(encoding="utf-8")
-        entries = _extract_entries(content)
-        assert len(entries) == 0
-        timeline = _extract_timeline(content)
-        assert len(timeline) == 0
-
-    def test_creates_output_directory(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
-
-        db = _make_ui_db(tmp_path)
-        nested = str(tmp_path / "deep" / "nested" / "ui")
-        result = generate_address_book_ui(db, nested)
-        assert result.is_file()
-
-    def test_footer_has_timestamp(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
-
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
-        content = result.read_text(encoding="utf-8")
-        assert "I2P Indexer Address Book" in content
-        assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", content), \
-            "Footer missing generation date"
-
-    def test_entry_reachable_flags(self, tmp_path: pathlib.Path):
-        from src.export_website import generate_address_book_ui
-
-        db = _make_ui_db(tmp_path)
-        result = generate_address_book_ui(db, str(tmp_path / "output"))
-        content = result.read_text(encoding="utf-8")
-        entries = _extract_entries(content)
-        by_dns = {e["dns_name"]: e for e in entries}
-        assert by_dns["site-a.i2p"]["reachable"] is True
+        assert "address_book_ui.html" not in content

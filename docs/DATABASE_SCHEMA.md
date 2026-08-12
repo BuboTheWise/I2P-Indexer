@@ -70,6 +70,7 @@ The authoritative target list for discovery sweeps. All probing sources (well-kn
 | `consecutive_failures` | INTEGER | No | `0` | Count of consecutive probe failures — resets to 0 on success |
 | `backoff_until` | REAL | No | `0` | Unix timestamp until which this target is excluded from sweeps. Uses exponential backoff: 60s → 300s → 1800s → 7200s → 43200s → capped at 604800s (7 days) |
 | `last_analyzed_at` | REAL | No | `0` | Unix timestamp of last LLM deep analysis. Zero means never analyzed. Updated by `src/deep_analysis.py`. Enables stale-analysis detection. |
+| `dest_data` | TEXT | No | `''` | Raw SUSI base64 destination blob for the target's identity. Populated automatically after successful b32 probes by querying the local router's internal DNS cache (`/susidns/export?book=router`). Used by `address_book_hosts.txt` exports so I2P routers can import entries directly without resolution. |
 
 ### Auto-seeding flow
 

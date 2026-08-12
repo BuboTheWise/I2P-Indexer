@@ -2914,3 +2914,149 @@ class TestDiscoveryCleanup:
         assert len(errors) == 0, f"Cleanup raised: {errors}"
 
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Destination data enrichment from router cache
+# ---------------------------------------------------------------------------
+
+class TestFetchSusiDestForHash:
+
+    def test_returns_none_when_port_unreachable(self):
+        """Should gracefully return None when webconsole host is unreachable."""
+        from src.config import I2PConfig
+        cfg = I2PConfig(http_port=4444, webconsole_port=19999)
+        from src.integration import _fetch_susi_dest_for_hash
+        assert _fetch_susi_dest_for_hash("A" * 40, config=cfg) is None
+
+    def test_returns_none_for_missing_hash(self):
+        """Should return None when the router cache has no entry for a given hash."""
+        from src.config import I2PConfig
+        cfg = I2PConfig(http_port=4444, webconsole_port=19999)
+        from src.integration import _fetch_susi_dest_for_hash
+        result = _fetch_susi_dest_for_hash("DEADBEEF" * 5 + "00", config=cfg)
+        assert result is None
+
+    def test_parses_real_export(self, tmp_path):
+        """parse_susi_export should handle a minimal SUSI export."""
+        import base64 as _b64
+        # Build a minimal destination blob (identity hash + public key + cert)
+        dest_bytes = bytes(range(20))  # 20-byte identity section (the hash itself)
+        dest_b64 = _b64.b64encode(dest_bytes).decode()
+        ident_hash = dest_bytes[:20].hex().upper()
+
+        # Write a mini SUSI export file for testing parse_susi_export
+        susi_path = tmp_path / "susitest"
+        susi_path.write_text(
+            f"# test.i2p: test.b32.i2p\n"
+            f"test={dest_b64}\n"
+        )
+
+        from src.integration import parse_susi_export
+        entries = parse_susi_export(str(susi_path))
+        assert len(entries) == 1
+        assert entries[0]["ident_hash_hex"] == ident_hash
+
+
+class TestUpdateTargetDestData:
+
+    def _make_db(self, tmp_path):
+        from src.integration import DiscoveryDB
+        db_path = str(tmp_path / "test.db")
+        db = DiscoveryDB(db_path)
+        # Insert a target with empty dest_data
+        db._conn.execute(
+            "INSERT INTO targets (ident_hash_hex, b32_addr, i2p_dns_name, source)"
+            " VALUES (?, '', 'test.i2p', 'susidns')",
+            ("A" * 40,)
+        )
+        db._conn.commit()
+        return db
+
+    def test_updates_empty_dest_data(self, tmp_path):
+        from src.integration import DiscoveryDB
+        db = self._make_db(tmp_path)
+        blob = "SGVsbG8gV29ybGQ="  # base64 for "Hello World"
+        target_hash = "A" * 40
+        assert db.update_target_dest_data(target_hash, blob) is True
+        cur = db._conn.cursor()
+        cur.execute("SELECT dest_data FROM targets WHERE ident_hash_hex=?", (target_hash,))
+        val = cur.fetchone()[0]
+        assert val == blob
+        db.close()
+
+    def test_skips_non_empty_dest_data(self, tmp_path):
+        """Should not overwrite an existing dest_data that's >= 20 chars."""
+        from src.integration import DiscoveryDB
+        db = self._make_db(tmp_path)
+        target_hash = "A" * 40
+        # Pre-populate with a blob > 20 chars (meaningful data)
+        db._conn.execute(
+            "UPDATE targets SET dest_data='EXISTINGBLOBTHATISLONGENOUGH' WHERE ident_hash_hex=?",
+            (target_hash,)
+        )
+        db._conn.commit()
+        ok = db.update_target_dest_data(target_hash, "NEWBLOB")
+        assert ok is False
+        cur = db._conn.cursor()
+        cur.execute("SELECT dest_data FROM targets WHERE ident_hash_hex=?", (target_hash,))
+        val = cur.fetchone()[0]
+        assert val == "EXISTINGBLOBTHATISLONGENOUGH"
+        db.close()
+
+    def test_ignores_missing_hash(self, tmp_path):
+        """Should return False when the hash doesn't exist in targets."""
+        from src.integration import DiscoveryDB
+        db = self._make_db(tmp_path)
+        ok = db.update_target_dest_data("B" * 40, "NEWBLOB")
+        assert ok is False
+        db.close()
+
+    def test_updates_timestamp(self, tmp_path):
+        """Should update last_updated_at when dest_data is written."""
+        import time as _time
+        from src.integration import DiscoveryDB
+        db = self._make_db(tmp_path)
+        target_hash = "A" * 40
+
+        # Backdate the target
+        db._conn.execute(
+            "UPDATE targets SET last_updated_at = 1000.0 WHERE ident_hash_hex=?",
+            (target_hash,)
+        )
+        db._conn.commit()
+
+        _time.sleep(0.05)  # Small delay so timestamp is strictly newer
+        db.update_target_dest_data(target_hash, "NewBlob")
+
+        cur = db._conn.cursor()
+        cur.execute("SELECT last_updated_at FROM targets WHERE ident_hash_hex=?", (target_hash,))
+        ts = cur.fetchone()[0]
+        assert ts > 1000.0, f"Timestamp should have been updated, got {ts}"
+        db.close()
+
+    def test_thread_safe(self, tmp_path):
+        """Concurrent updates should not corrupt the DB."""
+        import threading as thrd
+        from src.integration import DiscoveryDB
+        db = self._make_db(tmp_path)
+        errors = []
+
+        def updater(idx_hex, blob):
+            try:
+                db.update_target_dest_data(idx_hex, blob)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            thrd.Thread(target=updater, args=(f"{i*64:040x}", f"blob_{i}"))
+            for i in range(10)
+        ]
+        # Only the first thread (hash 'A'*40) exists; others are no-op
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert len(errors) == 0
+        db.close()

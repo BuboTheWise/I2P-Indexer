@@ -269,7 +269,7 @@ Requires **Ollama** running locally with `RogerBen/HY-MT2-1.8B:latest` (~1GB VRA
 Orchestrate all steps in one script (`pipeline.sh`):
 
 ```bash
-# Full pipeline: probe → translate → analyze → extract → export
+# Full pipeline: sync addressbook, probe, translate, analyze, extract, export
 bash pipeline.sh full
 
 # Daily refresh: reachable sweep + translate + analyze + export
@@ -328,7 +328,7 @@ src/                    ← core library
   ext_plugins/          ← auto-discovered extractor modules (gitignored)
 probe_sweep.py          ← CLI entry point: sweep, export, target management
 translate_summaries.py  ← CLI entry point: batch-translate non-English summaries
-pipeline.sh             ← Layered cron orchestrator (probe → translate → analyze → export)
+pipeline.sh             ← Layered cron orchestrator (sync → probe → translate → analyze → export)
 tests/                  ← unit + integration tests (~821 cases)
 
 ### Verbose Mode

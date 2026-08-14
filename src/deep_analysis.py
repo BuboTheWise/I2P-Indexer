@@ -452,14 +452,15 @@ def main() -> None:
     # Process each site
     processed = 0
     failed = 0
-    for row in pending:
+    for i, row in enumerate(pending, 1):
         ident_hash, b32_addr, dns_name = row
+        label = dns_name or b32_addr[:40]
 
         # Fetch body via proxy
         body_html = fetch_body_via_proxy(host, port, b32_addr, dns_name)
 
         if not body_html or len(body_html) < 100:
-            logger.debug(f"Skipping {ident_hash[:8]}... — no/insufficient body")
+            logger.debug(f"[{i}/{len(pending)}] SKIP {label} — no/insufficient body")
             continue
 
         # Strip HTML to get body text for the prompt
@@ -489,10 +490,10 @@ def main() -> None:
 
             update_analysis(db_path, ident_hash, probe_mode, analysis_json)
             processed += 1
-            logger.info(f"✓ Analyzed {dns_name or b32_addr[:40]} ({ident_hash[:8]}...)")
+            logger.info(f"[{i}/{len(pending)}] ✓ Analyzed {label} ({ident_hash[:8]}...)")
         else:
             failed += 1
-            logger.warning(f"✗ Failed to analyze {dns_name or b32_addr[:40]}")
+            logger.warning(f"[{i}/{len(pending)}] ✗ Failed to analyze {label}")
 
     logger.info(
         f"Done: {processed} analyzed, {failed} failed out of "

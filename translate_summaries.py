@@ -311,13 +311,14 @@ def main():
     failed = 0
     start = time.time()
 
-    for entry in pending:
+    for i, entry in enumerate(pending, 1):
         didl = entry["i2p_dns_name"] or entry["ident_hash_hex"][:12]
         lang = entry["detected_lang"]
         summary = entry.get("content_summary", "")
 
         if not _needs_translation(summary):
             skipped += 1
+            print(f"  [{i}/{len(pending)}] SKIP {didl}")
             continue
 
         original_text = "\n".join(
@@ -327,23 +328,24 @@ def main():
 
         if not original_text:
             skipped += 1
+            print(f"  [{i}/{len(pending)}] SKIP {didl} (no text)")
             continue
 
         if args.dry_run:
-            print(f"  [DRY] Would translate [{lang}] {didl}: {original_text[:80]}...")
+            print(f"  [{i}/{len(pending)}] DRY  [{lang}] {didl}: {original_text[:80]}...")
             translated += 1
             continue
 
         result = translate_text(original_text, lang, args.ollama_url, args.timeout)
         if not result:
             failed += 1
-            print(f"  [FAIL] [{lang}] {didl} — translation failed")
+            print(f"  [{i}/{len(pending)}] FAIL [{lang}] {didl} — translation failed")
             continue
 
         new_summary = build_translation_summary(summary, result, lang)
         if update_summary(db_path, entry["id"], new_summary):
             translated += 1
-            print(f"  [OK]   [{lang}] {didl}")
+            print(f"  [{i}/{len(pending)}] OK   [{lang}] {didl}")
         else:
             failed += 1
 

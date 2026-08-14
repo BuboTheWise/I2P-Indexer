@@ -58,6 +58,8 @@ def generate_address_book_txt(db_path: str, output_dir: str) -> pathlib.Path:
             dest_map[dns] = blob
     conn.close()
 
+    print(f"Exporting hosts.txt: {total} entries ({reachable_count} reachable, {down_count} unreachable)")
+
     # 3. Header lines — match router export format exactly
     now_utc = datetime.utcnow()
     host_lines: list[str] = [
@@ -410,6 +412,8 @@ def generate_address_book_html(
     entries = _query_entries(db_path)
     items_timeline = _query_timeline(db_path)
     series = _query_reachability_series(db_path, bucket='hour')
+
+    print(f"Exporting address_book.html: {len(entries)} entries, {len(series)} timeline data points")
 
     # 3. Serialize JSON payloads
     entries_json = json.dumps(entries, ensure_ascii=False)

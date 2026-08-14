@@ -196,6 +196,7 @@ run_full_pipeline() {
     log "========================================"
     log "FULL PIPELINE START"
     log "========================================"
+    probe_new_imports
     probe_all
     translate_summaries
     analyze_reachable
@@ -250,7 +251,7 @@ case "$ACTION" in
 Usage: $0 <action> [options] [-v]
 
 Actions (layered pipeline):
-  full          Run all layers (probe → translate → analyze → extract → export)
+  full          Sync addressbook, probe all, translate, analyze, extract, export
   daily         Reachable check + translate + analysis + export (daily cron target)
   stale         Re-probe old sites + translate + re-analyze with new prompt fields
 

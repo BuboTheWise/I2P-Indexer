@@ -91,7 +91,7 @@ def detect_language(
 # Public entry point for the extractor pipeline
 # ---------------------------------------------------------------------------
 
-_Ollama_URL: Optional[str] = None
+_OLLAMA_URL: Optional[str] = None
 _OLLAMA_MODEL: str = "RogerBen/HY-MT2-1.8B:latest"
 _ollama_error: bool = False
 _ollama_error_time: float = 0.0
@@ -254,13 +254,31 @@ def process_content_for_language(
     return tagged_lines, lang
 
 
-# ---------------------------------------------------------------------------
-# State reset (for test isolation)
-# ---------------------------------------------------------------------------
-
 def reset_state() -> None:
     """Reset global state for test isolation."""
     global _detect_error, _ollama_error, _ollama_error_time
     _detect_error = False
     _ollama_error = False
     _ollama_error_time = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Ollama probe (optional)
+# ---------------------------------------------------------------------------
+
+def _probe_ollama(url: str) -> bool:
+    """Return True if an Ollama instance responds at *url*."""
+    import json as _json
+    import urllib.request as _urllib
+    import urllib.error as _urllib_error
+
+    try:
+        req = _urllib.Request(
+            url.replace("/api/generate", "/api/tags") + ("/api/tags" if "/api/" not in url else ""),
+            method="GET",
+        )
+        with _urllib.urlopen(req, timeout=3) as r:
+            data = _json.loads(r.read().decode())
+            return isinstance(data, dict)
+    except Exception:
+        return False

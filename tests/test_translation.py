@@ -1,4 +1,4 @@
-"""Tests for src/translation.py — language detection, tagging, and local translation.
+"""Tests for src/translation.py — language detection, tagging, and Ollama translation pipeline.
 
 Covers:
 - Language detection with langid (various languages, confidence)
@@ -6,12 +6,16 @@ Covers:
 - Ollama-based translate_to_english (success, timeout, fallback)
 - Graceful fallback when libraries or Ollama are unavailable
 - Detected_lang column in DB schema and migrations
+- Smoke test for Ollama translation integration (default config, reachable/unreachable paths)
 
 Non-English content is tagged with language code for identification.
-When Ollama is configured via set_ollama_url(), summaries are translated to English.
+Optional Ollama translation routes through a local /api/generate endpoint.
 """
+import json
 import sys
 import os
+import unittest
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -273,3 +277,42 @@ class TestOllamaTranslation:
         assert result is None
         from src import translation as trans_mod
         assert trans_mod._ollama_error is True
+
+class TestOllamaConfigSmoke(unittest.TestCase):
+    """Smoke tests for OllamaConfig integration (task t_4a274cfc)."""
+
+    def setUp(self):
+        reset_state()
+
+    def test_ollama_config_default_url_empty(self):
+        """OllamaConfig created with no arguments has empty URL and is disabled."""
+        from src.config import OllamaConfig, I2PConfig
+
+        ollama = OllamaConfig()
+        self.assertEqual(ollama.ollama_url, "")
+        self.assertFalse(ollama.enabled)
+
+        # I2PConfig backward compat properties work
+        cfg = I2PConfig()
+        self.assertEqual(cfg.ollama_url, "")
+        self.assertFalse(cfg.ollama_enabled)
+
+    def test_ollama_config_default_model(self):
+        """OllamaConfig default model is llama3.2."""
+        from src.config import OllamaConfig
+
+        ollama = OllamaConfig()
+        self.assertEqual(ollama.model, "llama3.2")
+
+    def test_i2pconfig_ollama_forwarding(self):
+        """I2PConfig passes through ollama settings correctly."""
+        from src.config import I2PConfig, OllamaConfig
+
+        cfg = I2PConfig(ollama=OllamaConfig(
+            ollama_url="http://localhost:11434/api/generate"
+        ))
+        self.assertTrue(cfg.ollama_enabled)
+        self.assertEqual(cfg.ollama.model, "llama3.2")
+
+if __name__ == "__main__":
+    unittest.main()

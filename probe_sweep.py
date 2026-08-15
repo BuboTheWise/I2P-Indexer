@@ -556,8 +556,15 @@ def main():
         db.close()
         return
 
-    # ── Real sweep ────────────────────────────────────────────────
     from src.config import I2PConfig
+
+    # ── Real sweep ───────────────────────
+    cfg = I2PConfig(
+        http_host=args.i2p_host,
+        http_port=args.i2p_http_port,
+        socks_port=args.i2p_socks_port,
+        ollama_url=args.ollama_url,
+    )
 
     effective_timeout = integration_module.PROBE_TIMEOUT
     if args.respect_robots:
@@ -565,12 +572,7 @@ def main():
 
     results = discover_addresses(
         known_addrs=None,
-        config=I2PConfig(
-            http_host=args.i2p_host,
-            http_port=args.i2p_http_port,
-            socks_port=args.i2p_socks_port,
-            ollama_url=args.ollama_url,
-        ),
+        config=cfg,
         db_path=args.db,
         probe_delay=args.delay,
         timeout=effective_timeout,

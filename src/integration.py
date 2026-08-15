@@ -2001,8 +2001,8 @@ def probe_destination(
 
     Returns the best result (most data from fastest successful probe).
     If a DB is provided, records both attempts.
-    ``timeout`` is the per-target deadline in seconds.
     ``config`` provides proxy host/port settings; defaults to I2PConfig().
+    ``timeout`` is the per-target deadline in seconds.
     ``robots_policy`` when set, filters discovered links against Disallow rules.
         Fully blocked sites get a robots_txt flag instead of being crawled deeply.
     """
@@ -2017,8 +2017,8 @@ def probe_destination(
             ident_hash_hex=ident_hash_hex,
             i2p_dns_name=i2p_dns_name,
             probe_mode="b32",
-            timeout=timeout,
             config=config,
+            timeout=timeout,
             robots_policy=robots_policy,
         )
         results.append(res_b32)
@@ -2068,8 +2068,8 @@ def probe_destination(
                 ident_hash_hex=ident_hash_hex,
                 i2p_dns_name=i2p_dns_name,
                 probe_mode="dns",
-                timeout=dns_timeout,
                 config=config,
+                timeout=dns_timeout,
                 robots_policy=robots_policy,
             )
             results.append(res_dns)
@@ -2102,8 +2102,8 @@ def probe_destination(
                 ident_hash_hex=ident_hash_hex,
                 i2p_dns_name=i2p_dns_name,
                 probe_mode="dns",
-                timeout=timeout,
                 config=config,
+                timeout=timeout,
                 robots_policy=robots_policy,
             )
             results.append(res_dns)
@@ -2202,15 +2202,15 @@ def _do_probe(
 ) -> DiscoveryResult:
     """Single HTTP fetch through proxy. Returns reachable=0 on any failure.
     
+    ``config`` provides proxy host/port settings; defaults to I2PConfig().
     ``timeout`` is the per-target deadline in seconds (default 120).
     The underlying I2PProxyClient uses this as a socket timeout.
-    ``config`` provides proxy host/port settings; defaults to I2PConfig().
     ``robots_policy`` when set, filters discovered links against Disallow rules
         and adds robots_txt flags for blocked or fully-blocked destinations.
     """
     start = time.monotonic()
     try:
-        resp = fetch_i2p(url, via="http-proxy", timeout=timeout, config=config)
+        resp = fetch_i2p(url, via="http-proxy", config=config, timeout=timeout)
         elapsed = round(time.monotonic() - start, 2)
         body_text = resp.text if hasattr(resp, "text") else resp.body.decode("utf-8", errors="replace")
 
@@ -2527,8 +2527,8 @@ def discover_addresses(
                 ident_hash_hex=hash_hex,
                 i2p_dns_name=dns_name,
                 db=db,
+                config=config,
                 timeout=timeout,
-                config=cfg,
                 robots_policy=robots_policy if respect_robots else None,
             )
             results.append(res)

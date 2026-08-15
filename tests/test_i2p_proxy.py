@@ -170,5 +170,85 @@ class TestComparison(unittest.TestCase):
         self.assertEqual(r.via, ProxyBackend.HTTP_PROXY)
 
 
+class TestI2PConfigWiring(unittest.TestCase):
+    """Regression tests: I2PConfig propagates through the full call chain.
+
+    Ensures that custom proxy/SAM endpoints from I2PConfig actually reach
+    the underlying clients instead of being silently ignored.
+    """
+
+    def test_proxy_client_uses_config(self):
+        """I2PProxyClient must respect I2PConfig ports and hosts."""
+        from src.config import I2PConfig
+        cfg = I2PConfig(
+            socks_host="10.0.0.2",
+            socks_port=8765,
+            http_host="10.0.0.3",
+            http_port=5432,
+        )
+        c = I2PProxyClient(config=cfg)
+        self.assertEqual(c.socks_host, "10.0.0.2")
+        self.assertEqual(c.socks_port, 8765)
+        self.assertEqual(c.http_host, "10.0.0.3")
+        self.assertEqual(c.http_port, 5432)
+
+    def test_proxy_client_explicit_kwargs_override(self):
+        """Explicit kwargs must override config defaults."""
+        from src.config import I2PConfig
+        cfg = I2PConfig(
+            socks_host="10.0.0.2",
+            socks_port=8765,
+            http_host="10.0.0.3",
+            http_port=5432,
+        )
+        c = I2PProxyClient(config=cfg, socks_port=9999)
+        self.assertEqual(c.socks_port, 9999)
+        self.assertEqual(c.http_port, 5432)
+
+    def test_proxy_client_defaults_when_no_config(self):
+        """Config still falls back to defaults when not provided."""
+        c = I2PProxyClient()
+        self.assertEqual(c.http_port, 4444)
+        self.assertEqual(c.socks_port, 7656)
+
+    def test_sam_client_uses_config(self):
+        """I2PSAMClient respects I2PConfig SAM host/port."""
+        from src.config import I2PConfig
+        cfg = I2PConfig(
+            sam_host="10.0.0.5",
+            sam_port=7890,
+        )
+        c = I2PSAMClient(config=cfg)
+        self.assertEqual(c.host, "10.0.0.5")
+        self.assertEqual(c.port, 7890)
+
+    def test_integration_call_chain_accepts_config(self):
+        """verify discover_addresses/probe_destination/_do_probe accept config param."""
+        import inspect
+        from src.integration import (
+            discover_addresses,
+            probe_destination,
+            _do_probe,
+        )
+
+        for fn in (discover_addresses, probe_destination, _do_probe):
+            sig = inspect.signature(fn)
+            self.assertIn(
+                "config", sig.parameters,
+                f"{fn.__name__} missing config parameter",
+            )
+            default = sig.parameters["config"].default
+            self.assertIsNone(
+                default,
+                f"{fn.__name__} config should default to None, got {default}",
+            )
+
+    def test_fetch_i2p_accepts_config(self):
+        """fetch_i2p function signature includes config parameter."""
+        import inspect
+        sig = inspect.signature(fetch_i2p)
+        self.assertIn("config", sig.parameters)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -268,17 +268,16 @@ def reset_state() -> None:
 
 def _probe_ollama(url: str) -> bool:
     """Return True if an Ollama instance responds at *url*."""
-    import json as _json
     import urllib.request as _urllib
-    import urllib.error as _urllib_error
+
+    # Derive /api/tags endpoint from the configured URL.
+    base = url.replace("/api/generate", "").rstrip("/")
+    tags_url = base + "/api/tags"
 
     try:
-        req = _urllib.Request(
-            url.replace("/api/generate", "/api/tags") + ("/api/tags" if "/api/" not in url else ""),
-            method="GET",
-        )
+        req = _urllib.Request(tags_url, method="GET")
         with _urllib.urlopen(req, timeout=3) as r:
-            data = _json.loads(r.read().decode())
-            return isinstance(data, dict)
+            data = r.read()
+            return isinstance(data, bytes) and len(data) > 0
     except Exception:
         return False

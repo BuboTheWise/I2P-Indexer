@@ -21,7 +21,7 @@ Stores the result of each probe attempt. One row per fetch — retries over time
 | `via_method` | TEXT | Yes | `''` | Path that succeeded: `'b32'`, `'dns'`, or `'b32+dns'` |
 | `content_type` | TEXT | Yes | `''` | Content bucket label (e.g., `"forum"`, `"news site"`) |
 | `content_summary` | TEXT | Yes | `''` | Sentence-length description of page content. Non-English summaries are annotated with `[detected_language: XX (LanguageName)]` prefix for auditability. |
-| `detected_lang` | TEXT | Yes | `'en'` | ISO 639-1 language code detected by `langid` (e.g., `de`, `ja`, `ru`). Defaults to `en` when detection fails or text is too short. Enables structured filtering of non-English destinations. |
+| `detected_lang` | TEXT | Yes | `''` (SQL) / `en` (runtime) | ISO 639-1 language code detected by `langid` (e.g., `de`, `ja`, `ru`). Runtime returns `en` as fallback on detection failure or text too short. Re-probes always re-detect — language drift is auto-corrected on the next sweep pass. |
 | `content_hash` | TEXT | Yes | `''` | SHA-256 hash of response body for change detection |
 | `last_modified` | TEXT | Yes | `''` | HTTP `Last-Modified` header value (if present) |
 | `found_links` | TEXT | Yes | `'[]'` | JSON array of `.i2p` hostnames found in page content |
@@ -208,7 +208,7 @@ A site probed via both `test.i2p` and its raw b32 address appears as two rows �
 
 **Cross-probe coalescing:** `b32_addr` and `i2p_dns_name` are aggregated across all probe modes (`b32` and `dns`) using SQL window functions (`MAX(...) OVER (PARTITION BY ...)`). This means even if the most recent probe is DNS-only, the row still carries the b32 address from an earlier b32-mode probe — and vice versa. Every reachable site in the view has both identifiers populated.
 
-### Columns (24 total) — human-readable first, technical at end
+### Columns (28 total) — human-readable first, technical at end
 
 | Column | Source | Description |
 |---|---|---|
@@ -220,7 +220,7 @@ A site probed via both `test.i2p` and its raw b32 address appears as two rows �
 | `deep_site_type` | JSONEXTRACT on `deep_analysis` | LLM-classified site type (e.g., `"news site"`, `"forum"`) |
 | `deep_purpose` | JSONEXTRACT on `deep_analysis` | LLM-generated purpose summary (truncated to 200 chars) |
 | `deep_analyzed_at` | correlated subquery | Timestamp of most recent deep analysis run (`MAX(probed_at)` where `deep_analysis IS NOT NULL`) |
-| `detected_lang` | discoveries (latest) | ISO 639-1 language code — empty string for English/undetermined |
+| `detected_lang` | discoveries (latest) | ISO 639-1 language code. **Updated on every re-probe** — language drift is auto-detected; sites that change language are picked up by the translation pipeline without manual intervention |
 | `ident_hash_hex` | discoveries → routers/leasesets join | SHA-1 destination hash |
 | `b32_addr` | window coalesce across probes | Base32 address — always populated if any probe resolved it |
 | `status_code` | discoveries (latest) | HTTP status code or 0 |
@@ -234,12 +234,14 @@ A site probed via both `test.i2p` and its raw b32 address appears as two rows �
 | `found_links` | discoveries (latest) | JSON array of `.i2p` hostnames |
 | `flags` | discoveries (latest) | JSON array of analysis notes (robots.txt, tech stack, etc.) |
 | `needs_review` | discoveries (latest) | Boolean flag for destinations flagged for manual review |
+| `interest_score` | JSONEXTRACT on `deep_analysis` | Integer 1–5 from LLM analysis indicating overall site importance/priority |
+| `interest_reasons` | JSONEXTRACT on `deep_analysis` | JSON array of reasons the LLM assigned the interest score |
+| `content_depth` | computed | Numeric metric combining found link count and body length — rough proxy for content richness |
+| `stability_index` | `routers` × `leasesets` × response_time | Composite reachability score: `(bandwidth_kbps × num_leases) / (response_time + 1)` |
 | `deep_analysis` | discoveries (latest) | Full JSON payload from LLM deep analysis pass |
 | `bandwidth_kbps` | routers (LEFT JOIN) | Advertised bandwidth |
 | `router_caps` | routers (LEFT JOIN) | Capability string (e.g., `"fR4"`) |
 | `num_leases` | leasesets (LEFT JOIN) | Active lease count |
-
-**(TODO — pending kanban t_bb57910d:** add `source` and `source_site` from targets table for provenance tracing in the web UI.)
 
 **Browse UI features (v0.4.6+):**
 - Clickable "Visit" links (`dns_name` and `b32_addr`) in expanded detail panels — open I2P destinations directly when browser proxy is configured.

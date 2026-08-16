@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 _detected: str | None = None
 _detect_error: bool = False
+_detect_error_time: float = 0.0
+_DETECT_COOLDOWN_S: float = 60.0  # reset error latch after 60s
 
 
 def _detect_langid(text: str) -> Tuple[str, float]:
@@ -56,8 +58,15 @@ def detect_language(
 
     On failure (library unavailable, empty text) returns ``('en', 1.0)``
     so the sweeper never hangs — it just treats everything as English.
+
+    Transient errors auto-reset after _DETECT_COOLDOWN_S so a single
+    langid glitch doesn't poison the entire probe run forever.
     """
-    global _detect_error
+    global _detect_error, _detect_error_time
+
+    # Auto-clear stale error latch
+    if _detect_error and time.time() - _detect_error_time >= _DETECT_COOLDOWN_S:
+        _detect_error = False
 
     if _detect_error:
         return ("en", 1.0)
@@ -82,8 +91,9 @@ def detect_language(
         # Low confidence → assume English to be safe
         return ("en", min(0.4, max(0.1, -conf / 100)))
     except Exception:
-        logger.info("langid detection failed, assuming English")
+        logger.debug("langid detection failed once, will retry after cooldown")
         _detect_error = True
+        _detect_error_time = time.time()
         return ("en", 1.0)
 
 
@@ -258,6 +268,7 @@ def reset_state() -> None:
     """Reset global state for test isolation."""
     global _detect_error, _ollama_error, _ollama_error_time
     _detect_error = False
+    _detect_error_time = 0.0
     _ollama_error = False
     _ollama_error_time = 0.0
 

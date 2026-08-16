@@ -559,12 +559,15 @@ def main():
     from src.config import I2PConfig
 
     # ── Real sweep ───────────────────────
+    from src.config import OllamaConfig
+
     cfg = I2PConfig(
         http_host=args.i2p_host,
         http_port=args.i2p_http_port,
         socks_port=args.i2p_socks_port,
-        ollama_url=args.ollama_url,
+        ollama=OllamaConfig(ollama_url=args.ollama_url or ""),
     )
+
 
     effective_timeout = integration_module.PROBE_TIMEOUT
     if args.respect_robots:

@@ -1284,7 +1284,7 @@ class DiscoveryDB:
                        response_time=excluded.response_time,
                        via_method=excluded.via_method,
                        content_type=excluded.content_type,
-                       detected_lang=COALESCE(NULLIF(excluded.detected_lang, ''), detected_lang),
+                       detected_lang=excluded.detected_lang,
                        content_summary=excluded.content_summary,
                        content_hash=excluded.content_hash,
                        last_modified=excluded.last_modified,

@@ -11,13 +11,16 @@ Key capabilities:
 - **Dual-mode discovery**: falls back to `.i2p` DNS names and reports which path succeeded
 - **Plugin-based content extraction**: modular extractors in `src/ext_plugins/` auto-loaded at startup; analyzer tool generates new extractors for unclassified sites
 - **Persistent SQLite store**: survival across runs; supports post-hoc analysis via LLM/manual tagging
+- **Language detection & translation**: automatic `langid` detection per probe with Ollama-based English translation pipeline
 - **Addressbook parsing**: reads `.rtr` and `.ls64` binary files from the I2P `netdb/` directory
+- **SUSI-compliant export**: generates router-importable `hosts.txt` alongside browsable HTML address book
 
 ## Requirements
 
 | Component | Version |
 |---|---|
 | Python | 3.11+ |
+| uv | recommended (or `pip`) |
 | httpx | 0.28.x |
 | PySocks | 1.7.x |
 | protobuf | ≥5.29.0 |
@@ -29,6 +32,11 @@ A running I2P router daemon (e.g., in Docker) is required as an **immutable depe
 
 ```bash
 cd "I2P-Indexer"
+
+# Option 1: uv (recommended)
+uv sync
+
+# Option 2: venv + pip
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -44,26 +52,32 @@ Verify the proxy backend:
 
 ### Configuration
 
-All endpoints default to `localhost` — override only if your router or Ollama runs elsewhere. Parameters are managed through `I2PConfig` in `src/config.py`:
+All endpoints default to `127.0.0.1` — override only if your router or Ollama runs elsewhere. Parameters are managed through `I2PConfig` and nested `OllamaConfig` in `src/config.py`:
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `host` | `localhost` | I2P router bind address |
-| `socks_port` | `7656` | SOCKS5 proxy for outbound traffic |
-| `http_port` | `4444` | HTTP proxy (primary fetch path) |
-| `sam_port` | `9025` | SAM API for controlled tunnel creation |
-| `webconsole_port` | `7657` | Router web console (address book parsing) |
-| Ollama URL | `http://localhost:11434` | Local translation endpoint |
+| `http_host` / `http_port` | `127.0.0.1` / `4444` | HTTP proxy (primary fetch path) |
+| `socks_host` / `socks_port` | `127.0.0.1` / `7656` | SOCKS5 proxy for outbound traffic |
+| `sam_host` / `sam_port` | `127.0.0.1` / `9025` | SAM API (not exposed by all daemons) |
+| `webconsole_host` / `webconsole_port` | `127.0.0.1` / `7657` | Router web console (address book parsing) |
+| `ollama.ollama_url` | `""` (disabled) | Local Ollama endpoint for translation/analysis |
+| `ollama.model` | `llama3.2` | Default model in config (runtime defaults override below) |
 
-Override in code when your router or Ollama runs elsewhere:
+Override in code:
+
 ```python
-from src.config import I2PConfig
+from src.config import I2PConfig, OllamaConfig
 
+# Nested config (primary pattern)
 cfg = I2PConfig(
-    http_host="otherhost", http_port=8080,
-    socks_port=9050,
-    ollama_url="http://otherhost:11434"
+    http_host="192.168.1.50", socks_port=9050,
+    ollama=OllamaConfig(ollama_url="http://192.168.1.50:11434"),
 )
+
+# Backward-compat: flat ollama_url property still works after construction
+cfg = I2PConfig()
+cfg.ollama_url = "http://other-host:11434"  # sets cfg.ollama.ollama_url
+cfg.ollama_enabled                        # True/False delegation
 ```
 
 ## Usage
@@ -71,30 +85,10 @@ cfg = I2PConfig(
 ### Quick start
 
 ```python
-from src.integration import discover_addresses, print_report
-
-results = discover_addresses()          # probes the built-in target list
-print_report(results)
-```
-
-Output:
-```
-======================================================================
-  I2P DISCOVERY RESULTS
-  Total: 3 | Reachable: 2 | Dead: 1
-======================================================================
-  [OK]     [dns]  i2p-projekt.i2p                           status=200    body=21063     time=5.4s  forum  "I2P - The Invisible Internet..."
-  [OK]     [dns]  mail.i2pmail.org                          status=200    body=6528      time=11.3s marketplace  "i2pmail.org - I2P Mail Relay..."
-  [DOWN]   [b32]  7flwhni4icu67drmltr5dhkd5shf6ehj.b32.i2p  status=0      body=0         time=0.6s
-```
-
-### Inspect results
-
-```python
 from src.integration import get_address_book, print_address_book
 
-entries = get_address_book()          # one row per identity from the DB
-print_address_book(entries)           # human-readable table
+entries = get_address_book()               # one row per identity from the DB
+print_address_book(entries)                # human-readable table
 ```
 
 Output:
@@ -118,8 +112,8 @@ Targets live in the **`targets` table**, not in Python code. Seed them programma
 ```python
 from src.integration import upsert_target
 
-upsert_target("A3B2C1D0E5F4...", "my-secure-forum.i2p")  # hash + dns -> b32-first
-upsert_target("", "other-site.i2p")                       # DNS-only fallback
+upsert_target("A3B2C1D0E5F4...", "my-secure-forum.i2p")   # hash + dns -> b32-first
+upsert_target("", "other-site.i2p")                         # DNS-only fallback
 ```
 
 ### Sweep filters (--sweep-filter)
@@ -143,17 +137,15 @@ python3 probe_sweep.py --import-export data/address_book_export.txt
 ```
 
 The `--proxy` flag selects which I2P backend handles the HTTP requests:
+
 | Flag value | Backend |
 |---|---|
 | `http-proxy` (default) | Connects to the I2P router's **HTTP proxy** (default port 4444). The primary fast path — uses Python's `urllib.request` with a `ProxyHandler`. |
 | `socks5` | Connects through the router's **SOCKS5 proxy** (default port 7656). Requires `PySocks`; monkey-patches `socket.socket` for each request. Useful when HTTP proxy is unavailable but SOCKS5 works. |
 
-Output:
-
-
 ## Content analysis
 
-Every successful fetch classifies the page into a content bucket and generates a summary. Buckets are detected offline via keyword matching (no LLM needed at probe time). Later passes can re-classify with an LLM by updating `content_type` / `content_summary` on disk:
+Every successful fetch classifies the page into a content bucket and generates a summary. Buckets are detected offline via keyword matching (no LLM needed at probe time):
 
 | Bucket | Keywords |
 |---|---|
@@ -222,7 +214,11 @@ This creates a self-healing cycle: sweep finds gaps → analyzer probes and gene
 
 ### Language Detection
 
-Every probe automatically detects the page's language using `langid` (~1 MB CPU model, zero network traffic). Non-English pages get an `[detected_language: XX (LanguageName)]` tag in their summary for auditability. No LLM or proxy call is made at probe time — detection runs locally and synchronously alongside content extraction.
+Every probe automatically detects the page's language using `langid` (~1 MB CPU model, zero network traffic). Results are stored in the `detected_lang` column (ISO 639-1 code) in the SQLite database. Non-English pages get a `[detected_language: XX (LanguageName)]` tag in their summary for auditability.
+
+**Language drift detection on re-probe:** When a site is re-probed, fresh content is passed through `langid` again and `detected_lang` is updated — even if the stored language was correct previously. This means sites that change language (e.g., from Finnish to German) are automatically detected on the next sweep, and the translation pipeline picks them up without manual intervention.
+
+Detection failures are transient: a single `langid` error temporarily falls back to English for that row but resets after 60 seconds — it does **not** poison the rest of the probe run.
 
 ### Local Deep Analysis with Ollama (decoupled)
 
@@ -238,67 +234,91 @@ python3 src/deep_analysis.py --mode stale
 # Only sites that have never been analyzed
 python3 src/deep_analysis.py --mode never_analyzed
 
-# Limit to 20 sites, override model
-python3 src/deep_analysis.py --mode reachable --limit 20 --ollama-model qwen3:8b
+# Limit to 20 sites, override model and Ollama endpoint
+python3 src/deep_analysis.py --mode reachable --limit 20 \
+    --ollama-url http://other-host:11434 --model qwen3:8b
 ```
 
-Default model is `RogerBen/HY-MT2-1.8B:latest`. Override via `--ollama-model` CLI flag or `LLM_MODEL` environment variable. Prompt lives in `analysis_prompt.txt` at the project root — edit it directly to change extracted fields.
+Default model is `RogerBen/HY-MT2-1.8B:latest` (~1 GB memory footprint). Override via `--model` CLI flag or `OLLAMA_MODEL` environment variable. Prompt lives in `analysis_prompt.txt` at the project root — edit it directly to change extracted fields.
+
+Results are stored as JSON in `discoveries.deep_analysis` and exposed through the `address_book` view as `deep_site_type`, `deep_purpose`, `interest_score`, `interest_reasons`.
 
 ### Local Translation with Ollama (decoupled)
 
 Translation runs as a **separate step** after probing, via `translate_summaries.py`. This prevents translation latency from blocking the sweep worker and lets you target specific languages:
 
 ```bash
-# Translate all pending non-English summaries (default Ollama on localhost:11434)
-python3 translate_summaries.py
+# Translate all pending non-English summaries (required --ollama-url flag)
+python3 translate_summaries.py --ollama-url http://localhost:11434
 
 # Dry-run: see what would be translated without making changes
-python3 translate_summaries.py --dry-run
+python3 translate_summaries.py --ollama-url http://localhost:11434 --dry-run
 
 # Target a specific language only (regional pipelines)
-python3 translate_summaries.py --lang de
+python3 translate_summaries.py --ollama-url http://localhost:11434 --lang de
 
-# Use a custom Ollama endpoint
-python3 translate_summaries.py --ollama-url http://other-host:11434
+# Limit to 20 entries, custom timeout
+python3 translate_summaries.py --ollama-url http://localhost:11434 \
+    --limit 20 --timeout 60
 ```
 
-Requires **Ollama** running locally with `RogerBen/HY-MT2-1.8B:latest` (~1GB VRAM). Translated summaries preserve original text as `[original: ...]` for auditability. Already-translated entries are skipped (idempotent). All translation stays on-device — no content leaves the host (NFR-07).
+Requires **Ollama** running locally with `RogerBen/HY-MT2-1.8B:latest` (~1 GB VRAM). Translated summaries preserve original text as `[original: ...]` for auditability. Already-translated entries are skipped (idempotent). All translation stays on-device — no content leaves the host.
+
+Translation uses a **300-second cooldown** after Ollama errors before retrying, with up to 3 retry attempts per request. Failed translations leave originals intact — they'll be picked up on the next run.
 
 ### Layered Pipeline (cron-ready)
 
 Orchestrate all steps in one script (`pipeline.sh`):
 
 ```bash
-# Full pipeline: sync addressbook, probe, translate, analyze, extract, export
+# Full pipeline: sync addressbook, probe all, translate, analyze, extractors dry-run, export
 bash pipeline.sh full
 
-# Daily refresh: reachable sweep + translate + analyze + export
+# Daily refresh: reachable sweep + translate + analysis + export
 bash pipeline.sh daily
 
-# Stale catch-up: re-probe old sites + re-analyze
+# Stale catch-up: re-probe old sites + translate + re-analyze
 bash pipeline.sh stale
 
 # Run individual layers
 bash pipeline.sh probe-all
+bash pipeline.sh probe-reach
+bash pipeline.sh probe-new
+bash pipeline.sh probe-stale [HOURS]
 bash pipeline.sh analyze
+bash pipeline.sh re-analyze
 bash pipeline.sh translate
-bash pipeline.sh export /var/www/eepsite
+bash pipeline.sh extractors-dry       # preview only
+bash pipeline.sh extractors           # write to disk
+bash pipeline.sh export [DIR]         # generate HTML + hosts.txt
 
-# Verbose mode — stream per-site progress to terminal
+# Verbose mode — stream per-site progress to terminal with live timestamps
 bash pipeline.sh daily -v
+bash pipeline.sh probe-reach -v
 ```
 
-All configuration (delays, limits, Ollama URL, output dir) is in variables at the top of `pipeline.sh`. See [CRON_SCHEDULING.md](docs/CRON_SCHEDULING.md) for scheduling with system cron or kanban.
+**Pipeline layers:**
+
+| Layer | Action | Description |
+|---|---|---|
+| L1 | `probe-*` | Network reachability sweep (stale/reachable/new/all filters) |
+| L2 | `translate` | Translate non-English summaries via Ollama |
+| L3 | `analyze` / `re-analyze` | Deep LLM analysis of site content |
+| L4 | `extractors-dry` / `extractors` | Generate extractors for flagged sites |
+| L5 | `export` | Generate browsable HTML + SUSI hosts.txt |
+
+All configuration (delays, limits, Ollama URL, output dir) is in variables at the top of `pipeline.sh`. Verbose mode (`-v`) shows pre-flight target counts and streams live `[step] [x/y]` progress to stderr. Logs accumulate in `./logs/`.
 
 ### Website / Eepsite Export
 
-Export the address book as static files for hosting on your I2P proxy:
+Export the address book as static files for I2P hosting:
 
 ```bash
-python3 probe_sweep.py export
+# Via pipeline.sh (recommended — uses configured DB and output dir)
+bash pipeline.sh export [DIR]
 
-# Custom output location and database
-python3 probe_sweep.py export --output-dir /var/www/eepsite --db-path indexer.db
+# Direct probe_sweep.py invocation
+python3 probe_sweep.py export --output-dir /var/www/eepsite --db indexer.db
 ```
 
 This produces three files in the output directory:
@@ -306,8 +326,14 @@ This produces three files in the output directory:
 | File | Purpose |
 |---|---|
 | `index.html` | Landing page with links to all exports and project documentation. |
-| `address_book.html` | Self-contained HTML page with a dark-themed sortable grid, filtering, pagination, timeline, and per-entry detail panels with clickable I2P URLs. Embeds all address book rows as JSON — suitable for browsing on any static server or I2P eepsite hosting. Typical size 1–1.5 MB depending on dataset. |
-| `hosts.txt` | Plain text host list in strict SUSI DNS export format (`NAME=base64_blob`). Each entry gets a comment line with the b32 address reference only — no probe timestamps or status tags. Importable by I2P routers and other tools. Typical size 100–400 KB. |
+| `address_book.html` | Self-contained HTML page with a dark-themed sortable grid, filtering, pagination, timeline, and per-entry detail panels with clickable I2P URLs. Embeds all address book rows as JSON — suitable for browsing on any static server or I2P eepsite hosting. Typical size 1–1.5 MB depending on dataset. |
+| `hosts.txt` | Plain text host list in strict SUSI DNS export format (`DNS_NAME=base64_blob`). Each entry preceded by a comment line with b32 address reference. Importable by I2P routers and other tools. Typical size 100–400 KB. |
+
+The export format follows SUSI DNS conventions:
+```
+# dns_name: addr.b32.i2p
+dns_name=base64_destination_blob_or_empty
+```
 
 The `website/` directory is in `.gitignore` — generated files are never version controlled.
 
@@ -315,21 +341,41 @@ The `website/` directory is in `.gitignore` — generated files are never versio
 
 ```
 src/                    ← core library
-  models.py             ← dataclasses: RouterInfo, LeaseSetInfo, DestinationEntry
-  addressbook.py        ← AddressBookCatalog: scan netdb, parse .rtr/.ls64
-  config.py             ← I2PConfig: proxy endpoints and ports
-  i2p_proxy.py          ← ProxyClient + SAM Client + fetch_i2p() helper
-  integration.py        ← probe loop, SQLite store, content classification
-  extractors.py         ← BaseExtractor interface, registry, plugin discovery
-  translation.py        ← Language detection (langid), tagging, Ollama translate
+  config.py             ← I2PConfig + nested OllamaConfig, port validation
+  i2p_proxy.py          ← ProxyClient, SAM Client, probe_health(), fetch_i2p()
+  integration.py        ← DiscoveryDB: SQLite schema, upserts, address_book view, probes
+  extractors.py         ← BaseExtractor interface, registry, plugin auto-discovery
+  translation.py        ← langid detection (transient error latch), Ollama translate_to_english()
   deep_analysis.py      ← LLM-powered site analysis (interest_score, purpose, sections)
   analyzer.py           ← Feedback loop: probes flagged sites, generates extractors
-  export_website.py     ← HTML/TXT generators for I2P eepsite hosting
+  export_website.py     ← HTML browse UI + SUSI hosts.txt generators
+  models.py             ← dataclasses: RouterInfo, LeaseSetInfo, DestinationEntry
+  addressbook.py        ← AddressBookCatalog: scan netdb, parse .rtr/.ls64
   ext_plugins/          ← auto-discovered extractor modules (gitignored)
-probe_sweep.py          ← CLI entry point: sweep, export, target management
-translate_summaries.py  ← CLI entry point: batch-translate non-English summaries
-pipeline.sh             ← Layered cron orchestrator (sync → probe → translate → analyze → export)
-tests/                  ← unit + integration tests (~821 cases)
+probe_sweep.py          ← CLI entry point: sweep with filters, export, target import/export
+translate_summaries.py  ← CLI entry point: batch-translate non-English summaries via Ollama
+pipeline.sh             ← Layered cron orchestrator (5 layers, pre-flight counts, verbose streaming)
+analysis_prompt.txt     ← Editable prompt template for deep analysis LLM calls
+tests/                  ← unit + integration tests (~818 cases)
+docs/                   ← architecture, schema reference, design decisions
+```
+
+**Probe strategy:** B32-first — probes `*.b32.i2p` directly via identity hash. Falls back to DNS only when B32 fails or no hash exists. Reduces probe time by skipping 60s DNS timeouts on dead targets.
+
+### Adaptive backoff
+
+After every probe, `consecutive_failures` and `backoff_until` are updated. On failure the target is excluded from sweeps for an exponentially growing interval:
+
+| Consecutive failures | Backoff |
+|---|---|
+| 1 | 60 seconds |
+| 2 | 5 minutes |
+| 3 | 30 minutes |
+| 4 | 2 hours |
+| 5 | 12 hours |
+| ≥6 | 7 days (hard cap) |
+
+Use `--no-backoff` or `skip_backoff=False` to force-probe everything. Sweep ordering prioritizes previously reachable → valid b32 → oldest probes first.
 
 ### Verbose Mode
 
@@ -341,17 +387,13 @@ Add `-v` to any pipeline action to stream live, per-site progress to your termin
 ```
 
 The script reports version, pre-flight target counts (from SQLite), and each site's probe/analysis status in real time. Logs are written to `./logs/<step>.log` for post-mortem review.
-docs/                   ← architecture, schema reference, design decisions
-```
-
-**Probe strategy:** B32-first — probes `*.b32.i2p` directly via identity hash. Falls back to DNS only when B32 fails or no hash exists. Reduces probe time by skipping 60s DNS timeouts on dead targets.
 
 ## Testing
 
 ```bash
-pytest tests/                          # full suite (~204 tests)
-pytest -v                              # verbose mode with live proxy connectivity checks
-pytest tests/smoke_test.py -v          # live I2P smoke test (requires running proxy)
+python3 -m pytest tests/                   # full suite (~818 cases)
+python3 -m pytest -v                       # verbose mode with live proxy checks
+python3 -m pytest tests/smoke_test.py -v   # live I2P smoke test (requires running proxy)
 ```
 
 ### Live Smoke Testing
@@ -359,13 +401,13 @@ pytest tests/smoke_test.py -v          # live I2P smoke test (requires running p
 The `tests/smoke_test.py` suite probes historically reachable `.i2p` sites through the I2P proxy to verify the full pipeline (probe → extract → classify) works end-to-end:
 
 ```bash
-# Run live smoke tests against 5 known targets
+# Run live smoke tests against known targets
 python -m pytest tests/smoke_test.py -v --tb=short
 
 # Expected output:
-# tests/smoke_test.py::TestSmokeProbe::test_at_least_one_target_reachable PASSED
-# tests/smoke_test.py::TestSmokeProbe::test_successful_probe_produces_extraction PASSED
-# tests/smoke_test.py::TestSmokePipelineIntegration::test_extractors_dont_crash_on_html PASSED
+# test_at_least_one_target_reachable PASSED
+# test_successful_probe_produces_extraction PASSED
+# test_extractors_dont_crash_on_html PASSED
 ```
 
 Targets are in `tests/smoke_targets.json` and should be refreshed **monthly** as I2P eepsite availability changes. The smoke test accepts that some targets may be temporarily unreachable — it only requires at least 1 to verify the pipeline works without crashes.

@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -463,6 +464,48 @@ class TestMarkdownFenceStripping:
         text = '```json\n{\n  "site_type": "forum",\n  "purpose": "discussion"\n}\n```'
         result = deep_strip_md(text)
         assert '"site_type"' in result and '"purpose"' in result
+
+
+class TestInterestScoreInteger:
+    """Ensure interest_score values stored in DB are plain integers, not strings."""
+
+    def test_interest_score_is_integer(self):
+        """interest_score must be an integer, not '5/10' or similar string."""
+        import sqlite3
+
+        db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        conn = sqlite3.connect(db.name)
+        cur = conn.cursor()
+
+        cur.execute(
+            "CREATE TABLE discoveries ("
+            "ident_hash_hex TEXT NOT NULL, "
+            "b32_addr TEXT NOT NULL DEFAULT '', "
+            "i2p_dns_name TEXT NOT NULL DEFAULT '', "
+            "probe_mode TEXT NOT NULL DEFAULT '', "
+            "reachable INTEGER NOT NULL DEFAULT 0, "
+            "title TEXT DEFAULT '', "
+            "content_summary TEXT DEFAULT '', "
+            "deep_analysis TEXT DEFAULT '', "
+            "probed_at REAL NOT NULL DEFAULT 0)"
+        )
+        # Insert with interest_score stored as JSON integer
+        cur.execute(
+            "INSERT INTO discoveries (ident_hash_hex, probe_mode, deep_analysis, reachable, title, probed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("hash_int", "dns", '{"site_type": "wiki", "interest_score": 7, "purpose": "knowledge"}', 1, "Test", time.time()),
+        )
+        conn.commit()
+
+        parsed = json.loads(cur.execute(
+            "SELECT deep_analysis FROM discoveries WHERE ident_hash_hex = ?",
+            ("hash_int",),
+        ).fetchone()[0])
+
+        assert isinstance(parsed["interest_score"], int), (
+            f"interest_score must be int, got {type(parsed['interest_score'])}: {parsed['interest_score']}"
+        )
+        conn.close()
 
 
 if __name__ == "__main__":

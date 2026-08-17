@@ -48,6 +48,7 @@ LOGDIR="./logs"
 
 VERBOSE=false
 ACTION="${1:-help}"
+LIMIT_NEXT=false
 for arg in "$@"; do
     [ "$arg" = "-v" ] && VERBOSE=true
     # Support --limit N as runtime override for analyze/translate batches
@@ -193,7 +194,7 @@ translate_summaries() {
     local LIMIT_ARG=""
     if [ "$TRANSLATE_LIMIT" -gt 0 ]; then
         LIMIT_STR="limit=${TRANSLATE_LIMIT}"
-        LIMIT_ARG="--limit \"$TRANSLATE_LIMIT\""
+        LIMIT_ARG="--limit $TRANSLATE_LIMIT"
     else
         LIMIT_STR="all pending"
     fi
@@ -225,7 +226,7 @@ analyze_reachable() {
     local LIMIT_ARG=""
     if [ "$ANALYSIS_LIMIT" -gt 0 ]; then
         LIMIT_STR="limit=${ANALYSIS_LIMIT}"
-        LIMIT_ARG="--limit \"$ANALYSIS_LIMIT\""
+        LIMIT_ARG="--limit $ANALYSIS_LIMIT"
     else
         LIMIT_STR="all pending"
     fi
@@ -240,7 +241,7 @@ analyze_stale() {
     local LIMIT_ARG=""
     if [ "$ANALYSIS_LIMIT" -gt 0 ]; then
         LIMIT_STR="limit=${ANALYSIS_LIMIT}"
-        LIMIT_ARG="--limit \"$ANALYSIS_LIMIT\""
+        LIMIT_ARG="--limit $ANALYSIS_LIMIT"
     else
         LIMIT_STR="all pending"
     fi

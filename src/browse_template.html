@@ -268,7 +268,7 @@ function interestBadge(v){
   else if(v<=6){bg='#b8860b';color='#fff'}
   else if(v<=8){bg='#2e7d32';color='#fff'}
   else{bg='#00c853';color='#fff'}
-  return`<span style="display:inline-block;padding:1px 6px;border-radius:3px;background:${bg};color:${color};font-size:11px;font-weight:bold">${v}/10</span>`;
+  return`<span style="display:inline-block;padding:1px 6px;border-radius:3px;background:${bg};color:${color};font-size:11px;font-weight:bold">${v}</span>`;
 }
 function tryJson(v){try{return JSON.parse(v)}catch{if(typeof v==='object'&&v!==null)return v;return[]}}
 

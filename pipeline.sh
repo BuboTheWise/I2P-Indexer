@@ -21,6 +21,29 @@ OUTPUT_DIR="/root/I2P/webroot"
 # Ollama API endpoint (local LM for translation and deep analysis)
 OLLAMA_URL="http://localhost:11434"
 
+# LLM-powered extractor generation (OPTIONAL — defaults disabled)
+#
+# When enabled, the analyzer sends fingerprint data + HTML sample to an
+# Ollama-compatible endpoint and uses the returned Python code instead of
+# the heuristic template. This produces far better extractors but REQUIRES
+# a code-capable model.
+#
+# MODEL REQUIREMENTS:
+#   - The model MUST be able to generate valid Python code that subclasses
+#     BaseExtractor with can_handle() and extract() methods.
+#   - Minimum recommended: qwen2.5-coder:3b (~2GB, CPU-friendly)
+#   - Better results: qwen2.5-coder:7b or deepseek-coder-v2-light:16b-a14b
+#   - General-purpose models (llama3, mistral, HY-MT2) will NOT produce usable
+#     extractors — they lack code generation training and will waste tokens.
+#   - Generation timeout is 120s to account for long code output.
+#
+# To enable: set both URL and MODEL below (or pass --generator-url /
+# --generator-model on the analyzer CLI). When either is empty, the
+# heuristic template is used with no Ollama calls.
+
+EXTRACTOR_GENERATOR_URL=""        # e.g. "http://localhost:11434" (empty = disabled)
+EXTRACTOR_GENERATOR_MODEL=""      # e.g. "qwen2.5-coder:3b" (empty = disabled)
+
 # Seconds between each probe request during full sweeps
 PROBE_DELAY=8
 
@@ -271,12 +294,16 @@ generate_extractors() {
     local CONFIRM="${1:-dry-run}"
     local TOTAL
     TOTAL=$(_extractor_count)
+    local GEN_ARGS=""
+    if [ -n "$EXTRACTOR_GENERATOR_URL" ] && [ -n "$EXTRACTOR_GENERATOR_MODEL" ]; then
+        GEN_ARGS="--generator-url $EXTRACTOR_GENERATOR_URL --generator-model $EXTRACTOR_GENERATOR_MODEL"
+    fi
     if [ "$CONFIRM" = "dry" ]; then
         log "LAYER 4: Dry-run extractor generation ($TOTAL flagged sites)"
-        run_cmd extractor_gen.log $PYTHON src/analyzer.py all-flagged
+        run_cmd extractor_gen.log $PYTHON src/analyzer.py all-flagged $GEN_ARGS
     else
         log "LAYER 4: Write extractors to disk ($TOTAL flagged sites)"
-        run_cmd extractor_gen_confirm.log $PYTHON src/analyzer.py all-flagged --confirm
+        run_cmd extractor_gen_confirm.log $PYTHON src/analyzer.py all-flagged --confirm $GEN_ARGS
     fi
 }
 

@@ -27,6 +27,7 @@ import inspect
 import json
 import logging
 import pathlib
+import urllib.request as _urllib_request
 import re
 import tempfile
 import textwrap
@@ -38,6 +39,33 @@ from typing import Any, Dict, List, NamedTuple
 from src.i2p_proxy import fetch_i2p, Response
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# LLM-powered extractor generation (optional)
+# ---------------------------------------------------------------------------
+#
+# When _GENERATOR_LLM_URL is set, the analyzer sends fingerprint data + HTML
+# sample to an Ollama-compatible endpoint and uses the returned Python code
+# instead of the heuristic template. This produces far better extractors but
+# requires a code-capable model.
+#
+# IMPORTANT — model requirements:
+#   - The model must be able to generate valid Python code that subclasses
+#     BaseExtractor with can_handle() and extract() methods.
+#   - Minimum recommended: qwen2.5-coder:3b (~2GB, CPU-friendly)
+#   - Better results: qwen2.5-coder:7b or deepseek-coder-v2-light:16b-a14b
+#   - General-purpose models (llama3, mistral, HY-MT2) will NOT produce usable
+#     extractors — they lack code generation training.
+#   - Generation timeout is ~120s to account for long code output.
+#
+# To enable, set EXTRACTOR_GENERATOR_URL and EXTRACTOR_GENERATOR_MODEL in
+# pipeline.sh or pass --generator-url / --generator-model on the CLI.
+# When unset (default), the heuristic template is used with no Ollama calls.
+# ---------------------------------------------------------------------------
+
+_GENERATOR_LLM_URL: str | None = None  # e.g. "http://localhost:11434"
+_GENERATOR_MODEL: str | None = None    # e.g. "qwen2.5-coder:3b"
+_GENERATOR_TIMEOUT: float = 120.0      # LLM code generation needs generous timeout
 
 # ---------------------------------------------------------------------------
 # Common set of paths to try
@@ -285,6 +313,182 @@ def _detect_fingerprints(body_sample: str) -> Dict[str, List[str]]:
             pass
 
     return results
+
+
+def generate_extractor_llm(
+    fingerprints: Dict[str, Any],
+    body_sample: str,
+    content_type_hint: str,
+    hostname: str = "",
+    url: str | None = None,
+    model: str | None = None,
+    max_retries: int = 2,
+) -> str | None:
+    """Generate a BaseExtractor subclass via an Ollama-compatible LLM endpoint.
+
+    Sends fingerprints + HTML sample to the LLM, extracts Python code from
+    the response, validates it, and retries with error feedback on failure.
+
+    Returns cleaned Python source on success, or None (caller falls back
+    to the heuristic template).
+    """
+    # Graceful fallback — no LLM configured
+    if not url or not model:
+        return None
+
+    # Build the prompt — give the LLM the full interface contract and analysis data
+    frameworks = fingerprints.get("frameworks", [])
+    content_types = fingerprints.get("content_types", [])
+    structural = fingerprints.get("structural", [])
+    meta_tags = fingerprints.get("meta_tags", [])
+
+    fp_summary = []
+    if frameworks:
+        fp_summary.append(f"Frameworks/CMS: {', '.join(str(f) for f in frameworks)}")
+    if content_types:
+        fp_summary.append(f"Content types detected: {', '.join(str(c) for c in content_types)}")
+    if structural:
+        fp_summary.append(f"Structural signals: {', '.join(str(s) for s in structural)}")
+    if meta_tags:
+        fp_summary.append(f"Meta tags: {', '.join(str(m) for m in meta_tags)[:500]}")
+
+    prompt = f"""You are a code generator. Produce EXACTLY ONE Python class that subclasses BaseExtractor.
+
+BaseExtractor interface contract — your class MUST implement:
+
+    from __future__ import annotations
+    import re
+    from typing import Dict, List, Tuple
+    from src.extractors import BaseExtractor
+
+    class MyExtractor(BaseExtractor):
+        priority = 80
+
+        _KNOWN_CT = "text/html"   # Best guess for the content type string
+
+        def can_handle(
+            self,
+            body_text: str,
+            headers: Dict[str, str],
+            status_code: int,
+        ) -> bool:
+            \"""Return True when this response belongs to this site/type.\"""
+            hits = 0
+            body_lower = body_text.lower()
+
+            # Check content-type header
+            ct = headers.get('Content-Type', '').lower()
+            if 'text/html' in ct or 'application/json' in ct:
+                hits += 1
+
+            # Check for fingerprint strings/patterns
+            # ... add pattern checks here ...
+
+            return hits >= 2
+
+        def extract(
+            self,
+            title: str,
+            body_text: str,
+            headers: Dict[str, str],
+        ) -> Tuple[str, List[str], List[str]]:
+            \"""Return (content_type_label, summary_lines, i2p_links).\"""
+            lines = []
+            # ... extract structured info here ...
+            links = self._find_i2p_links(body_text)
+            return self._KNOWN_CT, lines, links
+
+        @staticmethod
+        def _find_i2p_links(body_text: str) -> list[str]:
+            \"""Extract .i2p hostnames from body text.\"""
+            pat = r"([a-z0-9](?:[a-z0-9\\-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9\\-]*[a-z0-9])?)?\\.i2p)"
+            return list({{h.lower() for h in re.findall(pat, body_text[:32768], re.I)}})
+
+SITE ANALYSIS DATA:
+Hostname: {hostname}
+Content-Type hint from headers: {content_type_hint or "(none)"}
+Fingerprints detected:
+{chr(10).join(f"  - {line}" for line in fp_summary)}
+
+HTML SAMPLE (first 4096 characters):
+---SAMPLE BEGIN---
+{body_sample[:4096]}
+---SAMPLE END---
+
+Generate the extractor class now. Return ONLY valid Python code wrapped in a ```python ... ``` markdown code block. No explanation before or after the code block."""
+
+    # Attempt generation — allow retries for validation failures
+    for attempt in range(1, max_retries + 2):  # 1 initial + max_retries retries
+        if attempt > 1:
+            logger.info(
+                f"Extractor LLM retry {attempt - 1}/{max_retries} "
+                f"for {hostname or 'unknown'}"
+            )
+
+        try:
+            payload = json.dumps({
+                "model": model,
+                "prompt": prompt,
+                "options": {"num_ctx": 16384, "temperature": 0.1},
+            }).encode("utf-8")
+
+            req = _urllib_request.Request(
+                f"{url}/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with _urllib_request.urlopen(req, timeout=_GENERATOR_TIMEOUT) as resp:
+                data = json.loads(resp.read())
+
+            raw_response = data.get("response", "").strip()
+            if not raw_response:
+                logger.warning(f"Empty LLM response for {hostname or 'unknown'} (attempt {attempt})")
+                continue
+
+        except Exception as exc:
+            logger.warning(f"Extractor LLM request failed (attempt {attempt}): {exc}")
+            continue
+
+        # Extract Python code from markdown code blocks
+        code_block_match = re.search(
+            r"```python\s*(.*?)\s*```", raw_response, re.DOTALL
+        )
+        if code_block_match:
+            extracted_code = code_block_match.group(1).strip()
+        else:
+            # No markdown block — use raw response as-is
+            extracted_code = raw_response.strip()
+
+        # Validate the generated code
+        validation = validate_extractor(extracted_code, body_sample)
+
+        if validation.get("valid"):
+            logger.info(
+                f"Extractor LLM generated valid class "
+                f"'{validation.get('class_name')}' for {hostname or 'unknown'} "
+                f"in {attempt} attempt(s)"
+            )
+            return extracted_code
+
+        # Validation failed — prepare retry prompt with error feedback
+        error_msg = validation.get("error", "validation failed")
+        suggestions = validation.get("suggestions", [])
+        prompt_suffix = f"\n\nPREVIOUS ATTEMPT FAILED:\nError: {error_msg}"
+        if suggestions:
+            prompt_suffix += "\nSuggested fixes:"
+            for sug in suggestions:
+                prompt_suffix += f"\n  - {sug}"
+        prompt_suffix += "\n\nGenerate a corrected version now. Return ONLY the fixed Python code in a ```python ... ``` block."
+
+        # Append error feedback to the end of the original prompt data section
+        prompt = prompt.rstrip() + prompt_suffix
+
+    # Exhausted all retries
+    logger.warning(
+        f"Extractor LLM failed after {max_retries + 1} attempts for "
+        f"{hostname or 'unknown'} — falling back to heuristic template"
+    )
+    return None
 
 
 _GENERATOR_TEMPLATE = '''"""Auto-generated extractor: {EXTRACTOR_NAME}.
@@ -749,22 +953,33 @@ def generate_extractors_pipeline(
     timeout: float = 60.0,
     dry_run: bool = False,
     force: bool = False,
+    generator_url: str | None = None,
+    generator_model: str | None = None,
 ) -> List[PipelineResult]:
     """Iterate flagged destinations, probe each body, generate + validate extractor plugins.
 
     Workflow per destination:
         1. Fetch body via I2P proxy (dns_name preferred, fallback to b32).
          2. Use content_type hint from last probe for naming/fingerprinting.
-        3. Generate extractor skeleton with ``generate_extractor_skeleton()``.
-        4. Validate with ``validate_extractor()``.
-        5. When dry_run=True or valid=False and not force: do not write.
-        6. On success: write to ``ext_plugins/<name>_extractor.py`` and clear needs_review.
+        3. If LLM generator configured: send fingerprints + HTML sample to Ollama endpoint
+           to generate extractor code (with retry on validation failure).
+        4. Fall back to ``generate_extractor_skeleton()`` heuristic template when LLM
+           unavailable, fails, or not configured.
+        5. Validate with ``validate_extractor()``.
+        6. When dry_run=True or valid=False and not force: do not write.
+        7. On success: write to ``ext_plugins/<name>_extractor.py`` and clear needs_review.
 
     Args:
         limit: Maximum flagged destinations to process.
         timeout: Per-target probe timeout in seconds.
         dry_run: Fetch + generate but skip writing to disk.
         force: Write even when validator says can_handle() failed.
+        generator_url: Ollama-compatible API base URL for LLM-powered extractor generation
+            (e.g. "http://localhost:11434"). Requires a code-capable model like qwen2.5-coder.
+            When None or empty, uses heuristic template with no LLM calls.
+        generator_model: Ollama model name for code generation
+            (e.g. "qwen2.5-coder:3b"). Must be set alongside generator_url or LLM is skipped.
+            General-purpose models (llama3, mistral, HY-MT2) will NOT produce usable extractors.
 
     Returns:
         List of ``PipelineResult`` tuples with per-destination status.
@@ -875,12 +1090,28 @@ def generate_extractors_pipeline(
 
         ct_hint = live_ct or hint_ctype or "unknown"
 
-        # ── Generate skeleton ──
-        code = generate_extractor_skeleton(
-            sample_body=body_text,
+        # ── Generate extractor code ──
+        # Try LLM generator first (retry loop with validation feedback)
+        fingerprints = _detect_fingerprints(body_text)
+        llm_code = generate_extractor_llm(
+            fingerprints=fingerprints,
+            body_sample=body_text[:4096],
             content_type_hint=ct_hint,
-            extractor_name=classifier_name,
+            hostname=dns_name or b32_addr,
+            url=target_url,
+            model=generator_model,
         )
+
+        if llm_code:
+            code = llm_code
+            print(f"    Generated via LLM ({generator_model})")
+        else:
+            # Fall back to heuristic template
+            code = generate_extractor_skeleton(
+                sample_body=body_text,
+                content_type_hint=ct_hint,
+                extractor_name=classifier_name,
+            )
 
         code_line_count = len(code.splitlines())
         print(f"    Generated: {code_line_count} lines  →  {classifier_name}")
@@ -1123,6 +1354,12 @@ def main() -> None:
     af_p.add_argument("--dry-run", action="store_true", help="(default) Preview without writing files")
     af_p.add_argument("--confirm", action="store_true", help="Write generated extractors to disk and clear flags")
     af_p.add_argument("--force", action="store_true", help="Write even if validation fails")
+    af_p.add_argument("--generator-url", type=str, default=None,
+        help='Ollama API URL for LLM extractor generation (e.g. "http://localhost:11434"). '
+             'Requires --generator-model. Uses a code-capable model like qwen2.5-coder:3b.')
+    af_p.add_argument("--generator-model", type=str, default=None,
+        help='Ollama model name for code generation (e.g. "qwen2.5-coder:3b"). '
+             'Must be set alongside --generator-url or LLM is skipped.')
 
     # ── generate-for-flagged (legacy alias for all-flagged --confirm) ──
     gff_p = sub.add_parser("generate-for-flagged", help="[deprecated] Alias for all-flagged --confirm")
@@ -1130,6 +1367,10 @@ def main() -> None:
     gff_p.add_argument("--timeout", type=float, default=60.0, help="Per-target timeout in seconds (default: 60)")
     gff_p.add_argument("--dry-run", action="store_true", help="Generate but don't write to disk")
     gff_p.add_argument("--force", action="store_true", help="Write even if validation fails")
+    gff_p.add_argument("--generator-url", type=str, default=None,
+        help='Ollama API URL for LLM extractor generation')
+    gff_p.add_argument("--generator-model", type=str, default=None,
+        help='Ollama model name for code generation')
 
     args = p.parse_args()
 
@@ -1214,6 +1455,8 @@ def main() -> None:
             timeout=args.timeout,
             dry_run=dry,
             force=getattr(args, "force", False),
+            generator_url=getattr(args, "generator_url", None),
+            generator_model=getattr(args, "generator_model", None),
         )
 
     elif args.command == "generate-for-flagged":
@@ -1223,6 +1466,8 @@ def main() -> None:
             timeout=args.timeout,
             dry_run=getattr(args, "dry_run", False),
             force=getattr(args, "force", False),
+            generator_url=getattr(args, "generator_url", None),
+            generator_model=getattr(args, "generator_model", None),
         )
 
 

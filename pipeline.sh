@@ -30,11 +30,11 @@ PROBE_REACHABLE_DELAY=3
 # Hours threshold for "stale" catch-up (re-probe sites older than this)
 STALE_HOURS=24
 
-# Max sites to analyze per deep_analysis run (lower = shorter runs)
-ANALYSIS_LIMIT=50
+# Max sites to analyze per deep_analysis run (0 = all pending)
+ANALYSIS_LIMIT=0
 
-# Max summaries to translate per run (lower = shorter runs)
-TRANSLATE_LIMIT=50
+# Max summaries to translate per run (0 = all pending)
+TRANSLATE_LIMIT=0
 
 # Max targets for reachable-only health check (use 0 or unset for all)
 PROBE_REACHABLE_COUNT=20
@@ -50,6 +50,16 @@ VERBOSE=false
 ACTION="${1:-help}"
 for arg in "$@"; do
     [ "$arg" = "-v" ] && VERBOSE=true
+    # Support --limit N as runtime override for analyze/translate batches
+    if [ "$arg" = "--limit" ]; then
+        LIMIT_NEXT=true
+        continue
+    fi
+    if [ "$LIMIT_NEXT" = "true" ]; then
+        ANALYSIS_LIMIT="$arg"
+        TRANSLATE_LIMIT="$arg"
+        LIMIT_NEXT=false
+    fi
 done
 
 echo "pipeline.sh v${VERSION}" >&2
@@ -180,9 +190,16 @@ except Exception:
 translate_summaries() {
     local TOTAL
     TOTAL=$(_translate_count)
-    log "LAYER 2: Translate non-English summaries ($TOTAL to translate, limit=${TRANSLATE_LIMIT})"
+    local LIMIT_ARG=""
+    if [ "$TRANSLATE_LIMIT" -gt 0 ]; then
+        LIMIT_STR="limit=${TRANSLATE_LIMIT}"
+        LIMIT_ARG="--limit \"$TRANSLATE_LIMIT\""
+    else
+        LIMIT_STR="all pending"
+    fi
+    log "LAYER 2: Translate non-English summaries ($TOTAL to translate, ${LIMIT_STR})"
     run_cmd translate.log $PYTHON translate_summaries.py --ollama-url "$OLLAMA_URL" \
-        --limit "$TRANSLATE_LIMIT"
+        $LIMIT_ARG
 }
 
 ###############################################################################
@@ -205,17 +222,31 @@ except Exception:
 analyze_reachable() {
     local TOTAL
     TOTAL=$(_analyze_count)
-    log "LAYER 3: Deep analysis of reachable sites ($TOTAL to analyze, limit=${ANALYSIS_LIMIT})"
+    local LIMIT_ARG=""
+    if [ "$ANALYSIS_LIMIT" -gt 0 ]; then
+        LIMIT_STR="limit=${ANALYSIS_LIMIT}"
+        LIMIT_ARG="--limit \"$ANALYSIS_LIMIT\""
+    else
+        LIMIT_STR="all pending"
+    fi
+    log "LAYER 3: Deep analysis of reachable sites ($TOTAL to analyze, ${LIMIT_STR})"
     run_cmd analyze_reachable.log $PYTHON src/deep_analysis.py --mode reachable \
-        --limit "$ANALYSIS_LIMIT"
+        $LIMIT_ARG
 }
 
 analyze_stale() {
     local TOTAL
     TOTAL=$(_analyze_count)
-    log "LAYER 3: Re-analyze old entries ($TOTAL to analyze, limit=${ANALYSIS_LIMIT})"
+    local LIMIT_ARG=""
+    if [ "$ANALYSIS_LIMIT" -gt 0 ]; then
+        LIMIT_STR="limit=${ANALYSIS_LIMIT}"
+        LIMIT_ARG="--limit \"$ANALYSIS_LIMIT\""
+    else
+        LIMIT_STR="all pending"
+    fi
+    log "LAYER 3: Re-analyze old entries ($TOTAL to analyze, ${LIMIT_STR})"
     run_cmd analyze_stale.log $PYTHON src/deep_analysis.py --mode stale \
-        --limit "$ANALYSIS_LIMIT"
+        $LIMIT_ARG
 }
 
 ###############################################################################
@@ -296,7 +327,19 @@ run_full_pipeline() {
     CNTR=$(_translate_count)
     CNTE=$(_analyze_count)
     CNTX=$(_extractor_count)
-    log "PLAN: L1-sync($PROBE_NEW new) → L1-probe($CNT_ALL) → L2-translate($CNTR limit=${TRANSLATE_LIMIT}) → L3-analyze($CNTE limit=${ANALYSIS_LIMIT}) → L4-extract-dry($CNTX) → L5-export"
+    local LIMIT_LABEL_T=""
+    if [ "$TRANSLATE_LIMIT" -gt 0 ]; then
+        LIMIT_LABEL_T="limit=${TRANSLATE_LIMIT}"
+    else
+        LIMIT_LABEL_T="all"
+    fi
+    local LIMIT_LABEL_E=""
+    if [ "$ANALYSIS_LIMIT" -gt 0 ]; then
+        LIMIT_LABEL_E="limit=${ANALYSIS_LIMIT}"
+    else
+        LIMIT_LABEL_E="all"
+    fi
+    log "PLAN: L1-sync($PROBE_NEW new) → L1-probe($CNT_ALL) → L2-translate($CNTR ${LIMIT_LABEL_T}) → L3-analyze($CNTE ${LIMIT_LABEL_E}) → L4-extract-dry($CNTX) → L5-export"
     probe_new_imports
     probe_all
     translate_summaries
@@ -370,6 +413,10 @@ Layer commands:
   extractors      L4 — Write extractors and clear flags
 
   export [DIR]    L5 — Export address book HTML/TXT to DIR (default: \$OUTPUT_DIR)
+
+Options:
+  -v            Verbose output (stream logs to terminal)
+  --limit N     Max sites for translate/analyze layers (default: all pending)
 
 Schedule with system cron or hermes kanban:
 

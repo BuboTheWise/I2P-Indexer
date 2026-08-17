@@ -263,7 +263,7 @@ def call_ollama(
 def get_pending_analyses(
     db_path: str,
     mode: str = "reachable",
-    limit: int = 50,
+    limit: int = 0,
 ) -> List[tuple]:
     """Return targets pending deep analysis.
 
@@ -271,7 +271,7 @@ def get_pending_analyses(
         db_path: Path to indexer.db (or any SQLite DB with discoveries/targets tables)
         mode: 'reachable' (all reachable sites), 'stale' (not analyzed or >30d old),
               'never_analyzed' (deep_analysis is empty)
-        limit: Max rows to return
+        limit: Max rows to return. 0 = no limit (default).
 
     Returns:
         List of (ident_hash_hex, b32_addr, i2p_dns_name) tuples.
@@ -291,7 +291,6 @@ def get_pending_analyses(
                 ORDER BY
                     CASE WHEN LENGTH(COALESCE(d.deep_analysis, '')) = 0 THEN 0 ELSE 1 END,
                     d.probed_at DESC
-                LIMIT ?
             ) d
         """
     elif mode == "stale":
@@ -306,7 +305,6 @@ def get_pending_analyses(
                   AND (t.last_analyzed_at IS NULL OR t.last_analyzed_at = 0
                        OR t.last_analyzed_at < strftime('%s','now') - 2592000)
                 ORDER BY COALESCE(t.last_analyzed_at, 0) ASC, d.probed_at DESC
-                LIMIT ?
             ) d
         """
     elif mode == "never_analyzed":
@@ -319,13 +317,15 @@ def get_pending_analyses(
                 WHERE d.reachable = 1
                   AND (d.deep_analysis IS NULL OR LENGTH(d.deep_analysis) = 0)
               ORDER BY d.probed_at DESC
-                LIMIT ?
             ) d
         """
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
-    cur.execute(query, (limit,))
+    if limit:
+        cur.execute(query + " LIMIT ?", (limit,))
+    else:
+        cur.execute(query)
     results = cur.fetchall()
     conn.close()
     return results
@@ -387,8 +387,8 @@ def parse_args() -> argparse.Namespace:
         help="Selection mode for sites to analyze (default: reachable)",
     )
     parser.add_argument(
-        "--limit", type=int, default=50,
-        help="Max sites to process per run (default: 50)",
+        "--limit", type=int, default=0,
+        help="Max sites to analyze per run (0=all pending)",
     )
     parser.add_argument(
         "--ollama-url", default=_DEFAULT_OLLAMA_URL,

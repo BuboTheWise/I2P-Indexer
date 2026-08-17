@@ -225,11 +225,14 @@ Detection failures are transient: a single `langid` error temporarily falls back
 Deep analysis runs as a **separate step** after probing, via `src/deep_analysis.py`. Feeds each site's HTML body through a local LLM and extracts structured metadata (`site_type`, `purpose`, sections, `interest_score` 1-5):
 
 ```bash
-# Analyze reachable sites with missing or stale analysis
+# Analyze all reachable sites with missing or stale analysis (default: no limit)
 python3 src/deep_analysis.py --mode reachable
 
 # Re-analyze old entries (30+ days since last analysis)
 python3 src/deep_analysis.py --mode stale
+
+# Limit to 20 sites instead of processing all
+python3 src/deep_analysis.py --mode reachable --limit 20
 
 # Only sites that have never been analyzed
 python3 src/deep_analysis.py --mode never_analyzed
@@ -294,7 +297,10 @@ bash pipeline.sh export [DIR]         # generate HTML + hosts.txt
 
 # Verbose mode — stream per-site progress to terminal with live timestamps
 bash pipeline.sh daily -v
-bash pipeline.sh probe-reach -v
+
+# Limit translate/analyze layers to N sites (default: all pending)
+bash pipeline.sh daily --limit 100
+bash pipeline.sh analyze --limit 20
 ```
 
 **Pipeline layers:**
@@ -307,7 +313,7 @@ bash pipeline.sh probe-reach -v
 | L4 | `extractors-dry` / `extractors` | Generate extractors for flagged sites |
 | L5 | `export` | Generate browsable HTML + SUSI hosts.txt |
 
-All configuration (delays, limits, Ollama URL, output dir) is in variables at the top of `pipeline.sh`. Verbose mode (`-v`) shows pre-flight target counts and streams live `[step] [x/y]` progress to stderr. Logs accumulate in `./logs/`.
+All configuration (delays, limits, Ollama URL, output dir) is in variables at the top of `pipeline.sh`. By default, translate and analyze layers process **all pending** sites. Use `--limit N` on any action to cap the number of sites processed by L2/L3. Verbose mode (`-v`) shows pre-flight target counts and streams live `[step] [x/y]` progress to stderr. Logs accumulate in `./logs/`.
 
 ### Website / Eepsite Export
 

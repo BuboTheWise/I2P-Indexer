@@ -1098,7 +1098,7 @@ def generate_extractors_pipeline(
             body_sample=body_text[:4096],
             content_type_hint=ct_hint,
             hostname=dns_name or b32_addr,
-            url=target_url,
+            url=generator_url,
             model=generator_model,
         )
 

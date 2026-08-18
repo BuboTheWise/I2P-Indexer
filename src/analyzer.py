@@ -429,6 +429,7 @@ Generate the extractor class now. Return ONLY valid Python code wrapped in a ```
             payload = json.dumps({
                 "model": model,
                 "prompt": prompt,
+                "stream": False,
                 "options": {"num_ctx": 16384, "temperature": 0.1},
             }).encode("utf-8")
 

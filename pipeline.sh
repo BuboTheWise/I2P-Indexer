@@ -69,11 +69,13 @@ LOGDIR="./logs"
 # INTERNAL — parse arguments, initialize venv and directories
 ###############################################################################
 
+FORCE=false
 VERBOSE=false
 ACTION="${1:-help}"
 LIMIT_NEXT=false
 for arg in "$@"; do
     [ "$arg" = "-v" ] && VERBOSE=true
+    [ "$arg" = "--force" ] && FORCE=true
     # Support --limit N as runtime override for analyze/translate batches
     if [ "$arg" = "--limit" ]; then
         LIMIT_NEXT=true
@@ -298,6 +300,9 @@ generate_extractors() {
     if [ -n "$EXTRACTOR_GENERATOR_URL" ] && [ -n "$EXTRACTOR_GENERATOR_MODEL" ]; then
         GEN_ARGS="--generator-url $EXTRACTOR_GENERATOR_URL --generator-model $EXTRACTOR_GENERATOR_MODEL"
     fi
+    if [ "$FORCE" = "true" ]; then
+        GEN_ARGS="$GEN_ARGS --force"
+    fi
     if [ "$CONFIRM" = "dry" ]; then
         log "LAYER 4: Dry-run extractor generation ($TOTAL flagged sites)"
         run_cmd extractor_gen.log $PYTHON src/analyzer.py all-flagged $GEN_ARGS
@@ -444,6 +449,7 @@ Layer commands:
 
 Options:
   -v            Verbose output (stream logs to terminal)
+  --force       Overwrite existing extractors even if they already exist
   --limit N     Max sites for translate/analyze layers (default: all pending)
 
 Schedule with system cron or hermes kanban:

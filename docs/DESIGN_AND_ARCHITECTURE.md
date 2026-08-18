@@ -24,7 +24,7 @@ The I2P Indexer is a **client-side discovery engine**. Its purpose is to systema
 │        Integration Layer           │  ← src/integration.py
 │   · probe_destination()            │
 │   · DiscoveryDB (SQLite persistence)│
-│   · _classify_content()            │
+│   · _do_probe()                    │
 ├──────────┬──────────────────────────┤
 │          │                         │
 ┌──────────▼──────┐     ┌───────────▼──────────┐
@@ -70,9 +70,11 @@ fetch_i2p() → Response.text
     └─► detect_language(title_text, body_text[:8192])  ← langid (local, no network)
         → (detected_lang, confidence)                   # e.g. ("de", 1.0)
 
-    DiscoveryDB.record_discovery(content_type=..., content_summary=..., detected_lang=...)
+    _do_probe() stores: content_type from extractors, detected_lang, content_summary with [detected_language] tag for non-EN → DiscoveryDB.record_discovery()
 
-### Async translation pass (post-probe, decoupled)
+Note: `process_content_for_language()` in `src/translation.py` is available as a standalone pipeline (detect + tag + optional inline Ollama translation) but is NOT called from `_do_probe()`. Probe time only does extraction + langid detection.
+
+### Async translation pass (post-probe, decoupled) — implemented via translate_summaries.py
 
 ```
 translate_summaries.py --ollama-url http://localhost:11434
@@ -89,7 +91,7 @@ translate_summaries.py --ollama-url http://localhost:11434
 Translation runs as a **separate script** outside the probe sweep loop. This prevents translation failures from blocking probe workers and avoids polluting probe logs with LLM latency. Probe time only does language detection via `langid`.
 ```
 
-Classification is intentionally **offline and heuristic-only**. No LLM call is made at probe time. Language detection uses `langid` (~1 MB model, CPU-only, zero network traffic). Non-English content is tagged with `[detected_language: XX (LanguageName)]` for auditability. Translation to English runs as a separate pass via `translate_summaries.py`, which connects to a local Ollama instance — still fully on-device per NFR-07 since no content leaves the host.
+Probe time only does language detection via `langid` — fast, reliable, no LLM. Non-English content is tagged with `[detected_language: XX (LanguageName)]` for auditability. Translation runs offline and Ollama-based when configured: `translate_summaries.py` connects to a local Ollama endpoint so all processing stays on-device per NFR-07. The `process_content_for_language()` function in `src/translation.py` can do inline translation at call time if Ollama is set, but the main probe path does not use it.
 
 ## Design Decisions and Rationale
 
@@ -115,24 +117,24 @@ A post-extraction pipeline that detects the language of scraped page content usi
 | Entrypoint | Purpose | Depends On |
 |---|---|---|
 | `detect_language(title, body_text)` | Detect language from title + first 8192 chars of body text. Returns `(iso_code, confidence)`. Uses `langid.classify()` with negative-log-probability scoring normalized to thresholds (≤-50 → 1.0, ≤-20 → 0.7, else fallback). | `langid` (local, no network) |
-| `process_content_for_language(title, summary_lines, detected_lang, confidence)` | Main pipeline: accepts pre-detected lang or detects itself → prepends `[detected_language: XX (LanguageName)]` tag to non-English summaries → returns `(tagged_lines, lang_code)`. Does **not** translate. Covers 29 languages via built-in `_LANG_NAMES`. | `detect_language` only |
+| `process_content_for_language(title, summary_lines, detected_lang, confidence)` | Standalone pipeline: accepts pre-detected lang or detects itself → prepends `[detected_language: XX (LanguageName)]` tag → **calls `translate_to_english()` when Ollama is configured**, appending original as comment. NOT called from `_do_probe()`. Covers 29 languages via built-in `_LANG_NAMES`. | `detect_language`, optionally `translate_to_english` (requires `set_ollama_url`) |
 | `reset_state()` | Clear global error flags for test isolation. | — |
 
-### Integration in `_do_probe()` (line ~1640 of `src/integration.py`)
+### Integration in `_do_probe()` (line ~2194 of `src/integration.py`)
 
 ```
 run_extractors() → ExtractorResult
        │
-       ├─► detect_language(title_text, body_text)        # full page body
-       │   → (det_lang, confidence)                       # e.g. ("de", 1.0)
+       ├─► detect_language(title_text, body_text)        # full page body via langid
+       │   └─► (det_lang, confidence)                     # e.g. ("de", 1.0)
        │
-       └─► process_content_for_language(                     title=title_text,
-           summary_lines=list(extractor_result.summary_lines),
-           detected_lang=det_lang)
-           → (tagged_summary_lines, final_lang_code)      # annotated, not translated
+       ├─► _extract_flags(body_text, resp_headers)        # needs_review, robots_txt, etc.
+       │
+       └─► DiscoveryResult(...)                           # content_type, detected_lang,
+          → record_discovery()                            #    content_summary, flags
 ```
 
-The tagged summary lines are joined with `"\n"` and stored in `content_summary`. The `detected_lang` ISO code is stored separately. Both are passed to `DiscoveryResult()` → `record_discovery()`.
+Probe time only detects language (fast, no LLM). Non-English discoveries are tagged `[detected_language: XX]` inline in the summary. `process_content_for_language()` is **not** called from here — it lives as a standalone function in `src/translation.py` for scripts that want detect+tag+translate in one call with Ollama. Translate happens as a separate batch job via `translate_summaries.py`.
 
 #### SQL view annotation
 
@@ -148,8 +150,9 @@ python3 -m src.deep_analysis --mode reachable [--limit N]
     ├─► analyze_site(body_text, ollama_url, model)   # Ollama /api/generate
     │   → {site_type, purpose, sections}              # structured JSON
     │
-    └─► update_analysis(db_path, hash_hex, result_json, timestamp)
-        → UPSERT deep_analysis column + last_analyzed_at
+    └─► update_analysis(db_path, hash_hex, probe_mode, result_json)
+        → UPDATE discoveries SET deep_analysis = ? ...     # JSON text in discoveries table
+           UPDATE targets SET last_analyzed_at = ...       # timestamp tracking on targets
 ```
 
 Deep analysis runs as a **separate script** outside the probe sweep loop. This prevents Ollama latency from blocking probe workers and keeps probe logs clean. The architecture mirrors `translate_summaries.py`: decoupled batch job, local-only LLM, graceful fallback on failure.
@@ -158,7 +161,7 @@ Deep analysis runs as a **separate script** outside the probe sweep loop. This p
 |---|---|---|
 | `get_pending_analyses(db_path, mode)` | Query targets needing analysis by mode (`reachable`, `stale`). Returns list of `(hash_hex, body_text)` pairs. | `DiscoveryDB` |
 | `analyze_site(body_text, url, model)` | Strip HTML tags, truncate to 4096 chars, POST to Ollama `/api/generate`. Retry with cooldown on error. | `urllib.request`, local Ollama |
-| `update_analysis(db_path, hash_hex, analysis_json, timestamp)` | Store JSON text in `deep_analysis` column; update `last_analyzed_at` epoch on targets table | `DiscoveryDB.sql_execute` |
+| `update_analysis(db_path, hash_hex, probe_mode, analysis_json)` | UPDATE `discoveries SET deep_analysis = ?` for matching ident_hash (all probe modes); also UPDATE `targets SET last_analyzed_at` for stale-tracking. Uses direct sqlite3, not DiscoveryDB. | sqlite3 |
 
 **Configuration:**
 
@@ -373,7 +376,7 @@ class MyForumExtractor(BaseExtractor):
 
 ### Orchestrator (`run_extractors`)
 
-The `run_extractors()` function in `src/extractors.py` is the entry point that replaces `_classify_content()` in the sweeper. It:
+The `run_extractors()` function in `src/extractors.py` is the content classification engine. The legacy `_classify_content()` was fully replaced by this system. It:
 
 1. Iterates `_registry` from highest priority (lowest number) downward.
 2. On the first `can_handle() → True`, calls `extract()` and validates the result.
@@ -415,9 +418,9 @@ src/
                              run_extractors() orchestrator
   ext_plugins/             ← gitignored; auto-generated + hand-written extractor modules
                               (each *.py registers one or more BaseExtractor subclasses)
-  integration.py           ← sweeper core: probe loop, fetch_i2p, _classify_content
-                             (current keyword-based pass; gradually replaced by run_extractors())
-analyzer.py                ← NEW: feedback-loop CLI tool; inspects flagged destinations,
+  integration.py           ← sweeper core: probe loop, fetch_i2p, _do_probe(),
+                             DiscoveryDB, record_discovery(), run_extractors() integration
+analyzer.py                ← feedback-loop CLI tool; inspects flagged destinations,
                              generates new extractor modules into src/ext_plugins/
 ```
 

@@ -5,8 +5,12 @@ Covers:
 - _needs_translation() detection logic (various tag states, edge cases)
 - build_translation_summary() format (tag markers, original preservation, URL skipping)
 - translate_text() with mocked urllib calls (success, failure, cooldown, English passthrough)
-- update_summary() DB writes
-- Error suppression / cooldown behavior
+- translate_text() Ollama payload structure (model, prompt, stream flag, Content-Type)
+- translate_text() retry on empty response followed by success
+- translate_text() cooldown blocking subsequent calls without HTTP
+- _try_clear_ollama_error() cooldown clearing vs staying in error
+- update_summary() DB writes, nonexistent ID, and error suppression
+- Probes in integration.py do NOT call translate_summaries functions (architectural isolation)
 """
 import json
 import os
@@ -26,6 +30,7 @@ from translate_summaries import (
     _try_clear_ollama_error,
     DEFAULT_DB_PATH,
     OLLAMA_MODEL,
+    OLLAMA_COOLDOWN_S,
 )
 
 
@@ -435,3 +440,206 @@ class TestUpdateSummary:
         """Updating nonexistent ID returns False."""
         result = update_summary(self.db_path, 9999, "nope")
         assert result is False
+
+
+class TestTranslateTextPayload:
+    """Test that translate_text constructs proper Ollama requests."""
+
+    def test_ollama_payload_structure(self):
+        """Ollama request contains correct model, prompt format, and stream=False."""
+        import translate_summaries as ts
+
+        ts._ollama_error = False
+        ts._ollama_error_time = 0.0
+
+        captured_req = None
+        class FakeResp:
+            def read(self):
+                return json.dumps({"response": "Übersetzt"}).encode("utf-8")
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+
+        def capture_urlopen(req, **kw):
+            nonlocal captured_req
+            captured_req = req
+            return FakeResp()
+
+        with patch("urllib.request.urlopen", side_effect=capture_urlopen):
+            translate_text("Hallo Welt", "de", "http://localhost:11434", 5.0)
+
+        assert captured_req is not None
+        assert "localhost:11434" in str(captured_req.full_url)
+        payload = json.loads(captured_req.data.decode("utf-8"))
+        assert payload["model"] == "RogerBen/HY-MT2-1.8B:latest"
+        assert "Hallo Welt" in payload["prompt"]
+        assert "de" in payload["prompt"]
+        assert payload["stream"] is False
+        # Request headers stored as dict; urllib uses case-insensitive mapping
+        headers = dict(captured_req.headers) if hasattr(captured_req, "headers") else {}
+        assert any(k.lower() == "content-type" for k in headers)
+
+    def test_empty_response_then_success(self):
+        """Empty Ollama response counts as transient failure; succeeds on retry."""
+        import translate_summaries as ts
+
+        ts._ollama_error = False
+        ts._ollama_error_time = 0.0
+
+        class FakeResp:
+            def read(self):
+                return json.dumps({"response": "Success"}).encode("utf-8")
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+
+        call_count = 0
+        def empty_then_success(*a, **kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                return FakeResp.__new__(FakeResp)  # will return empty via read below
+            return FakeResp()
+
+        class EmptyResp:
+            def read(self):
+                return json.dumps({"response": ""}).encode("utf-8")
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+
+        calls = [0]
+        def mixed(*a, **kw):
+            calls[0] += 1
+            if calls[0] <= 2:
+                return EmptyResp()
+            return FakeResp()
+
+        with patch("urllib.request.urlopen", side_effect=mixed):
+            result = translate_text("testo", "es", "http://localhost:11434", 10.0)
+
+        assert result == "Success"
+        assert calls[0] == 3  # 2 empty + 1 success
+
+    def test_cooldown_blocks_subsequent_calls(self):
+        """After error, subsequent translate_text calls return None immediately."""
+        import translate_summaries as ts
+
+        ts._ollama_error = False
+        ts._ollama_error_time = 0.0
+
+        # First call fails and triggers cooldown
+        with patch("urllib.request.urlopen", side_effect=Exception("fail")):
+            result = translate_text("test", "de", "http://localhost:11434", 5.0)
+
+        assert result is None
+        assert ts._ollama_error is True
+
+        # Second call should return None without calling urlopen at all
+        with patch("urllib.request.urlopen") as mock_open:
+            result = translate_text("another test", "fr", "http://localhost:11434", 5.0)
+
+        assert result is None
+        mock_open.assert_not_called()
+
+
+class TestTryClearOllamaError:
+    """Test _try_clear_ollama_error cooldown logic."""
+
+    def test_stays_in_error_when_cooldown_not_expired(self):
+        """If cooldown not elapsed, error flag remains True."""
+        import translate_summaries as ts
+        import time as t
+
+        ts._ollama_error = True
+        ts._ollama_error_time = t.time()  # just now
+
+        _try_clear_ollama_error()
+        assert ts._ollama_error is True
+
+    def test_clears_when_cooldown_elapsed(self):
+        """After cooldown period, error flag is cleared."""
+        import translate_summaries as ts
+        import time as t
+
+        ts._ollama_error = True
+        ts._ollama_error_time = t.time() - (OLLAMA_COOLDOWN_S + 1)  # past cooldown
+
+        _try_clear_ollama_error()
+        assert ts._ollama_error is False
+
+
+class TestProbePathIsolation:
+    """Test that integration.py probe path does NOT call translate_summaries functions.
+
+    This verifies the architectural separation: probing should only detect language,
+    not invoke translation. Translation runs as a separate pass afterwards.
+    """
+
+    def test_probe_does_not_import_translate_text(self):
+        """probe_destination/_do_probe do not import or call translate_text."""
+        import inspect
+        # Read integration.py source and verify no reference to translate_summaries functions
+        import os
+        integration_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "src", "integration.py"
+        )
+        with open(integration_path, "r") as f:
+            source = f.read()
+
+        # None of these translate_summaries functions should appear in integration.py imports/calls
+        forbidden_refs = [
+            "from translate_summaries import",
+            "from src.translate_summaries import",
+            "translate_text(",
+            "get_pending_translations(",
+            "build_translation_summary(",
+            "_needs_translation(",
+            "update_summary(",
+        ]
+        found = [ref for ref in forbidden_refs if ref in source]
+        assert not found, (
+            f"integration.py contains forbidden translate_summaries references: {found}"
+        )
+
+    def test_do_probe_calls_language_detection_not_translation(self):
+        """_do_probe calls detect_language from src.translation, not translation functions."""
+        import os
+        integration_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "src", "integration.py"
+        )
+        with open(integration_path, "r") as f:
+            source = f.read()
+
+        # Should use detect_language for language identification
+        assert "detect_language" in source
+
+        # But should NOT import translation logic from translate_summaries
+        assert "from translate_summaries" not in source
+        assert "import translate_summaries" not in source
+
+
+class TestUpdateSummaryError:
+    """Test update_summary DB error handling."""
+
+    def setup_method(self):
+        self.db_path, self.conn = _make_test_db()
+        self.conn.close()
+
+    def teardown_method(self):
+        if os.path.exists(self.db_path):
+            os.unlink(self.db_path)
+
+    def test_update_db_error_returns_false(self):
+        """update_summary returns False when UPDATE statement raises."""
+        import translate_summaries as ts_mod
+        real_sqlite3 = ts_mod.sqlite3
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.execute.side_effect = sqlite3.OperationalError("disk I/O error")
+
+        with patch.object(real_sqlite3, "connect", return_value=mock_conn):
+            result = update_summary(self.db_path, 1, "test")
+            assert result is False

@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 _GENERATOR_LLM_URL: str | None = None  # e.g. "http://localhost:11434"
 _GENERATOR_MODEL: str | None = None    # e.g. "qwen2.5-coder:3b"
-_GENERATOR_TIMEOUT: float = 120.0      # LLM code generation needs generous timeout
+_GENERATOR_TIMEOUT: float = 600.0      # LLM code generation needs generous timeout (5 min)
 
 # ---------------------------------------------------------------------------
 # Common set of paths to try

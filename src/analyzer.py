@@ -429,7 +429,6 @@ Generate the extractor class now. Return ONLY valid Python code wrapped in a ```
             payload = json.dumps({
                 "model": model,
                 "prompt": prompt,
-                "stream": False,
                 "options": {"num_ctx": 16384, "temperature": 0.1},
             }).encode("utf-8")
 
@@ -439,9 +438,19 @@ Generate the extractor class now. Return ONLY valid Python code wrapped in a ```
                 headers={"Content-Type": "application/json"},
             )
             with _urllib_request.urlopen(req, timeout=_GENERATOR_TIMEOUT) as resp:
-                data = json.loads(resp.read())
+                # Ollama always streams (ignores stream: false), so parse NDJSON.
+                raw = resp.read().decode("utf-8")
+                chunks = []
+                for line in raw.strip().split("\n"):
+                    try:
+                        part = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk_text = part.get("response", "")
+                    if chunk_text:
+                        chunks.append(chunk_text)
+                raw_response = "".join(chunks).strip()
 
-            raw_response = data.get("response", "").strip()
             if not raw_response:
                 logger.warning(f"Empty LLM response for {hostname or 'unknown'} (attempt {attempt})")
                 continue

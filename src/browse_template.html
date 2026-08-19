@@ -280,6 +280,7 @@ for(const r of ENTRIES){
 }
 
 function colValue(r,key){
+  if(key==='interest_score')return Number(r[key])||0;
   if(key==='response_time_sec')return hiRT(r[key]);
   if(key==='body_length')return hiBytes(r[key]);
   if(key==='_linkcount')return r[key]??0;
@@ -289,7 +290,7 @@ function colValue(r,key){
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-let sortKey='dns_name', sortAsc=false;
+let sortKey='interest_score', sortAsc=true;
 let filterText='';
 let showUnreachable=true;
 let pageSize=50, page=1;

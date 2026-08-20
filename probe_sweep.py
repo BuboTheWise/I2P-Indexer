@@ -465,6 +465,17 @@ def main():
             "(default: off — language detection and tagging only)"
         ),
     )
+    p.add_argument(
+        "--translation-model",
+        default=None,
+        dest="translation_model",
+        metavar="NAME",
+        help=(
+            "Ollama model name for translation (default: RogerBen/HY-MT2-1.8B:latest). "
+            "Allows per-feature model selection — e.g., use a smaller model for "
+            "translation while deep analysis uses a larger one."
+        ),
+    )
     args = p.parse_args()
 
     # ── Validate crawl args ───────────────────────────────────────
@@ -568,6 +579,15 @@ def main():
         ollama=OllamaConfig(ollama_url=args.ollama_url or ""),
     )
 
+    # Wire translation config into the module-level globals so the extractor
+    # pipeline can access them during discovery. Each feature now gets its own
+    # model via dedicated CLI args (--translation-model for extraction,
+    # --ollama-model for deep analysis).
+    from src import translation as trans_mod
+    if cfg.ollama_url:
+        trans_mod.set_ollama_url(cfg.ollama_url)
+        if args.translation_model:
+            trans_mod.set_ollama_model(args.translation_model)
 
     effective_timeout = integration_module.PROBE_TIMEOUT
     if args.respect_robots:

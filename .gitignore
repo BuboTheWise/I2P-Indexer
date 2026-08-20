@@ -53,3 +53,6 @@ benchmark*.py
 # Export logs
 *.log
 pipeline-test.sh
+
+# Internal notes — private brainstorming, not part of the project
+.internal/

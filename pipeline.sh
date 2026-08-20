@@ -18,8 +18,31 @@ DB="./indexer.db"
 # Output directory for the exported website — change to your webroot
 OUTPUT_DIR="/root/I2P/webroot"
 
-# Ollama API endpoint (local LM for translation and deep analysis)
-OLLAMA_URL="http://localhost:11434"
+###############################################################################
+# PER-FEATURE AI MODEL CONFIGURATION
+#
+#   Each pipeline layer that talks to Ollama can now use an independent model.
+#   Override any of these via environment variables before calling pipeline.sh,
+#   or source a .env file:
+#
+#     export TRANSLATION_MODEL="mistral:7b"           # probe-sweep translations
+#     export ANALYSIS_MODEL="llama3.2:latest"          # deep analysis scoring
+#     export SUMMARY_MODEL="RogerBen/HY-MT2-1.8B:latest"  # summary translation
+#     export OLLAMA_URL="http://localhost:11434"       # shared endpoint
+#
+###############################################################################
+
+# Shared Ollama endpoint (all features route here unless overridden later)
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+
+# Translation model — used by probe_sweep.py during extraction of non-English sites
+TRANSLATION_MODEL="${TRANSLATION_MODEL:-RogerBen/HY-MT2-1.8B:latest}"
+
+# Deep analysis model — used for site classification, interest scoring, and tagging
+ANALYSIS_MODEL="${ANALYSIS_MODEL:-RogerBen/HY-MT2-1.8B:latest}"
+
+# Summary translation model — used by translate_summaries.py (Layer 2)
+SUMMARY_MODEL="${SUMMARY_MODEL:-llama3.2}"
 
 # LLM-powered extractor generation (OPTIONAL — defaults disabled)
 #
@@ -158,10 +181,12 @@ probe_all() {
     log "LAYER 1: Full sweep of all targets ($TOTAL targets)"
     if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
         run_cmd probe_all.log $PYTHON probe_sweep.py --sweep-filter all \
-            --db "$DB" --delay "$PROBE_DELAY" --count "$COUNT"
+            --db "$DB" --delay "$PROBE_DELAY" --count "$COUNT" \
+            --ollama-url "$OLLAMA_URL" --translation-model "$TRANSLATION_MODEL"
     else
         run_cmd probe_all.log $PYTHON probe_sweep.py --sweep-filter all \
-            --db "$DB" --delay "$PROBE_DELAY"
+            --db "$DB" --delay "$PROBE_DELAY" \
+            --ollama-url "$OLLAMA_URL" --translation-model "$TRANSLATION_MODEL"
     fi
 }
 
@@ -172,10 +197,12 @@ probe_reachable() {
     log "LAYER 1: Reachable-only health check ($TOTAL targets, limit=${COUNT})"
     if [ "$COUNT" -gt 0 ] 2>/dev/null; then
         run_cmd probe_reachable.log $PYTHON probe_sweep.py --sweep-filter reachable_only \
-            --db "$DB" --delay "$PROBE_REACHABLE_DELAY" --count "$COUNT"
+            --db "$DB" --delay "$PROBE_REACHABLE_DELAY" --count "$COUNT" \
+            --ollama-url "$OLLAMA_URL" --translation-model "$TRANSLATION_MODEL"
     else
         run_cmd probe_reachable.log $PYTHON probe_sweep.py --sweep-filter reachable_only \
-            --db "$DB" --delay "$PROBE_REACHABLE_DELAY"
+            --db "$DB" --delay "$PROBE_REACHABLE_DELAY" \
+            --ollama-url "$OLLAMA_URL" --translation-model "$TRANSLATION_MODEL"
     fi
 }
 
@@ -184,7 +211,8 @@ probe_new_imports() {
     TOTAL=$(_probe_count never_probed)
     log "LAYER 1: Sync addressbook + probe never_probed ($TOTAL new targets)"
     run_cmd probe_new.log $PYTHON probe_sweep.py --load-address-book \
-        --sweep-filter never_probed --db "$DB"
+        --sweep-filter never_probed --db "$DB" \
+        --ollama-url "$OLLAMA_URL" --translation-model "$TRANSLATION_MODEL"
 }
 
 probe_stale() {
@@ -193,7 +221,8 @@ probe_stale() {
     TOTAL=$(_probe_count stale)
     log "LAYER 1: Stale catch-up (>$HOURS hours, $TOTAL targets)"
     run_cmd probe_stale.log $PYTHON probe_sweep.py --sweep-filter stale \
-        --min-age-hours "$HOURS" --db "$DB"
+        --min-age-hours "$HOURS" --db "$DB" \
+        --ollama-url "$OLLAMA_URL" --translation-model "$TRANSLATION_MODEL"
 }
 
 ###############################################################################
@@ -225,6 +254,7 @@ translate_summaries() {
     fi
     log "LAYER 2: Translate non-English summaries ($TOTAL to translate, ${LIMIT_STR})"
     run_cmd translate.log $PYTHON translate_summaries.py --ollama-url "$OLLAMA_URL" \
+        --ollama-model "$SUMMARY_MODEL" \
         $LIMIT_ARG
 }
 
@@ -257,6 +287,7 @@ analyze_reachable() {
     fi
     log "LAYER 3: Deep analysis of reachable sites ($TOTAL to analyze, ${LIMIT_STR})"
     run_cmd analyze_reachable.log $PYTHON src/deep_analysis.py --mode reachable \
+        --ollama-url "$OLLAMA_URL" --ollama-model "$ANALYSIS_MODEL" \
         $LIMIT_ARG
 }
 
@@ -272,6 +303,7 @@ analyze_stale() {
     fi
     log "LAYER 3: Re-analyze old entries ($TOTAL to analyze, ${LIMIT_STR})"
     run_cmd analyze_stale.log $PYTHON src/deep_analysis.py --mode stale \
+        --ollama-url "$OLLAMA_URL" --ollama-model "$ANALYSIS_MODEL" \
         $LIMIT_ARG
 }
 
@@ -451,6 +483,12 @@ Options:
   -v            Verbose output (stream logs to terminal)
   --force       Overwrite existing extractors even if they already exist
   --limit N     Max sites for translate/analyze layers (default: all pending)
+
+Per-feature AI model config (override via env vars or source .env):
+  TRANSLATION_MODEL  Probe-sweep translation model (default: RogerBen/HY-MT2-1.8B:latest)
+  ANALYSIS_MODEL     Deep analysis model (default: RogerBen/HY-MT2-1.8B:latest)
+  SUMMARY_MODEL      Summary translation model (default: llama3.2)
+  OLLAMA_URL         Shared Ollama endpoint (default: http://localhost:11434)
 
 Schedule with system cron or hermes kanban:
 

@@ -56,3 +56,6 @@ pipeline-test.sh
 
 # Internal notes — private brainstorming, not part of the project
 .internal/
+
+# .env — contains actual API URLs, keys, credentials
+.env

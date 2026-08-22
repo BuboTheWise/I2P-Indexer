@@ -32,6 +32,8 @@ OUTPUT_DIR="/root/I2P/webroot"
 #     export ANALYSIS_MODEL="RogerBen/HY-MT2-1.8B:latest"     # analysis model
 #     export SUMMARY_URL="http://remote-ollama:11434"         # batch summary translation
 #     export SUMMARY_MODEL="llama3.2"                          # summary model
+#     export EXTRACTOR_GENERATOR_URL="http://local-ollama:11434"  # extractor generation (empty=disabled)
+#     export EXTRACTOR_GENERATOR_MODEL="qwen2.5-coder:3b"      # code-capable model
 #
 ###############################################################################
 
@@ -488,10 +490,12 @@ Options:
   --limit N     Max sites for translate/analyze layers (default: all pending)
 
 Per-feature AI model config (override via env vars or source .env):
-  TRANSLATION_MODEL  Probe-sweep translation model (default: RogerBen/HY-MT2-1.8B:latest)
-  ANALYSIS_MODEL     Deep analysis model (default: RogerBen/HY-MT2-1.8B:latest)
-  SUMMARY_MODEL      Summary translation model (default: llama3.2)
-  TRANSLATION_URL    Translation endpoint (default: http://localhost:11434)
+  TRANSLATION_MODEL    Probe-sweep translation model (default: RogerBen/HY-MT2-1.8B:latest)
+  ANALYSIS_MODEL       Deep analysis model (default: RogerBen/HY-MT2-1.8B:latest)
+  SUMMARY_MODEL        Summary translation model (default: llama3.2)
+  EXTRACTOR_GENERATOR_URL   Extractor generation endpoint (empty = disabled)
+  EXTRACTOR_GENERATOR_MODEL Code-capable model (e.g. qwen2.5-coder:3b)
+  TRANSLATION_URL      Translation endpoint (default: http://localhost:11434)
   ANALYSIS_URL         Deep analysis endpoint (default: http://localhost:11434)
   SUMMARY_URL          Summary translation endpoint (default: http://localhost:11434)
 

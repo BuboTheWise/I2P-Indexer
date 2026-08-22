@@ -18,8 +18,34 @@ DB="./indexer.db"
 # Output directory for the exported website — change to your webroot
 OUTPUT_DIR="/root/I2P/webroot"
 
-# Ollama API endpoint (local LM for translation and deep analysis)
-OLLAMA_URL="http://localhost:11434"
+###############################################################################
+# PER-FEATURE AI CONFIGURATION
+#
+#   Each pipeline layer that talks to an LLM backend gets its own endpoint URL
+#   and model.  Completely independent — no sharing between features.
+#   Override any of these via environment variables before calling pipeline.sh,
+#   or source a .env file:
+#
+#     export TRANSLATION_URL="http://remote-ollama:11434"      # probe-sweep translations
+#     export TRANSLATION_MODEL="mistral:7b"                    # translation model
+#     export ANALYSIS_URL="http://local-ollama:11434"          # deep analysis scoring  
+#     export ANALYSIS_MODEL="RogerBen/HY-MT2-1.8B:latest"     # analysis model
+#     export SUMMARY_URL="http://remote-ollama:11434"         # batch summary translation
+#     export SUMMARY_MODEL="llama3.2"                          # summary model
+#
+###############################################################################
+
+# Feature 1: Probe-Sweep Translation — endpoint and model for real-time translations
+TRANSLATION_URL="${TRANSLATION_URL:-http://localhost:11434}"
+TRANSLATION_MODEL="${TRANSLATION_MODEL:-RogerBen/HY-MT2-1.8B:latest}"
+
+# Feature 2: Deep Analysis — endpoint and model for site classification/scoring
+ANALYSIS_URL="${ANALYSIS_URL:-http://localhost:11434}"
+ANALYSIS_MODEL="${ANALYSIS_MODEL:-RogerBen/HY-MT2-1.8B:latest}"
+
+# Feature 3: Summary Translation (Batch) — endpoint and model for Layer 2 pass
+SUMMARY_URL="${SUMMARY_URL:-http://localhost:11434}"
+SUMMARY_MODEL="${SUMMARY_MODEL:-RogerBen/HY-MT2-1.8B:latest}"
 
 # LLM-powered extractor generation (OPTIONAL — defaults disabled)
 #
@@ -158,10 +184,12 @@ probe_all() {
     log "LAYER 1: Full sweep of all targets ($TOTAL targets)"
     if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
         run_cmd probe_all.log $PYTHON probe_sweep.py --sweep-filter all \
-            --db "$DB" --delay "$PROBE_DELAY" --count "$COUNT"
+            --db "$DB" --delay "$PROBE_DELAY" --count "$COUNT" \
+            --ollama-url "$TRANSLATION_URL" --translation-model "$TRANSLATION_MODEL"
     else
         run_cmd probe_all.log $PYTHON probe_sweep.py --sweep-filter all \
-            --db "$DB" --delay "$PROBE_DELAY"
+            --db "$DB" --delay "$PROBE_DELAY" \
+            --ollama-url "$TRANSLATION_URL" --translation-model "$TRANSLATION_MODEL"
     fi
 }
 
@@ -172,10 +200,12 @@ probe_reachable() {
     log "LAYER 1: Reachable-only health check ($TOTAL targets, limit=${COUNT})"
     if [ "$COUNT" -gt 0 ] 2>/dev/null; then
         run_cmd probe_reachable.log $PYTHON probe_sweep.py --sweep-filter reachable_only \
-            --db "$DB" --delay "$PROBE_REACHABLE_DELAY" --count "$COUNT"
+            --db "$DB" --delay "$PROBE_REACHABLE_DELAY" --count "$COUNT" \
+            --ollama-url "$TRANSLATION_URL" --translation-model "$TRANSLATION_MODEL"
     else
         run_cmd probe_reachable.log $PYTHON probe_sweep.py --sweep-filter reachable_only \
-            --db "$DB" --delay "$PROBE_REACHABLE_DELAY"
+            --db "$DB" --delay "$PROBE_REACHABLE_DELAY" \
+            --ollama-url "$TRANSLATION_URL" --translation-model "$TRANSLATION_MODEL"
     fi
 }
 
@@ -184,7 +214,8 @@ probe_new_imports() {
     TOTAL=$(_probe_count never_probed)
     log "LAYER 1: Sync addressbook + probe never_probed ($TOTAL new targets)"
     run_cmd probe_new.log $PYTHON probe_sweep.py --load-address-book \
-        --sweep-filter never_probed --db "$DB"
+        --sweep-filter never_probed --db "$DB" \
+        --ollama-url "$TRANSLATION_URL" --translation-model "$TRANSLATION_MODEL"
 }
 
 probe_stale() {
@@ -193,7 +224,8 @@ probe_stale() {
     TOTAL=$(_probe_count stale)
     log "LAYER 1: Stale catch-up (>$HOURS hours, $TOTAL targets)"
     run_cmd probe_stale.log $PYTHON probe_sweep.py --sweep-filter stale \
-        --min-age-hours "$HOURS" --db "$DB"
+        --min-age-hours "$HOURS" --db "$DB" \
+        --ollama-url "$TRANSLATION_URL" --translation-model "$TRANSLATION_MODEL"
 }
 
 ###############################################################################
@@ -224,7 +256,8 @@ translate_summaries() {
         LIMIT_STR="all pending"
     fi
     log "LAYER 2: Translate non-English summaries ($TOTAL to translate, ${LIMIT_STR})"
-    run_cmd translate.log $PYTHON translate_summaries.py --ollama-url "$OLLAMA_URL" \
+    run_cmd translate.log $PYTHON translate_summaries.py --ollama-url "$SUMMARY_URL" \
+        --ollama-model "$SUMMARY_MODEL" \
         $LIMIT_ARG
 }
 
@@ -257,6 +290,7 @@ analyze_reachable() {
     fi
     log "LAYER 3: Deep analysis of reachable sites ($TOTAL to analyze, ${LIMIT_STR})"
     run_cmd analyze_reachable.log $PYTHON src/deep_analysis.py --mode reachable \
+        --ollama-url "$ANALYSIS_URL" --ollama-model "$ANALYSIS_MODEL" \
         $LIMIT_ARG
 }
 
@@ -272,6 +306,7 @@ analyze_stale() {
     fi
     log "LAYER 3: Re-analyze old entries ($TOTAL to analyze, ${LIMIT_STR})"
     run_cmd analyze_stale.log $PYTHON src/deep_analysis.py --mode stale \
+        --ollama-url "$ANALYSIS_URL" --ollama-model "$ANALYSIS_MODEL" \
         $LIMIT_ARG
 }
 
@@ -451,6 +486,14 @@ Options:
   -v            Verbose output (stream logs to terminal)
   --force       Overwrite existing extractors even if they already exist
   --limit N     Max sites for translate/analyze layers (default: all pending)
+
+Per-feature AI model config (override via env vars or source .env):
+  TRANSLATION_MODEL  Probe-sweep translation model (default: RogerBen/HY-MT2-1.8B:latest)
+  ANALYSIS_MODEL     Deep analysis model (default: RogerBen/HY-MT2-1.8B:latest)
+  SUMMARY_MODEL      Summary translation model (default: llama3.2)
+  TRANSLATION_URL    Translation endpoint (default: http://localhost:11434)
+  ANALYSIS_URL         Deep analysis endpoint (default: http://localhost:11434)
+  SUMMARY_URL          Summary translation endpoint (default: http://localhost:11434)
 
 Schedule with system cron or hermes kanban:
 

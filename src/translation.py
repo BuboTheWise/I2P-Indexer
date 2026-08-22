@@ -118,6 +118,16 @@ def set_ollama_url(url: Optional[str]) -> None:
     _ollama_error_time = 0.0
 
 
+def set_ollama_model(model: str) -> None:
+    """Configure the Ollama model for local translation.
+
+    Allows each AI-using feature to pick its own model independently.
+    Default remains ``_OLLAMA_MODEL`` (RogerBen/HY-MT2-1.8B:latest).
+    """
+    global _OLLAMA_MODEL
+    _OLLAMA_MODEL = model
+
+
 def _try_clear_ollama_error() -> None:
     """Clear error latch if cooldown elapsed."""
     global _ollama_error, _ollama_error_time

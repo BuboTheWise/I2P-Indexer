@@ -264,7 +264,7 @@ def build_translation_summary(original_summary: str, translated_line: str, sourc
 # ---------------------------------------------------------------------------
 
 def main():
-    global OLLAMA_COOLDOWN_S
+    global OLLAMA_COOLDOWN_S, OLLAMA_MODEL
 
     p = argparse.ArgumentParser(description="Translate non-English I2P site summaries via local Ollama")
     p.add_argument("--ollama-url", required=True, help="Ollama API endpoint (e.g. http://localhost:11434)")
@@ -272,10 +272,20 @@ def main():
     p.add_argument("--limit", type=int, default=0, help="Max sites to process (0=all)")
     p.add_argument("--dry-run", action="store_true", help="Show what would be translated without doing it")
     p.add_argument("--timeout", type=float, default=30.0, help="Per-request Ollama timeout in seconds")
+# Add --model to let pipeline.sh pass the summary model
+    p.add_argument(
+        "--ollama-model", default=OLLAMA_MODEL, dest="ollama_model",
+        help=f"Ollama model for translation (default: {OLLAMA_MODEL})",
+    )
     p.add_argument("--cooldown", type=float, default=OLLAMA_COOLDOWN_S, help="Cooldown after Ollama error (seconds)")
     p.add_argument("--db-path", default=None, dest="db_path", help="Path to indexer.db")
 
     args = p.parse_args()
+
+    # Override module-level model so translate_text() uses the per-feature model
+    if args.ollama_model:
+        OLLAMA_MODEL = args.ollama_model
+
     db_path = args.db_path or DEFAULT_DB_PATH
 
     if not os.path.exists(db_path):

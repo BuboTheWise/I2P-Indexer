@@ -1,6 +1,9 @@
 """Tests for the I2P proxy client (SOCKS5 + SAM API).
 
 Run with: pytest tests/test_i2p_proxy.py -v --tb=short
+
+Live network tests carry a ``slow = True`` class attribute so conftest can
+skip them during coverage runs.  Run with ``--run-slow`` to include them.
 """
 
 import socket
@@ -75,10 +78,25 @@ class TestSAMClientInit(unittest.TestCase):
 
 
 class TestHTTPProxyLive(unittest.TestCase):
-    """Live tests against the I2P daemon's HTTP proxy."""
+    """Live tests against the I2P daemon's HTTP proxy.
+
+    These make actual I2P network requests and are inherently slow (~30s+).
+    They skip if port 4444 is unreachable and are excluded from coverage runs
+    via ``slow = True`` (requires ``--run-slow`` to include).
+    """
+
+    slow = True
 
     @classmethod
     def setUpClass(cls):
+        # Skip if I2P proxy is unavailable (e.g. during unit test runs)
+        try:
+            s = socket.socket()
+            s.settimeout(3)
+            s.connect(("127.0.0.1", 4444))
+            s.close()
+        except OSError:
+            raise unittest.SkipTest("I2P HTTP proxy (port 4444) unavailable")
         cls.client = I2PProxyClient(timeout=120.0)
 
     def test_http_proxy_port_accepts_tcp(self):
@@ -141,7 +159,12 @@ class TestSAMUnavailable(unittest.TestCase):
 
 
 class TestHealthProbe(unittest.TestCase):
-    """Verify the health check utility."""
+    """Verify the health check utility.
+
+    Makes live network requests — marked slow so it can be skipped during CI.
+    """
+
+    slow = True
 
     def test_probe_http_proxy(self):
         """probe_health should return True if at least one eepsite responds."""
@@ -150,10 +173,23 @@ class TestHealthProbe(unittest.TestCase):
 
 
 class TestComparison(unittest.TestCase):
-    """Compare SOCKS5 and HTTP proxy performance/reliability."""
+    """Compare SOCKS5 and HTTP proxy performance/reliability.
+
+    Makes live network requests — marked slow so it can be skipped during CI.
+    """
+
+    slow = True
 
     @classmethod
     def setUpClass(cls):
+        # Skip if I2P proxy is unavailable
+        try:
+            s = socket.socket()
+            s.settimeout(3)
+            s.connect(("127.0.0.1", 4444))
+            s.close()
+        except OSError:
+            raise unittest.SkipTest("I2P HTTP proxy (port 4444) unavailable")
         cls.client = I2PProxyClient(timeout=120.0)
 
     def test_both_return_response_objects(self):
@@ -223,7 +259,7 @@ class TestI2PConfigWiring(unittest.TestCase):
         self.assertEqual(c.port, 7890)
 
     def test_integration_call_chain_accepts_config(self):
-        """verify discover_addresses/probe_destination/_do_probe accept config param."""
+        """Verify discover_addresses/probe_destination/_do_probe accept config param."""
         import inspect
         from src.integration import (
             discover_addresses,

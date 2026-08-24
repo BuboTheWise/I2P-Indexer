@@ -2357,7 +2357,7 @@ def _do_probe(
             "  [%s] %s  FAILED %.1fs:\n%s", probe_mode, url, elapsed, tb
         )
         return DiscoveryResult(
-            b32_addr=url.split("/")  [2] if "/" in url else "",
+            b32_addr=url.split("/")[2] if "/" in url else "",
             ident_hash_hex=ident_hash_hex,
             reachable=False,
             error=f"{exc}\n{tb}",

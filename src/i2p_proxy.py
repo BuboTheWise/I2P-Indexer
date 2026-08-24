@@ -431,30 +431,68 @@ class I2PSAMClient:
         """Push raw bytes through an active SAM session and read response.
 
         Parameters match the SAM ``send`` / ``receive`` commands.
+
+        Integirty check: The server echoes back how many bytes it actually
+        received in the ``receive`` command header (e.g. ``receive bytes=N``).
+        We compare N against len(data) so that silent truncation or partial
+        writes are detected.  A mismatch is logged as an error and raises
+        ``ValueError`` rather than returning silently corrupted data.
+
+        Additionally, if the receive stream closes before N body bytes have
+        been read, a warning is logged so the caller knows the response was
+        truncated instead of assuming the entire response fit in one call.
         """
         if not self._connected:
             raise ConnectionError("SAM not connected")
 
+        sent_len = len(data)
+
         # Send the data
-        cmd = f"send bytes={len(data)}"
-        logger.debug("SAM >>> send bytes=%d", len(data))
+        cmd = f"send bytes={sent_len}"
+        logger.debug("SAM >>> send bytes=%d", sent_len)
         self._sock.sendall((cmd + "\n").encode() + data)
 
-        # Read response
+        # Read response header line
         resp = self._read_line()
         logger.debug("SAM <<< %s", resp)
 
         if "receive bytes=" in resp:
             n = int(resp.split("=", 1)[1].split()[0])
+
+            # --- integrity check ---
+            if n != sent_len:
+                logger.error(
+                    "send_data integrity mismatch: sent %d bytes but server "
+                    "reports receive bytes=%d (data may have been truncated or "
+                    "corrupted in transit)",
+                    sent_len, n,
+                )
+                raise ValueError(
+                    f"send_data integrity mismatch: sent {sent_len} bytes, "
+                    f"server confirmed {n} bytes"
+                )
+
+            # Read exactly N response body bytes
             received = b""
             while len(received) < n:
                 chunk = self._sock.recv(min(n - len(received), 4096))
                 if not chunk:
+                    logger.warning(
+                        "send_data receive truncated: read %d of %d bytes "
+                        "(stream closed early)",
+                        len(received), n,
+                    )
                     break
                 received += chunk
+
             return received
 
-        # If the response doesn't match 'receive bytes=N', return empty
+        elif "REPLY ERROR" in resp or "ERROR" in resp:
+            logger.error("SAM send_data failed: %s", resp)
+            raise ConnectionError(f"SAM send failed: {resp}")
+
+        # Unknown response shape — return empty instead of misleading data
+        logger.warning("Unexpected SAM send_data response: %s", resp)
         return b""
 
     def close(self) -> None:

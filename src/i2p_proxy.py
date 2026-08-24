@@ -592,6 +592,110 @@ def fetch_i2p(
 
 
 # ---------------------------------------------------------------------------
+# Protocol fingerprinting — TCP banner grab before HTTP probe
+# ---------------------------------------------------------------------------
+
+# Table-driven protocol signatures. Order matters — HTTP first because many
+# services start with text that looks like other protocols, and we want to
+# catch the most common case first.
+_PROTOCOL_SIGNATURES: list[tuple[str, str, int]] = [
+    # (tag, prefix_to_match, match_length)
+    ("http/web", "HTTP/1.", 7),
+    ("smtp/nntp", "+OK ", 4),
+    ("smtp/nntp", "220 ", 4),
+    ("irc_gateway", " :Welcome to IRC", 16),
+    ("irc_gateway", " :Your host is", 14),
+    ("bob_bridge", "BOB ", 4),
+]
+
+
+def probe_tcp_banner(
+    host: str,
+    port: int = 80,
+    timeout: float = 3.0,
+    max_read: int = 50,
+    config: Optional[I2PConfig] = None,
+) -> tuple[str, bytes]:
+    """Connect to *host*:*port* via SOCKS5 proxy and read up to *max_read* bytes.
+
+    Returns (tag, raw_banner) where *tag* is one of the protocol labels or
+    "unknown/tcp" if nothing matched.  The raw banner is at most *max_read*
+    bytes from the first recv(); a service that sends nothing within the timeout
+    returns ("closed", b"").
+
+    Uses PySocks monkey-patching so the connection travels through the I2P
+    tunnel without opening a new one — the SOCKS5 proxy (default port 7656)
+    is reused.
+    """
+    cfg = config or I2PConfig()
+    import socks
+
+    _original_socket = socket.socket
+    banner = b""
+    try:
+        socks.set_default_proxy(
+            socks.PROXY_TYPE_SOCKS5, cfg.socks_host, cfg.socks_port
+        )
+        socket.socket = socks.socksocket
+
+        raw_sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            _start = time.monotonic()
+            banner = raw_sock.recv(max_read)
+        finally:
+            raw_sock.close()
+    except OSError:
+        return ("unreachable", b"")
+    finally:
+        socket.socket = _original_socket
+
+    if not banner:
+        return ("closed", b"")
+
+    tagged = _fingerprint_protocol(banner)
+    return (tagged, banner[:max_read])
+
+
+# Byte-string regex patterns for protocol detection.
+# Raw bytes literal (rb'...') — \s means actual whitespace in the pattern.
+_PROTOCOL_PATTERNS_RE: list[tuple[str, re.Pattern[bytes]]] = [
+    ("bob_bridge", re.compile(rb"^BOB\s")),
+    ("bittorrent_tracker", re.compile(rb"(announce|peers|info_hash|complete\s)")),
+]
+
+
+def _fingerprint_protocol(banner: bytes) -> str:
+    """Match *banner* against the protocol signature table.
+
+    Returns a stable tag string like "http/web" or "unknown/tcp".
+    Checks both fixed prefixes and regex patterns.
+    """
+    # 1. Fixed prefix matches (fast path, handles >90% of cases)
+    for tag, prefix, length in _PROTOCOL_SIGNATURES:
+        if banner[:length].decode("ascii", errors="ignore") == prefix:
+            return tag
+
+    # 2. Regex pattern matches (slower, catches partial/signature banners)
+    try:
+        text = banner.decode("ascii", errors="replace").upper()
+    except Exception:
+        text = ""
+
+    for tag, pattern in _PROTOCOL_PATTERNS_RE:
+        if pattern.search(banner):
+            return tag
+
+    # 3. Heuristics for common non-HTTP services detectable by structure
+    if b"<stream" in banner[:50] or b"</streamelement>" in banner[:50]:
+        return "xmpp/jabber"
+    if banner.startswith(b"\x00\x01") or len(banner) == 0:
+        # TLS/NULL banners are common on SMTP
+        return "smtp/tls"
+
+    return "unknown/tcp"
+
+
+# ---------------------------------------------------------------------------
 # Helpers for testing
 # ---------------------------------------------------------------------------
 

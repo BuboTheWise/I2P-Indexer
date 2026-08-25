@@ -252,6 +252,102 @@ class TestDiscoveryDB:
         with pytest.raises((sqlite3.ProgrammingError, sqlite3.DatabaseError)):
             inst.record_router(ident_hash_hex="A" * 40)
 
+    # ── Phase 3: Banner cache helpers ───────────────────────────────
+
+    def test_banner_columns_exist(self, db):
+        """banner_hash and last_banner_check columns should be created on init."""
+        cur = db._conn.cursor()
+        cur.execute("PRAGMA table_info(targets)")
+        col_names = {row[1] for row in cur.fetchall()}
+        assert "banner_hash" in col_names
+        assert "last_banner_check" in col_names
+
+    def test_update_banner_hash(self, db):
+        """Store a hash and verify it's retrievable."""
+        # Must insert into targets table (banner helpers query targets, not discoveries)
+        db.upsert_targets([("AB" * 20, "test.b32.i2p")])
+        assert db.update_banner_hash("AB" * 20, "caffee" * 8) is True
+        cached = db.get_banner_cache("AB" * 20)
+        assert cached is not None
+        assert cached[0] == "caffee" * 8
+        assert cached[1] > 0
+
+    def test_update_banner_hash_no_row(self, db):
+        """update_banner_hash returns False when hash doesn't exist in targets."""
+        assert db.update_banner_hash("FF" * 20, "deadbeef" * 8) is False
+
+    def test_get_banner_cache_none_when_empty(self, db):
+        """get_banner_cache returns None when no hash is stored."""
+        db.record_discovery(
+            ident_hash_hex="CD" * 20,
+            b32_addr="empty.b32.i2p",
+            probe_mode="b32",
+            reachable=True,
+        )
+        assert db.get_banner_cache("CD" * 20) is None
+
+    def test_is_banner_stale_missing(self, db):
+        """Missing cache entry is stale."""
+        assert db.is_banner_stale("ZZ" * 20) is True
+
+    def test_is_banner_stale_fresh(self, db):
+        """Freshly stored hash should not be stale."""
+        db.upsert_targets([("EE" * 20, "fresh.b32.i2p")])
+        db.update_banner_hash("EE" * 20, "abcdef" * 8)
+        assert db.is_banner_stale("EE" * 20) is False
+
+    def test_is_banner_stale_after_ttl(self, db):
+        """Cache should expire after BANNER_CACHE_TTL."""
+        from src.integration import BANNER_CACHE_TTL
+        # Must insert into targets table (banner helpers query targets, not discoveries)
+        db.upsert_targets([("FF" * 20, "stale.b32.i2p")])
+        db.update_banner_hash("FF" * 20, "123456" * 8)
+        assert db.is_banner_stale("FF" * 20) is False
+        # Backdate the timestamp to force expiry
+        now_ts = None
+        with db._lock:
+            cur = db._conn.cursor()
+            cur.execute(
+                "UPDATE targets SET last_banner_check = ? WHERE ident_hash_hex = ?",
+                (1000000.0, "FF" * 20),
+            )
+            db._conn.commit()
+        assert db.is_banner_stale("FF" * 20) is True
+
+    def test_update_last_banner_check(self, db):
+        """Update just the timestamp without changing the hash."""
+        # Must insert into targets table (banner helpers query targets, not discoveries)
+        db.upsert_targets([("DD" * 20, "ts.b32.i2p")])
+        old_hash = "oldhash1234567890abcdef"
+        db.update_banner_hash("DD" * 20, old_hash)
+        cached_before = db.get_banner_cache("DD" * 20)
+        import time
+        time.sleep(0.01)
+        assert db.update_last_banner_check("DD" * 20) is True
+        cached_after = db.get_banner_cache("DD" * 20)
+        assert cached_after[0] == old_hash  # hash unchanged
+        assert cached_after[1] > cached_before[1]
+
+    def test_update_last_banner_check_empty_hash(self, db):
+        """update_last_banner_check skips rows with empty banner_hash."""
+        # Insert target without setting banner_hash
+        db.upsert_targets([("99" * 20, "nohash.b32.i2p")])
+        assert db.update_last_banner_check("99" * 20) is False
+
+    def test_get_target_by_hash(self, db):
+        """Look up target row by identity hash."""
+        # Insert into targets (banner helpers query targets, not discoveries)
+        db.upsert_targets([("AA" * 20, "lookup.b32.i2p")])
+        row = db.get_target_by_hash("AA" * 20)
+        assert row is not None
+        assert row[0] == "AA" * 20
+        # Prefer b32_addr over dns_name
+        assert "b32" in row[1].lower()
+
+    def test_get_target_by_hash_not_found(self, db):
+        """Return None for non-existent hash."""
+        assert db.get_target_by_hash("NN" * 20) is None
+
 
 # ---------------------------------------------------------------------------
 # discover_addresses tests (mocked)
@@ -374,6 +470,74 @@ class TestDiscoverAddresses:
         cur.execute("SELECT count(*) FROM discoveries")
         # Just confirm we can query it without sqlite3.ProgrammingError
         db_conn.close()
+
+    @patch("src.integration._do_probe")
+    @patch("src.integration._quick_reachability_probe")
+    def test_banner_cache_fresh_skips_full_probe(self, mock_quick, mock_probe, test_db):
+        """When banner cache is fresh, only quick probe should fire."""
+        # Seed the targets table — record_discovery writes to `discoveries`,
+        # but the banner-cache helpers (is_banner_stale, get_banner_cache,
+        # get_target_by_hash) all query `targets`.
+        h = "AA" * 20
+        test_db.upsert_targets([(h, "cache.example.i2p")])
+        test_db.update_banner_hash(h, "abcdef" * 8)
+
+        # Quick probe result for cache hit path
+        qr = DiscoveryResult(
+            b32_addr="cache.b32.i2p", ident_hash_hex=h, reachable=True, response_time_sec=1.5,
+        )
+        mock_quick.return_value = qr
+
+        # Safety net: if the cache-hit path unexpectedly falls through to full
+        # probe, return a JSON-serialisable result instead of a bare MagicMock.
+        mock_probe.return_value = DiscoveryResult(
+            b32_addr="cache.b32.i2p", ident_hash_hex=h, reachable=True,
+            probe_mode="b32", response_time_sec=1.5,
+        )
+
+        results = discover_addresses(known_addrs=[h], db_instance=test_db)
+        assert len(results) == 1
+        # Quick probe was called (cache hit path)
+        mock_quick.assert_called_once()
+        # Full probe should NOT have been called for this target
+        mock_probe.assert_not_called()
+
+    @patch("src.integration._do_probe")
+    @patch("src.integration.fetch_i2p")
+    def test_banner_cache_stale_triggers_full_probe(self, mock_fetch, mock_probe, test_db):
+        """When banner cache is expired or missing, full probe fires."""
+        from src.integration import BANNER_CACHE_TTL
+        h = "BB" * 20
+        # Seed the targets table (upsert_targets writes to `targets`; the
+        # banner-cache helpers query `targets`, not `discoveries`).
+        test_db.upsert_targets([(h, "stale.example.i2p")])
+        test_db.update_banner_hash(h, "bbbb" * 8)
+        # Backdate to force TTL expiry
+        with test_db._lock:
+            cur = test_db._conn.cursor()
+            cur.execute(
+                "UPDATE targets SET last_banner_check = 1000000.0 "
+                "WHERE ident_hash_hex = ?",
+                (h,),
+            )
+            test_db._conn.commit()
+
+        # Full probe goes through _do_probe → must return JSON-serialisable
+        # fields so record_discovery's json.dumps(found_links, flags) succeeds.
+        mock_probe.return_value = DiscoveryResult(
+            b32_addr="stale.b32.i2p", ident_hash_hex=h, reachable=True,
+            probe_mode="b32", response_time_sec=1.0,
+        )
+        # (fetch_i2p is patched for completeness; _do_probe is already mocked.)
+        mock_fetch.return_value = MagicMock(
+            status=200, text="<html><title>Stale</title></html>",
+            body=b"x" * 1000, title=lambda: "Stale", headers={},
+        )
+
+        discover_addresses(known_addrs=[h], db_instance=test_db)
+        # Stale cache → full probe path (fetch_i2p or probe_destination called)
+        # Since we have both hash and DNS empty in the tuple, it probes .b32.i2p URL
+        assert mock_fetch.called or mock_probe.called
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 [project]
 name = "i2p-indexer"
-version = "0.4.10"
+version = "0.4.11"
 description = "Client-side discovery and cataloging tool for I2P eepsites"
 readme = "README.md"
 license = {text = "MIT"}

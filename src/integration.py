@@ -2733,7 +2733,7 @@ def discover_addresses(
             results.append(res)
 
             # ── Phase 3: Update banner cache after full probe ────
-            if hash_hex and res.content_hash:
+            if hash_hex and res.content_hash and isinstance(res.content_hash, str):
                 cached = db.get_banner_cache(hash_hex)
                 if cached is None or cached[0] != res.content_hash:
                     logger.info(

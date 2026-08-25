@@ -1,5 +1,7 @@
 """I2P Indexer — client-side eepsite discovery tools."""
 
+__version__ = "0.4.10"
+
 from .addressbook import AddressBookCatalog
 from .config import I2PConfig
 from .i2p_proxy import (

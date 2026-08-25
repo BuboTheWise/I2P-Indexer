@@ -578,6 +578,10 @@ _BACKOFF_INTERVALS = (60, 300, 1800, 7200, 43200, 604800)
 # Fixed strategy: constant delay per failure (seconds).
 _FIXED_BACKOFF_SECONDS = 300  # 5 minutes per failed attempt
 
+# Phase 3 — Banner cache TTL (7 days).  Banners older than this are considered
+# stale and trigger a full re-probe to catch changed protocols/content.
+BANNER_CACHE_TTL: int = 604800
+
 
 class BackoffStrategy:
     """Named constants for backoff algorithm selection."""
@@ -968,6 +972,18 @@ class DiscoveryDB:
         if "dest_data" not in existing_cols:
             cur.execute(
                 "ALTER TABLE targets ADD COLUMN dest_data TEXT DEFAULT ''"
+            )
+        # Banner cache — SHA-256 of the protocol banner/fingerprint for this
+        # destination.  Used to skip redundant full probes when the banner hasn't
+        # changed between sweep cycles, and last_banner_check timestamps each check
+        # so stale caches expire after BANNER_CACHE_TTL seconds.
+        if "banner_hash" not in existing_cols:
+            cur.execute(
+                "ALTER TABLE targets ADD COLUMN banner_hash TEXT DEFAULT ''"
+            )
+        if "last_banner_check" not in existing_cols:
+            cur.execute(
+                "ALTER TABLE targets ADD COLUMN last_banner_check REAL DEFAULT 0"
             )
         self._conn.commit()
 
@@ -1977,6 +1993,101 @@ class DiscoveryDB:
             self._conn.commit()
             return cur.rowcount > 0
 
+    # ── Phase 3 banner cache helpers ───────────────────────────────
+
+    def update_banner_hash(self, ident_hash_hex: str, sha256_hex: str) -> bool:
+        """Store or update the cached banner hash for a target.
+
+        Args:
+            ident_hash_hex: 40-char hex identity hash.
+            sha256_hex: SHA-256 (hex string) of the protocol/banner fingerprint.
+
+        Returns:
+            True if an existing row was updated, False if no row matched.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE targets SET banner_hash = ?, last_banner_check = ? "
+                "WHERE ident_hash_hex = ?",
+                (sha256_hex, now, ident_hash_hex),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def get_banner_cache(self, ident_hash_hex: str) -> tuple[str, float] | None:
+        """Retrieve the cached banner hash and timestamp for a target.
+
+        Returns:
+            (sha256_hex, last_check_epoch) if a non-empty hash exists, else None.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT banner_hash, COALESCE(last_banner_check, 0) FROM targets "
+                "WHERE ident_hash_hex = ?",
+                (ident_hash_hex,),
+            )
+            row = cur.fetchone()
+        if row and row[0]:
+            return row[0], float(row[1])
+        return None
+
+    def is_banner_stale(self, ident_hash_hex: str) -> bool:
+        """Check whether the cached banner hash has expired or is missing.
+
+        Returns True when a full re-probe is warranted (no cache entry, empty
+        hash, or last check older than BANNER_CACHE_TTL seconds).
+        """
+        cached = self.get_banner_cache(ident_hash_hex)
+        if cached is None:
+            return True
+        _, ts = cached
+        now = datetime.now(timezone.utc).timestamp()
+        return (now - ts) > BANNER_CACHE_TTL
+
+    def update_last_banner_check(self, ident_hash_hex: str) -> bool:
+        """Update just the last_banner_check timestamp without changing the hash.
+
+        Used after a quick reachability check confirms the destination is still up
+        and the banner hasn't changed — keeps the cache fresh without full reprobing.
+
+        Args:
+            ident_hash_hex: 40-char hex identity hash.
+
+        Returns:
+            True if an existing row was updated, False if no row matched.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE targets SET last_banner_check = ? "
+                "WHERE ident_hash_hex = ? AND banner_hash != ''",
+                (now, ident_hash_hex),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def get_target_by_hash(self, ident_hash_hex: str) -> tuple[str, str] | None:
+        """Look up a target row by identity hash.
+
+        Returns:
+            (ident_hash_hex, b32_addr) tuple or None if not found.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT ident_hash_hex, COALESCE(b32_addr, i2p_dns_name) FROM targets "
+                "WHERE ident_hash_hex = ?",
+                (ident_hash_hex,),
+            )
+            row = cur.fetchone()
+        if row:
+            return row[0], row[1]
+        return None
+
     def close(self) -> None:
         """Close the SQLite connection.  Idempotent — safe to call repeatedly."""
         try:
@@ -2367,6 +2478,65 @@ def _do_probe(
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 — Quick reachability probe (banner cache hit path)
+# ---------------------------------------------------------------------------
+
+def _quick_reachability_probe(
+    url: str,
+    ident_hash_hex: str,
+    config: I2PConfig | None = None,
+    timeout: float = 10.0,
+) -> DiscoveryResult:
+    """Lightweight connectivity check without full banner extraction.
+
+    Used when the banner cache has a valid entry and we only need to confirm
+    the destination is still reachable, not re-extract content.  Sends a HEAD
+    request (or GET with minimal body read) and returns a slim DiscoveryResult.
+
+    Args:
+        url: Target URL to probe.
+        ident_hash_hex: 40-char hex identity hash.
+        config: Optional I2PConfig override.
+        timeout: Per-target deadline (default 10s, much shorter than full probes).
+
+    Returns:
+        DiscoveryResult with reachable/status, no content extraction.
+    """
+    start = time.monotonic()
+    try:
+        resp = fetch_i2p(url, via="http-proxy", config=config, timeout=timeout)
+        elapsed = round(time.monotonic() - start, 2)
+        logger.info(
+            "  [cache-hit] %s  status=%d  %.1fs  (banner cached, reachability only)",
+            url, resp.status, elapsed,
+        )
+        return DiscoveryResult(
+            b32_addr=url.split("/")[2] if "/" in url else "",
+            ident_hash_hex=ident_hash_hex,
+            reachable=200 <= resp.status < 500,
+            status_code=resp.status,
+            body_length=0,
+            response_time_sec=elapsed,
+            via_method="cache-hit",
+            probe_mode="cache-hit",
+        )
+    except Exception as exc:
+        elapsed = round(time.monotonic() - start, 2)
+        logger.warning(
+            "  [cache-hit] %s  FAILED %.1fs: %s", url, elapsed, exc
+        )
+        return DiscoveryResult(
+            b32_addr=url.split("/")[2] if "/" in url else "",
+            ident_hash_hex=ident_hash_hex,
+            reachable=False,
+            error=str(exc),
+            response_time_sec=elapsed,
+            via_method="cache-hit",
+            probe_mode="cache-hit",
+        )
+
+
 class _RedirectCountingHandler(urllib.request.HTTPRedirectHandler):
     """Subclass that counts how many 3xx redirects were followed."""
 
@@ -2503,11 +2673,40 @@ def discover_addresses(
         # robots.txt cache keyed by DNS name or b32 address — fetch once per destination
         _robots_cache: dict[str, TypingAny] = {}
 
+        # ── Phase 3 counters ────────────────────────────────────────
+        cache_hits: int = 0
+        cache_misses: int = 0
+
         for i, (hash_hex, dns_name) in enumerate(targets):
             if i > 0:
                 logger.info("Waiting %.1fs before next probe...", probe_delay)
                 time.sleep(probe_delay)
             logger.info("--- Probing [%d/%d]: hash=%s  dns=%s", i + 1, len(targets), hash_hex or "(none)", dns_name or "(none)")
+
+            # ── Phase 3: Banner cache check ────────────────────────
+            if hash_hex and not db.is_banner_stale(hash_hex):
+                logger.info("  [cache] Banner cached & fresh for %s — skipping full probe", dns_name or hash_hex)
+                url_to_check = ""
+                if dns_name:
+                    url_to_check = f"http://{dns_name}/"
+                else:
+                    target_row = db.get_target_by_hash(hash_hex)
+                    if target_row and target_row[1]:
+                        url_to_check = f"http://{target_row[1]}.b32.i2p/"
+
+                if url_to_check:
+                    res = _quick_reachability_probe(
+                        url_to_check, hash_hex, config=config, timeout=min(timeout, 10.0)
+                    )
+                    db.update_last_banner_check(hash_hex)
+                    cache_hits += 1
+                    results.append(res)
+                    db.update_backoff_state(hash_hex, dns_name, res.reachable, backoff_strategy=backoff_strategy)
+                    continue
+                else:
+                    logger.debug("  [cache] No URL available for reachability check — falling through to full probe")
+
+            cache_misses += 1
 
             # Fetch robots.txt for this destination (cached to avoid redundant requests)
             robots_policy = None
@@ -2533,12 +2732,27 @@ def discover_addresses(
             )
             results.append(res)
 
+            # ── Phase 3: Update banner cache after full probe ────
+            if hash_hex and res.content_hash:
+                cached = db.get_banner_cache(hash_hex)
+                if cached is None or cached[0] != res.content_hash:
+                    logger.info(
+                        "  [cache] Banner changed for %s (old=%s, new=%s)",
+                        dns_name or hash_hex,
+                        cached[0] if cached else "(none)",
+                        res.content_hash[:12],
+                    )
+                db.update_banner_hash(hash_hex, res.content_hash)
+
             # Adaptive backoff: update consecutive_failures and backoff_until
             # based on probe outcome, so chronically dead destinations
             # don't consume sweep budget every run.
             db.update_backoff_state(hash_hex, dns_name, res.reachable, backoff_strategy=backoff_strategy)
 
-        # Sort: reachable first, then fastest
+        logger.info(
+            "Probe complete: %d full probes, %d cache hits (%d skipped)",
+            cache_misses, cache_hits, cache_hits,
+        )
         results.sort(key=lambda r: (not r.reachable, r.response_time_sec))
 
         # ── Maintenance: prune stale unreachable records ───────────────

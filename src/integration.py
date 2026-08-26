@@ -2292,11 +2292,9 @@ def probe_destination(
                 # Gate fired. Record the service and return early — skip the
                 # expensive HTTP body fetch and extractor pipeline.
                 if db:
-                    status = "ok" if banner else ("closed" if not tag else "unreachable")
-                    if tag == "closed":
-                        status = "closed"
-                    elif tag == "unreachable":
-                        status = "unreachable"
+                    # Banner probe outcomes: no bytes = closed/rejected TCP,
+                    # bytes present (and classified) = a live non-HTTP service.
+                    status = "closed" if not banner else "ok"
                     db.record_service(
                         host=host,
                         port=gate_port,
@@ -2798,6 +2796,8 @@ def discover_addresses(
     skip_backoff: bool = True,
     backoff_strategy: str = BackoffStrategy.EXPONENTIAL,
     respect_robots: bool = False,
+    service_gate: bool = False,
+    gate_port: int = 0,
 ) -> list[DiscoveryResult]:
     """Probe destinations and record results in persistent DB.
 
@@ -2827,6 +2827,13 @@ def discover_addresses(
             probing paths. Disallow rules are enforced — matching paths are skipped
             during link extraction, and fully blocked sites get a flag instead of
             being probed in their entirety.
+        service_gate: When True (opt-in, default False), enable the protocol gate —
+            before the HTTP body fetch, a TCP banner is read and classified. Confident
+            non-HTTP services (IRC/SMTP/BOB/Bittorrent/XMPP) are recorded in the
+            services table and skip the HTTP fetch + extractors entirely, saving a
+            full I2P round-trip. Ambiguous or HTTP banners proceed normally.
+        gate_port: TCP port for the gate's banner probe (0 → DEFAULT_GATE_PORT=443).
+            Only used when ``service_gate`` is True.
 
     Returns:
         List of DiscoveryResult objects sorted by reachability then speed.
@@ -2942,6 +2949,8 @@ def discover_addresses(
                 config=config,
                 timeout=timeout,
                 robots_policy=robots_policy if respect_robots else None,
+                service_gate=service_gate,
+                port=gate_port,
             )
             results.append(res)
 
@@ -2993,6 +3002,8 @@ def auto_crawl(
     config: I2PConfig | None = None,
     db_path: str = DEFAULT_DB_PATH,
     db_instance: DiscoveryDB | None = None,
+    service_gate: bool = False,
+    gate_port: int = 0,
 ) -> dict:
     """Recursively discover new .i2p destinations by crawling links within depth bounds.
 
@@ -3124,6 +3135,8 @@ def auto_crawl(
                         db=db,
                         timeout=timeout,
                         config=cfg,
+                        service_gate=service_gate,
+                        port=gate_port,
                     )
                 except Exception as exc:
                     logger.warning("  ERROR probing %s: %s", target_id, exc)

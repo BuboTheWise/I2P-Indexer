@@ -51,8 +51,38 @@ The I2P Indexer is a **client-side discovery engine**. Its purpose is to systema
 2. **Hash → b32**: Each hash is converted to a `.b32.i2p` address via base32 encoding.
 3. **Dual-mode probe**: The system attempts both `http://HASH.b32.i2p/` (direct key) and `http://NAME.i2p/` (DNS), recording which succeeded.
 4. **Content extraction**: On success, the response body is parsed for `<title>`, size, and a keyword-based content classification pass.
-5. **Persistence**: Results are written to three SQLite tables (`discoveries`, `routers`, `leasesets`) keyed by `ident_hash_hex`.
+5. **Persistence**: Results are written to SQLite tables (`discoveries`, `routers`, `leasesets`, and — when the protocol gate fires — `services`) keyed by `ident_hash_hex`.
 6. **Report generation**: `print_report()` renders a terminal summary; raw data remains queryable via SQL.
+
+### Protocol gate (opt-in, v0.4.12+)
+
+`probe_destination(service_gate=True, port=N)` classifies a destination *before* the HTTP body fetch:
+
+```
+probe_destination(service_gate=True)
+    │
+    ├─► probe_tcp_banner(host, port)         ← raw TLS-free CONNECT, ≤50 bytes, ≤4s
+    │   · SOCKS5 tunnel (I2P), no new tunnel
+    │   · b"<" or b"</streamelement>" → xmpp/jabber   (conf 0.75 — heuristic)
+    │   · b"\x00\x01"                   → smtp/tls     (conf 0.75 — heuristic)
+    │   · b"" (empty read)             → closed       (conf 0.30 — no banner, NOT smtp/tls)
+    │   · b"220 " or b"+OK "           → nntp/smtp    (high conf)
+    │   · b" :Welcome" (IRC)           → irc_gateway  (high conf)
+    │   · b"HTTP/"                     → http/web     (conf 1.00)
+    │   · unmatched                    → unknown/tcp  (conf 0.30)
+    │
+    ├─► classify_service(banner) → ServiceClassification(protocol, confidence, service_type)
+    │   · is_non_http = (protocol in NON_HTTP_TAGS and confidence ≥ 0.85)
+    │   · asymmetric safety: low-confidence or unknown banners fall through to HTTP,
+    │     so a false "non-HTTP" classification never loses a web site
+    │
+    ├─► is_non_http = True   → record_service(host, port, …) to services table
+    │                         return early — no HTTP fetch, no extractors
+    │
+    └─► is_non_http = False  → proceed normally (b32 + DNS fetch + extractors + langid)
+```
+
+`record_service()` upserts on `(host, port)`, refreshing protocol/banner/last_seen and incrementing `seen_count` while preserving `first_seen`. The `services` table is a first-class "what's on the network" store, independent of `discoveries`.
 
 ### Consolidated view (`address_book`)
 

@@ -414,6 +414,25 @@ def main():
         help="Fetch robots.txt from each destination and skip Disallow paths during link extraction (default: off — probe everything)",
     )
     p.add_argument(
+        "--protocol-gate",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable the protocol gate: read a TCP banner before the HTTP fetch and "
+            "classify the service. Confident non-HTTP services (IRC, SMTP, BOB, Bittorrent, "
+            "XMPP) are recorded in the services table and skip the HTTP fetch + extractors, "
+            "saving a full I2P round-trip. Ambiguous or HTTP banners proceed normally "
+            "(default: off)"
+        ),
+    )
+    p.add_argument(
+        "--gate-port",
+        type=int,
+        default=443,
+        metavar="PORT",
+        help="TCP port for the protocol gate's banner probe (default: 443; only used with --protocol-gate)",
+    )
+    p.add_argument(
         "--no-backoff",
         action="store_true",
         default=False,
@@ -604,6 +623,8 @@ def main():
         skip_backoff=not args.no_backoff,
         backoff_strategy=args.backoff_strategy,
         respect_robots=args.respect_robots,
+        service_gate=args.protocol_gate,
+        gate_port=args.gate_port,
     )
 
     # Slice to --count if requested

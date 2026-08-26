@@ -27,7 +27,7 @@ from typing import Any as TypingAny
 
 from src.addressbook import AddressBookCatalog, _hex_to_b32_addr
 from src.config import I2PConfig
-from src.i2p_proxy import ProxyBackend, fetch_i2p
+from src.i2p_proxy import ProxyBackend, fetch_i2p, probe_tcp_banner, classify_service
 from src.models import DestinationEntry
 
 # Per-target probe timeout (seconds). Override via PROBE_TIMEOUT env var
@@ -565,6 +565,16 @@ class DiscoveryResult:
     needs_review: bool = False  # True when no extractor claimed or partial extract
     reason: str = ""  # reason string for needs_review (e.g. "no_extractor_claimed")
 
+    # ── protocol-gate fields ───────────────────────────────────────────
+    # Populated when the gate fires (i.e. a confident non-HTTP service was
+    # detected and the HTTP pipeline was skipped). When the gate did NOT
+    # fire (normal HTTP flow), all three fields stay "".
+    service_type: str = ""       # human-friendly label ("I2P IRC gateway")
+    service_protocol: str = ""   # machine tag ("irc_gateway")
+    gate_applied: bool = False   # True when the gate fired for this destination
+    gate_confidence: float = 0.0 # classifier confidence at gate-fire time
+
+
 
 # ---------------------------------------------------------------------------
 # Adaptive backoff — exponential or fixed penalties for dead destinations
@@ -581,6 +591,19 @@ _FIXED_BACKOFF_SECONDS = 300  # 5 minutes per failed attempt
 # Phase 3 — Banner cache TTL (7 days).  Banners older than this are considered
 # stale and trigger a full re-probe to catch changed protocols/content.
 BANNER_CACHE_TTL: int = 604800
+
+# ── Protocol gate ────────────────────────────────────────────────────────────
+# Confidence threshold at which the gate fires on a non-HTTP tag.
+# Set slightly above 0.80 so that structural heuristics (0.75) do NOT
+# trigger the gate — only exact signature matches (1.00) and regex matches
+# (0.90) do. The asymmetric cost model: a false "non-HTTP" masks a real site
+# (high cost); a false "HTTP" costs one fetch (low cost).
+GATE_CONFIDENCE_THRESHOLD: float = 0.85
+
+# Default port used when the gate probes a destination without an explicit
+# port hint. I2P web services default to 443.
+DEFAULT_GATE_PORT: int = 443
+
 
 
 class BackoffStrategy:
@@ -641,6 +664,7 @@ class DiscoveryDB:
         self._ensure_discovery_columns()
         self._ensure_targets_columns()
         self._ensure_susi_sync_table()
+        self._ensure_services_table()
         self._ensure_address_book_view()
 
     # ── context manager (P4 — prevent connection leaks) ────
@@ -998,6 +1022,129 @@ class DiscoveryDB:
             )"""
         )
         self._conn.commit()
+
+    def _ensure_services_table(self) -> None:
+        """Create the services table if not already present.
+
+        The services table is a first-class store of "what's on the network":
+        one row per (host, port) that we have probed and classified, with the
+        protocol tag, a human-friendly label, a hash of the banner for cache
+        hits, and a short capped copy of the banner text.  The gate writes to
+        this table whenever a high-confidence non-HTTP service is detected, so
+        the index can later answer questions like "what's on port 6667?"
+
+        Key on (host, port):
+          * host: the b32_addr / i2p_dns_name / ident_hash_hex we probed
+          * port: the TCP port (443 by default; 6667 for IRC, etc.)
+
+        Idempotent: CREATE TABLE IF NOT EXISTS.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS services (
+                host          TEXT    NOT NULL,
+                port          INTEGER NOT NULL,
+                protocol      TEXT    NOT NULL,
+                service_type  TEXT    NOT NULL,
+                banner_hash   TEXT    NOT NULL,
+                banner_text   TEXT    NOT NULL DEFAULT '',
+                status        TEXT    NOT NULL DEFAULT 'ok',   -- 'ok' | 'closed' | 'unreachable'
+                first_seen    REAL    NOT NULL,
+                last_seen     REAL    NOT NULL,
+                seen_count    INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (host, port)
+            )"""
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_services_protocol ON services (protocol)"
+        )
+        self._conn.commit()
+
+    # ── services table: record + query ──────────────────────────────────
+
+    def record_service(
+        self,
+        host: str,
+        port: int,
+        protocol: str,
+        service_type: str,
+        banner: bytes,
+        status: str = "ok",
+    ) -> int:
+        """Upsert a row in the services table.
+        
+        The primary key is (host, port), so repeated probes of the same
+        endpoint update the existing row rather than creating duplicates.
+        
+        Returns the rowid of the affected row.
+        """
+        import hashlib as _hashlib
+        import time as _time
+        banner_hash = _hashlib.sha256(banner).hexdigest()
+        # Keep banner_text readable: only ASCII-printable bytes, capped at 100.
+        # NB: no .strip() — IRC banners legitimately start with a leading
+        # space (part of the protocol), and stripping would mangle it.
+        _decoded = banner[:100].decode("ascii", errors="ignore")
+        banner_text = _decoded.replace("\r", "\\r").replace("\n", "\\n")[:100]
+        ts = _time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO services
+                    (host, port, protocol, service_type, banner_hash,
+                     banner_text, status, first_seen, last_seen, seen_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT (host, port) DO UPDATE SET
+                    protocol     = excluded.protocol,
+                    service_type = excluded.service_type,
+                    banner_hash  = excluded.banner_hash,
+                    banner_text  = excluded.banner_text,
+                    status       = excluded.status,
+                    last_seen    = excluded.last_seen,
+                    seen_count   = services.seen_count + 1
+                """,
+                (
+                    host, port, protocol, service_type, banner_hash,
+                    banner_text, status, ts, ts,
+                ),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def get_service(self, host: str, port: int) -> dict | None:
+        """Read the services-row for (host, port), or None if absent."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT host, port, protocol, service_type, banner_hash, "
+                "banner_text, status, first_seen, last_seen, seen_count "
+                "FROM services WHERE host = ? AND port = ?",
+                (host, port),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        keys = ("host", "port", "protocol", "service_type", "banner_hash",
+                "banner_text", "status", "first_seen", "last_seen", "seen_count")
+        return dict(zip(keys, row))
+
+    def get_services_by_protocol(self, protocol: str, limit: int = 100) -> list[dict]:
+        """Return up to *limit* rows for a given protocol tag (e.g. "irc_gateway").
+        Ordered by most-recently-seen first — the freshest service first."""
+        keys = ("host", "port", "protocol", "service_type", "banner_hash",
+                "banner_text", "status", "first_seen", "last_seen", "seen_count")
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT host, port, protocol, service_type, banner_hash, "
+                "banner_text, status, first_seen, last_seen, seen_count "
+                "FROM services WHERE protocol = ? "
+                "ORDER BY last_seen DESC LIMIT ?",
+                (protocol, limit),
+            )
+            rows = cur.fetchall()
+        return [dict(zip(keys, r)) for r in rows]
 
     def _recreate_address_book_view(self, cur: sqlite3.Cursor) -> None:
         """DROP then CREATE the address_book view with the current schema.
@@ -2107,6 +2254,8 @@ def probe_destination(
     timeout: float = PROBE_TIMEOUT,
     config: I2PConfig | None = None,
     robots_policy: TypingAny = None,
+    service_gate: bool = False,
+    port: int = 0,
 ) -> DiscoveryResult:
     """Probe a single destination by BOTH its b32 key address and .i2p DNS name.
 
@@ -2116,9 +2265,73 @@ def probe_destination(
     ``timeout`` is the per-target deadline in seconds.
     ``robots_policy`` when set, filters discovered links against Disallow rules.
         Fully blocked sites get a robots_txt flag instead of being crawled deeply.
+    ``service_gate`` when True (opt-in), enables the protocol-gate: before any
+      HTTP body fetch, a cheap TCP banner is read on the destination's primary
+      port and classified.  On a confident non-HTTP match the gate fires —
+      a services-table row is written and the HTTP fetch + extractor pipeline
+      are skipped, saving a full I2P round-trip.  On HTTP or ambiguous banners
+      the normal flow proceeds unchanged.  Default False so existing callers
+      and tests are unaffected.
+    ``port`` optional hint for the gate's banner port (0 → DEFAULT_GATE_PORT).
     """
     b32_addr = _hex_to_b32_addr(ident_hash_hex) if len(ident_hash_hex) == 40 else ""
     results: list[DiscoveryResult] = []
+
+    # ── Protocol gate (opt-in) ───────────────────────────────────────────
+    if service_gate:
+        gate_port = port if port else DEFAULT_GATE_PORT
+        host = b32_addr or i2p_dns_name or ident_hash_hex
+        try:
+            tag, banner = probe_tcp_banner(
+                host=host, port=gate_port,
+                timeout=max(1.5, min(timeout, 4.0)),
+                config=config,
+            )
+            svc = classify_service(banner)
+            if svc.is_non_http:
+                # Gate fired. Record the service and return early — skip the
+                # expensive HTTP body fetch and extractor pipeline.
+                if db:
+                    status = "ok" if banner else ("closed" if not tag else "unreachable")
+                    if tag == "closed":
+                        status = "closed"
+                    elif tag == "unreachable":
+                        status = "unreachable"
+                    db.record_service(
+                        host=host,
+                        port=gate_port,
+                        protocol=svc.protocol,
+                        service_type=svc.service_type or svc.protocol,
+                        banner=banner,
+                        status=status,
+                    )
+                gated_res = DiscoveryResult(
+                    b32_addr=b32_addr or host,
+                    ident_hash_hex=ident_hash_hex,
+                    reachable=True,
+                    via_method="banner_gate",
+                    probe_mode="banner",
+                    status_code=0,
+                    error="",
+                    service_type=svc.service_type or svc.protocol,
+                    service_protocol=svc.protocol,
+                    gate_applied=True,
+                    gate_confidence=svc.confidence,
+                )
+                logger.info(
+                    "Gate fired on %s:%d → %s (%s, conf=%.2f) — skipping HTTP path",
+                    host, gate_port, svc.protocol, svc.service_type, svc.confidence,
+                )
+                return gated_res
+            else:
+                logger.debug(
+                    "Gate: %s:%d → %s (conf=%.2f) — proceeding to HTTP path",
+                    host, gate_port, svc.protocol, svc.confidence,
+                )
+        except Exception as gate_exc:
+            # Gate is best-effort: a network error in the banner probe should
+            # not fail the whole destination probe. Fall through to HTTP.
+            logger.warning("Gate banner probe failed for %s: %s", host, gate_exc)
 
     # ── Attempt 1: Hit the b32 key directly (no DNS resolution needed)
     if b32_addr:

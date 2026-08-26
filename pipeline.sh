@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # I2P Indexer — Layered Pipeline
-VERSION="0.4.11"
+VERSION="0.4.12"
 # Edit the variables below, then run:
 #   bash pipeline.sh <action>
 

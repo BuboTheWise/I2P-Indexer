@@ -174,7 +174,20 @@ Sweep filters work with all existing probe_sweep.py options:
 | `--crawl-depth N` | `python3 probe_sweep.py --sweep-filter all --crawl-depth 2` (auto-crawl linked sites up to depth 2) |
 | `--max-new-targets N` | `python3 probe_sweep.py --crawl-depth 2 --max-new-targets 25` (limit auto-crawl to 25 new discoveries) |
 | `--ollama-url URL` | `python3 probe_sweep.py --sweep-filter reachable_only --ollama-url http://localhost:11434` (translate non-English summaries) |
+| `--protocol-gate` | `python3 probe_sweep.py --sweep-filter reachable_only --protocol-gate` (classify each target's protocol via TCP banner; skip HTTP extraction for confident non-HTTP services) |
+| `--gate-port PORT` | `python3 probe_sweep.py --protocol-gate --gate-port 6667` (banner probe on port 6667 instead of 443; only meaningful with `--protocol-gate`) |
 | `--dry-run` | See dry run section above |
+
+---
+
+## Protocol Gate (service classification before HTTP fetch)
+
+Opt-in flag introduced in v0.4.13. When `--protocol-gate` is set, `probe_destination()` reads a TCP banner (≤50 bytes, through the I2P tunnel) before deciding whether to run the full HTTP extraction pipeline. If the banner confidently matches a non-HTTP service (IRC, SMTP, XMPP, BOB bridge, etc., confidence ≥ 0.85), the target is recorded in the `services` table and the HTTP body fetch is skipped — saving tunnel traffic on high-latency probes.
+
+- Default (no flag, or `--protocol-gate` off): unchanged behavior — every reachable target gets a full HTTP GET, exactly as before v0.4.13.
+- `--gate-port` overrides the banner probe's default TCP port (443). Use it when a destination is known to serve a specific protocol on a non-default port, e.g. IRC on 6667.
+- This is independent of and orthogonal to `--sweep-filter` — combine as needed, e.g. `--sweep-filter stale --protocol-gate --gate-port 6667` to re-probe stale targets for an IRC service.
+
 
 ---
 

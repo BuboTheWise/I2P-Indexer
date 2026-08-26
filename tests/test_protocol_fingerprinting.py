@@ -118,10 +118,8 @@ class TestFingerprintProtocol(unittest.TestCase):
 
     def test_empty_banner(self):
         result = _fingerprint_protocol(b"")
-        # "" starts with \x00\x01? No, empty → unknown. Actually code checks len(banner)==0 which is True
-        # but banner.startswith(b"\x00\x01") would be False for empty... let's check:
-        # b"".startswith(b"\x00\x01") → False. len(b"") == 0 → True. So it returns "smtp/tls".
-        self.assertEqual(result, "smtp/tls")
+        # Empty banner = no response, port is closed (not a TLS handshake)
+        self.assertEqual(result, "closed")
 
     def test_non_ascii_unicode(self):
         result = _fingerprint_protocol("こんにちは世界".encode("utf-8"))

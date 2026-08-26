@@ -320,5 +320,75 @@ class TestProbeDestinationGate(unittest.TestCase):
         mock.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# discover_addresses() — production sweep path with the gate wired through
+# ---------------------------------------------------------------------------
+
+class TestDiscoverAddressesGateWiring(unittest.TestCase):
+    """The gate must be reachable from the production sweep entry point.
+
+    Regression: in v0.4.12 the gate was opt-in at probe_destination() but
+    discover_addresses() never forwarded service_gate, so sweeps never
+    engaged the gate. v0.4.13 threads the parameter through — this test
+    locks that wiring in place.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mktemp(suffix=".db")
+        self.db = DiscoveryDB(self.tmp)
+
+    def tearDown(self) -> None:
+        self.db.close()
+        if os.path.exists(self.tmp):
+            os.unlink(self.tmp)
+
+    def test_gate_fires_through_discover_addresses(self) -> None:
+        """service_gate=True on the sweep drives a fires-and-records flow."""
+        from src.integration import discover_addresses
+
+        banner = b" :Welcome to IRC at irc.i2p\r\n"
+        mock = MagicMock(return_value=("irc_gateway", banner))
+        with patch("src.integration.probe_tcp_banner", mock):
+            results = discover_addresses(
+                known_addrs=[("a" * 40, "")],
+                db_instance=self.db,
+                probe_delay=0,
+                timeout=1,
+                service_gate=True,
+                gate_port=6667,
+            )
+        self.assertEqual(len(results), 1)
+        res = results[0]
+        self.assertTrue(res.gate_applied, "gate was not engaged from discover_addresses")
+        self.assertEqual(res.service_protocol, "irc_gateway")
+        self.assertGreater(res.gate_confidence, 0.85)
+        # probe_destination stores the row keyed on b32_addr (the host it actually dialed).
+        row = self.db._conn.execute(
+            "SELECT * FROM services WHERE port = 6667"
+        ).fetchone()
+        self.assertIsNotNone(row, "no services row recorded for gate-port 6667")
+        keys = ["host", "port", "protocol", "service_type", "banner_hash",
+                "banner_text", "status", "first_seen", "last_seen", "seen_count"]
+        data = dict(zip(keys, row))
+        self.assertEqual(data["protocol"], "irc_gateway")
+        # gate_port should have been forwarded, not defaulted to 443
+        self.assertEqual(data["port"], 6667)
+
+    def test_gate_defaults_off_in_discover_addresses(self) -> None:
+        """Without service_gate, the banner probe must not run at all."""
+        from src.integration import discover_addresses
+
+        mock = MagicMock(return_value=("irc_gateway", b" :Welcome to IRC at irc.i2p"))
+        with patch("src.integration.probe_tcp_banner", mock):
+            results = discover_addresses(
+                known_addrs=[("a" * 40, "")],
+                db_instance=self.db,
+                probe_delay=0,
+                timeout=1,
+            )
+        self.assertFalse(results[0].gate_applied)
+        mock.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

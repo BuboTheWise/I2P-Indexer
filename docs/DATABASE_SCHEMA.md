@@ -1,6 +1,6 @@
 # Database Schema Reference
 
-The indexer uses a single SQLite file (`indexer.db`) with WAL journal mode. Four operational tables, auto-generated indexes, and a denormalized read view. Runtime database is in `.gitignore` — never committed to VCS.
+The indexer uses a single SQLite file (`indexer.db`) with WAL journal mode. Five operational tables, auto-generated indexes, and a denormalized read view. Runtime database is in `.gitignore` — never committed to VCS.
 
 ## Table: `discoveries`
 
@@ -159,6 +159,43 @@ Parsed from `.ls64` files in the I2P `netdb/` directory. One row per lease set i
 | `i2p_dns_name` | TEXT | No | `''` | Associated DNS name (if known) |
 | `source` | TEXT | No | `'unknown'` | Origin of data |
 | `updated_at` | REAL | No | now | Last update timestamp |
+
+---
+
+## Table: `services`
+
+Added in v0.4.12 (protocol gate). A first-class store of "what's on the network": one row per `(host, port)` endpoint that has been banner-probed and classified. Written by the protocol gate when `service_gate=True` and a confident non-HTTP service is detected (IRC/SMTP/BOB/Bittorrent/XMPP, etc.).
+
+| Column | Type | PK | Default | Description |
+|---|---|---|---|---|
+| `host` | TEXT | Yes (part of PK) | — | The identifier dialed: b32 address, DNS name, or ident hash |
+| `port` | INTEGER | Yes (part of PK) | — | TCP port probed (443 by default; 6667 for IRC, etc.) |
+| `protocol` | TEXT | No | — | Machine tag: `irc_gateway`, `smtp/nntp`, `bob_bridge`, `bittorrent_tracker`, `xmpp/jabber`, `ftp`, `gopher`, `closed`, … |
+| `service_type` | TEXT | No | — | Human-friendly label ("I2P IRC gateway", "Mail over TLS", …) |
+| `banner_hash` | TEXT | No | — | SHA-256 of the raw banner bytes — change detection for gate re-probes |
+| `banner_text` | TEXT | No | `''` | ASCII printables of the banner, capped at 100 chars. No `.strip()` — IRC greetings legitimately start with a leading space |
+| `status` | TEXT | No | `'ok'` | `'ok'` (banner received) or `'closed'` (no response / rejected TCP) |
+| `first_seen` | REAL | No | — | Unix timestamp of first classification |
+| `last_seen` | REAL | No | — | Unix timestamp of most recent classification |
+| `seen_count` | INTEGER | No | `1` | How many times this endpoint has been gate-classified |
+
+Primary key `(host, port)` — the same host can run different protocols on different ports. Repeated probes UPSERT (refresh `protocol`/`banner`/`last_seen`, increment `seen_count`, preserve `first_seen`).
+
+### Indexes
+
+```sql
+CREATE INDEX idx_services_protocol ON services (protocol);
+```
+
+### Access
+
+```python
+db.record_service(host, port, protocol, service_type, banner, status)  # upsert
+db.get_service(host, port)            # -> dict | None
+db.get_services_by_protocol("irc_gateway", limit=100)  # freshest first
+```
+
+Enabled on the CLI with `probe_sweep.py --protocol-gate [--gate-port PORT]` (default port 443). Off by default — fully backward compatible.
 
 ---
 

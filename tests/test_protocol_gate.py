@@ -13,8 +13,10 @@ Run with:
     pytest tests/test_protocol_gate.py -v --tb=short
 
 """
+import io
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
@@ -219,6 +221,172 @@ class TestServicesTable(unittest.TestCase):
             "SELECT COUNT(*) FROM services WHERE host='multi.i2p'"
         ).fetchone()[0]
         self.assertEqual(count, 2)
+
+
+# ---------------------------------------------------------------------------
+# 4. Service query methods — the CLI backing queries
+# ---------------------------------------------------------------------------
+
+class TestServiceQueryMethods(unittest.TestCase):
+    """get_services_by_port / get_all_services — the two new read paths.
+
+    These back the `--show-services` CLI (probe_sweep.py).  They must
+    mirror get_services_by_protocol() in shape (list[dict], freshest-first,
+    limit respected) but key on port / all-rows.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mktemp(suffix=".db")
+        self.db = DiscoveryDB(self.tmp)
+        # Seed a small mixed set of services to query against.
+        self.db.record_service(
+            host="irc-a.i2p", port=6667, protocol="irc_gateway",
+            service_type="I2P IRC gateway", banner=b" :Welcome a",
+        )
+        self.db.record_service(
+            host="irc-b.i2p", port=6667, protocol="irc_gateway",
+            service_type="I2P IRC gateway", banner=b" :Welcome b",
+        )
+        self.db.record_service(
+            host="mail.i2p", port=25, protocol="smtp",
+            service_type="SMTP", banner=b"220 mail.i2p ESMTP",
+        )
+        self.db.record_service(
+            host="xmpp.i2p", port=5222, protocol="xmpp",
+            service_type="XMPP", banner=b"<stream:stream ...>",
+        )
+
+    def tearDown(self) -> None:
+        self.db.close()
+        if os.path.exists(self.tmp):
+            os.unlink(self.tmp)
+
+    def test_by_port_returns_only_matching(self) -> None:
+        rows = self.db.get_services_by_port(6667)
+        self.assertEqual(len(rows), 2, "6667 has exactly two seeded rows")
+        self.assertTrue(all(r["port"] == 6667 for r in rows))
+        self.assertTrue(all(r["protocol"] == "irc_gateway" for r in rows))
+
+    def test_by_port_no_match_is_empty(self) -> None:
+        self.assertEqual(self.db.get_services_by_port(9999), [])
+
+    def test_by_port_respects_limit(self) -> None:
+        self.assertEqual(len(self.db.get_services_by_port(6667, limit=1)), 1)
+
+    def test_by_port_returns_dict_rows(self) -> None:
+        row = self.db.get_services_by_port(25)[0]
+        for k in ("host", "port", "protocol", "service_type", "banner_hash",
+                  "banner_text", "status", "first_seen", "last_seen", "seen_count"):
+            self.assertIn(k, row)
+
+    def test_all_services_returns_everything(self) -> None:
+        rows = self.db.get_all_services()
+        self.assertEqual(len(rows), 4, "one row across all four seeded endpoints")
+
+    def test_all_services_respects_limit(self) -> None:
+        rows = self.db.get_all_services(limit=2)
+        self.assertEqual(len(rows), 2)
+
+    def test_all_services_is_freshest_first(self) -> None:
+        # Most recently written rows should surface first (last_seen DESC).
+        # Seed a fresh row after setUp's writes and assert it leads the result.
+        self.db.record_service(
+            host="fresh.i2p", port=6667, protocol="irc_gateway",
+            service_type="IRC", banner=b" :newest",
+        )
+        rows = self.db.get_all_services()
+        self.assertEqual(rows[0]["host"], "fresh.i2p",
+                         "newest row must sort first")
+
+
+# ---------------------------------------------------------------------------
+# 5. probe_sweep --show-services CLI dispatch
+# ---------------------------------------------------------------------------
+
+class TestShowServicesCLI(unittest.TestCase):
+    """The `--show-services` dispatch block in probe_sweep.main.
+
+    We exercise the real CLI by invoking main() with argv patched and the
+    DB pointed at a temp file, so --show-services never enters the probe path.
+    We capture stdout to assert the rows come back and the shape is right.
+    """
+
+    def setUp(self) -> None:
+        import probe_sweep as ps
+        self._ps = ps
+        self.tmp = tempfile.mktemp(suffix=".cli.db")
+        db = DiscoveryDB(self.tmp)
+        db.record_service(
+            host="irc-a.i2p", port=6667, protocol="irc_gateway",
+            service_type="I2P IRC gateway", banner=b" :Welcome a",
+        )
+        db.record_service(
+            host="mail.i2p", port=25, protocol="smtp",
+            service_type="SMTP", banner=b"220 mail.i2p ESMTP",
+        )
+        db.close()
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.tmp):
+            os.unlink(self.tmp)
+        if os.path.exists(self.tmp + "-wal"):
+            os.unlink(self.tmp + "-wal")
+        if os.path.exists(self.tmp + "-shm"):
+            os.unlink(self.tmp + "-shm")
+
+    def _run(self, args, cap):
+        import io, contextlib
+        from unittest import mock
+        with mock.patch.object(sys, "argv", [self._ps.__name__, *args]), \
+             contextlib.redirect_stdout(cap):
+            self._ps.main()
+
+    def test_json_by_protocol(self) -> None:
+        cap = io.StringIO()
+        self._run(["--db", self.tmp, "--show-services",
+                   "--protocol", "irc_gateway", "--json"], cap)
+        import json as _json
+        out = _json.loads(cap.getvalue())
+        self.assertEqual(out["query"], "protocol=irc_gateway")
+        self.assertEqual(out["total"], 1)
+        self.assertEqual(out["services"][0]["host"], "irc-a.i2p")
+
+    def test_json_by_port(self) -> None:
+        cap = io.StringIO()
+        self._run(["--db", self.tmp, "--show-services",
+                   "--port", "25", "--json"], cap)
+        import json as _json
+        out = _json.loads(cap.getvalue())
+        self.assertEqual(out["query"], "port=25")
+        self.assertEqual(out["total"], 1)
+        self.assertEqual(out["services"][0]["host"], "mail.i2p")
+
+    def test_json_all_services(self) -> None:
+        cap = io.StringIO()
+        self._run(["--db", self.tmp, "--show-services", "--json"], cap)
+        import json as _json
+        out = _json.loads(cap.getvalue())
+        self.assertEqual(out["total"], 2)
+        self.assertEqual(
+            {s["host"] for s in out["services"]},
+            {"irc-a.i2p", "mail.i2p"},
+        )
+
+    def test_empty_query_reports_helpful_hint(self) -> None:
+        cap = io.StringIO()
+        self._run(["--db", self.tmp, "--show-services",
+                   "--protocol", "bittorrent", "--json"], cap)
+        import json as _json
+        out = _json.loads(cap.getvalue())
+        self.assertEqual(out["total"], 0)
+
+    def test_limit_caps_rows(self) -> None:
+        cap = io.StringIO()
+        self._run(["--db", self.tmp, "--show-services",
+                   "--limit", "1", "--json"], cap)
+        import json as _json
+        out = _json.loads(cap.getvalue())
+        self.assertEqual(out["total"], 1, "limit=1 must cap results")
 
 
 # ---------------------------------------------------------------------------

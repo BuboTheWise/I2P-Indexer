@@ -282,11 +282,16 @@ def main():
         description="I2P Indexer — target discovery sweep",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Subcommands:\n"
-            "  export    Generate website files (HTML + TXT) from the address book\n\n"
-            "Examples:\n"
-            "  python3 probe_sweep.py --sweep-filter reachable_only\n"
-            "  python3 probe_sweep.py export --output-dir website\n"
+        "Subcommands:\n"
+        "  export    Generate website files (HTML + TXT) from the address book\n\n"
+        "Query modes:\n"
+        "  --show-services [--protocol TAG | --port N]  List what's on the network\n"
+        "  --check-health                                Show I2P router health\n\n"
+        "Examples:\n"
+        "  python3 probe_sweep.py --sweep-filter reachable_only\n"
+        "  python3 probe_sweep.py --show-services --protocol irc_gateway\n"
+        "  python3 probe_sweep.py --show-services --port 6667 --json\n"
+        "  python3 probe_sweep.py export --output-dir website\n"
         ),
     )
 
@@ -376,6 +381,48 @@ def main():
         "--check-health",
         action="store_true",
         help="Show I2P router health and exit",
+    )
+    p.add_argument(
+        "--show-services",
+        action="store_true",
+        help=(
+            "Query the services table — 'what's out there?' — and exit without "
+            "probing. Pair with --protocol (e.g. irc_gateway) or --port (e.g. 6667). "
+            "Alone, lists every classified service, freshest first"
+        ),
+    )
+    p.add_argument(
+        "--protocol",
+        type=str,
+        default=None,
+        dest="service_protocol",
+        metavar="TAG",
+        help=(
+            "Filter --show-services to a protocol tag (e.g. irc_gateway, smtp, "
+            "xmpp). Combined with --show-services only"
+        ),
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        dest="service_port",
+        metavar="PORT",
+        help=(
+            "Filter --show-services to a TCP port (e.g. 6667 = IRC, 5222 = XMPP). "
+            "Combined with --show-services only"
+        ),
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Max service rows to return for --show-services (default: 100)",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit --show-services results as structured JSON (for piping/export)",
     )
     p.add_argument(
         "--wait-for-i2p",
@@ -531,6 +578,54 @@ def main():
             print(health.summary())
         except ConnectionError as e:
             print(f"I2P console unreachable: {e}")
+        return
+
+    # ── Services query mode ─────────────────────────────────────
+    # Answers "what's on the network?" from the services table — a
+    # read-only query that exits before any probing.  Filter precedence:
+    #   --protocol  (protocol tag)  >  --port  (TCP port)  >  all services.
+    if args.show_services:
+        db = DiscoveryDB(args.db)
+        try:
+            if args.service_protocol:
+                rows = db.get_services_by_protocol(args.service_protocol, args.limit)
+                label = f"protocol={args.service_protocol}"
+            elif args.service_port is not None:
+                rows = db.get_services_by_port(args.service_port, args.limit)
+                label = f"port={args.service_port}"
+            else:
+                rows = db.get_all_services(args.limit)
+                label = "all services"
+        finally:
+            db.close()
+
+        if args.json:
+            import json as _svc_json
+            print(_svc_json.dumps(
+                {"query": label, "total": len(rows), "services": rows},
+                indent=2,
+                default=str,
+            ))
+            return
+
+        if not rows:
+            print(f"\n  (no services match {label} — run a sweep with --protocol-gate first)\n")
+            return
+
+        _ok = sum(1 for r in rows if r["status"] == "ok")
+        _closed = sum(1 for r in rows if r["status"] == "closed")
+        _unreach = len(rows) - _ok - _closed
+        print(f"\n{'='*78}")
+        print(f"  Services  —  {len(rows)} endpoint(s)  [{label}]   "
+              f"({_ok} ok, {_closed} closed, {_unreach} unreachable)")
+        print(f"{'='*78}")
+        for r in rows:
+            status = r["status"].upper()
+            print(f"  [{status:>10}] {r['host']:<32}:{r['port']:<6} "
+                  f"{r['protocol']:<14} {r['service_type']}")
+            if r["banner_text"]:
+                print(f"             banner: {r['banner_text']!r}")
+            print(f"             seen {r['seen_count']}x, last {r['last_seen']:.0f}\n")
         return
 
     # ── Wait for network readiness ──────────────────────────────

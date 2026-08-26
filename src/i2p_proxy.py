@@ -726,11 +726,169 @@ def _fingerprint_protocol(banner: bytes) -> str:
     # 3. Heuristics for common non-HTTP services detectable by structure
     if b"<stream" in banner[:50] or b"</streamelement>" in banner[:50]:
         return "xmpp/jabber"
-    if banner.startswith(b"\x00\x01") or len(banner) == 0:
-        # TLS/NULL banners are common on SMTP
+    # Non-empty TLS/NULL banners (0x00 0x01 prefix) are common on SMTP.
+    # A truly empty read (len==0) is *closed*, not a guessed TLS handshake —
+    # see the protocol-gate design notes on asymmetric confidence.
+    if banner.startswith(b"\x00\x01"):
         return "smtp/tls"
+    if len(banner) == 0:
+        return "closed"
 
     return "unknown/tcp"
+
+
+# ── Protocol-gate: classification + confidence ─────────────────────────────
+
+# Tags the gate treats as "definitely HTTP" → always proceed to the normal
+# fetch + extractor pipeline.
+_HTTP_TAGS: frozenset[str] = frozenset({"http/web"})
+
+# Tags that are clearly non-HTTP. When the classifier is confident (≥
+# GATE_CONFIDENCE_THRESHOLD), the gate fires: record a services table row and
+# skip the HTTP body fetch + extractors.
+_NON_HTTP_TAGS: frozenset[str] = frozenset(
+    {
+        "irc_gateway",
+        "smtp/nntp",
+        "smtp/tls",
+        "bob_bridge",
+        "bittorrent_tracker",
+        "xmpp/jabber",
+        "ftp",
+        "gopher",
+    }
+)
+
+# Tags that are "unknown" — could be HTTP, could be something else. We
+# default to trying HTTP for these (asymmetric: a false "HTTP" costs one
+# fetch; a false "non-HTTP" would mask a real site).
+_AMBIGUOUS_TAGS: frozenset[str] = frozenset({"unknown/tcp", "closed", "unreachable"})
+
+# Human-friendly labels for the services table and DiscoveryResult display.
+# Keyed by protocol tag; defaults to the tag itself when not listed.
+_SERVICE_TYPE_LABELS: dict[str, str] = {
+    "http/web": "I2P web site",
+    "smtp/nntp": "Mail/NNTP",
+    "smtp/tls": "Mail over TLS",
+    "irc_gateway": "I2P IRC gateway",
+    "bob_bridge": "BOB (BitTorrent) bridge",
+    "bittorrent_tracker": "Bittorrent peer/tracker",
+    "xmpp/jabber": "XMPP/Jabber (I2P-XMPP)",
+    "ftp": "FTP server",
+    "ftp_server": "FTP server",
+    "gopher": "Gopher",
+    "unknown/tcp": "Unknown service (non-HTTP)",
+    "closed": "No banner (closed / no response)",
+    "unreachable": "Unreachable (no TCP connect)",
+}
+
+
+@dataclass(frozen=True)
+class ServiceClassification:
+    """Result of classifying a TCP banner.
+
+    Attributes
+    ----------
+    protocol: stable tag string, e.g. ``"irc_gateway"``, ``"http/web"``.
+    confidence: 0.0–1.00. How confident the classifier is. Exact signature
+        matches are 1.00, regex matches are 0.90, structural heuristics are
+        0.75, unknown/ambiguous are 0.30.
+    raw_banner: the first bytes read from the socket (for diagnostics).
+    service_type: human-friendly label for display or DB storage.
+    """
+
+    protocol: str
+    confidence: float
+    raw_banner: bytes
+    service_type: str = ""
+
+    @property
+    def is_http(self) -> bool:
+        """True if the gate should NOT fire (normal fetch+extractors)."""
+        return self.protocol in _HTTP_TAGS
+
+    @property
+    def is_ambiguous(self) -> bool:
+        """True if the classifier is uncertain → default to HTTP path."""
+        return self.protocol in _AMBIGUOUS_TAGS
+
+    @property
+    def is_non_http(self) -> bool:
+        """True if the gate should fire (skip HTTP; record service).
+
+        Uses a conservative threshold: the tag must be clearly non-HTTP AND
+        confidence must be ≥ 0.85. This means the gate only fires for exact
+        signature matches (conf 1.00) or very confident regex matches (0.90).
+        Structural heuristics (0.75) and unknown (0.30) do NOT fire — they
+        fall through to the normal HTTP path, which is asymmetric-safe:
+        a false "HTTP" costs one fetch, a false "non-HTTP" would mask a site.
+        """
+        return self.protocol in _NON_HTTP_TAGS and self.confidence >= 0.85
+
+
+def classify_service(banner: bytes) -> ServiceClassification:
+    """Classify a TCP banner into a protocol tag with a confidence score.
+
+    Pure function — no I/O, no network, no time. Directly unit-testable.
+
+    Confidence model (deliberately conservative):
+      * Exact prefix match in ``_PROTOCOL_SIGNATURES``        → 1.00 (high)
+      * Regex pattern match in ``_PROTOCOL_PATTERNS_RE``       → 0.90 (high)
+      * Structural heuristics (b'<stream', 0x00 0x01)          → 0.75 (mid)
+      * Empty / unrecognized banner (unknown/tcp)              → 0.30 (low)
+
+    The caller uses ``.is_non_http`` (which requires confidence ≥ 0.85)
+    to decide whether to gate the HTTP pipeline. This means:
+
+      * High-confidence IRC/SMTP/BOB/Bittorrent/XMPP/FTP     → gate fires
+      * Low-confidence or ambiguous banners                   → no gate
+      * HTTP banners                                          → normal flow
+    """
+    tag = _fingerprint_protocol(banner)
+    return _build_classification(tag, banner)
+
+
+def _build_classification(tag: str, raw_banner: bytes) -> ServiceClassification:
+    """Map a protocol *tag* to its confidence and a human-friendly label.
+
+    Confidence is derived from which mechanism identified the tag:
+      * Exact prefix match in ``_PROTOCOL_SIGNATURES``        → 1.00
+      * Regex pattern match in ``_PROTOCOL_PATTERNS_RE``       → 0.90
+      * Structural heuristics (b'<stream', 0x00 0x01)          → 0.75
+      * Empty / unrecognized banner                            → 0.30
+    """
+    label = _SERVICE_TYPE_LABELS.get(tag, tag)
+
+    if tag in _HTTP_TAGS:
+        return ServiceClassification(
+            protocol=tag, confidence=1.00,
+            raw_banner=raw_banner, service_type=label,
+        )
+
+    if tag in _NON_HTTP_TAGS:
+        for sig_tag, _prefix, _length in _PROTOCOL_SIGNATURES:
+            if sig_tag == tag:
+                return ServiceClassification(
+                    protocol=tag, confidence=1.00,
+                    raw_banner=raw_banner, service_type=label,
+                )
+        for reg_tag, pattern in _PROTOCOL_PATTERNS_RE:
+            if reg_tag == tag and pattern.search(raw_banner):
+                return ServiceClassification(
+                    protocol=tag, confidence=0.90,
+                    raw_banner=raw_banner, service_type=label,
+                )
+        # Non-HTTP tag matched only by structural heuristic.
+        return ServiceClassification(
+            protocol=tag, confidence=0.75,
+            raw_banner=raw_banner, service_type=label,
+        )
+
+    # Unknown / ambiguous / closed / unreachable.
+    return ServiceClassification(
+        protocol=tag, confidence=0.30,
+        raw_banner=raw_banner, service_type=label,
+    )
 
 
 # ---------------------------------------------------------------------------

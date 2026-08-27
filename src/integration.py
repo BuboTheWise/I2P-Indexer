@@ -575,6 +575,7 @@ class DiscoveryResult:
     service_protocol: str = ""   # machine tag ("irc_gateway")
     gate_applied: bool = False   # True when the gate fired for this destination
     gate_confidence: float = 0.0 # classifier confidence at gate-fire time
+    gate_ports: list[int] = field(default_factory=list)  # ports the gate probed; populated when gate_applied
     # gate_hit — the DOWNSTREAM branch-condition flag.
     # True ONLY when the gate fired AND a service record was actually written
     # to the services table (a non-HTTP service was positively identified and
@@ -616,6 +617,13 @@ GATE_CONFIDENCE_THRESHOLD: float = 0.85
 # Default port used when the gate probes a destination without an explicit
 # port hint. I2P web services default to 443.
 DEFAULT_GATE_PORT: int = 443
+
+# Default set of ports the gate probes when no explicit list is supplied.
+# 443 (HTTPS), 6667 (IRC), 5222 (XMPP/Jabber) cover the I2P services that
+# are most commonly misclassified as web. Pass a custom list via
+# ``gate_ports=`` on probe_destination() / discover_addresses() / auto_crawl()
+# or ``--gate-ports`` on probe_sweep.py.
+DEFAULT_GATE_PORTS: tuple[int, ...] = (443, 6667, 5222)
 
 
 
@@ -2310,6 +2318,7 @@ def probe_destination(
     robots_policy: TypingAny = None,
     service_gate: bool = False,
     port: int = 0,
+    gate_ports: list[int] | tuple[int, ...] | None = None,
 ) -> DiscoveryResult:
     """Probe a single destination by BOTH its b32 key address and .i2p DNS name.
 
@@ -2327,27 +2336,58 @@ def probe_destination(
       the normal flow proceeds unchanged.  Default False so existing callers
       and tests are unaffected.
     ``port`` optional hint for the gate's banner port (0 → DEFAULT_GATE_PORT).
+        Only used when ``gate_ports`` is not supplied. Backward-compat single-port.
+    ``gate_ports`` optional explicit list of ports the gate probes, in order.
+        When supplied (non-empty), overrides ``port`` entirely.  The gate scans
+        EVERY port in the list (default ``(443, 6667, 5222)`` when the gate is
+        on and no explicit list is given).  A confident non-HTTP classification
+        on ANY port fires the gate for that specific (host, port) — we record
+        the fired service and skip the HTTP path.  Closed/ambiguous/HTTP
+        classifications on a given port are silently skipped and the gate moves
+        on.  Only a fully silent scan (all ports closed/unreachable/ambiguous)
+        falls through to the normal HTTP path.  This is the "what's on port
+        6667?" capability: the services table accumulates per-(host, port)
+        rows across the full port set.
     """
     b32_addr = _hex_to_b32_addr(ident_hash_hex) if len(ident_hash_hex) == 40 else ""
     results: list[DiscoveryResult] = []
 
-    # ── Protocol gate (opt-in) ───────────────────────────────────────────
+    # ── Protocol gate (opt-in, multi-port) ──────────────────────────────
     if service_gate:
-        gate_port = port if port else DEFAULT_GATE_PORT
         host = b32_addr or i2p_dns_name or ident_hash_hex
-        try:
-            tag, banner = probe_tcp_banner(
-                host=host, port=gate_port,
-                timeout=max(1.5, min(timeout, 4.0)),
-                config=config,
-            )
+        # Resolve the port list once: explicit list > single ``port`` hint > default set.
+        if gate_ports:
+            port_list: list[int] = list(gate_ports)
+        elif port:
+            port_list = [port]
+        else:
+            port_list = list(DEFAULT_GATE_PORTS)
+        # Full scan: iterate EVERY port in the list and record each confident
+        # non-HTTP (host, port) in the services table. If ANY port fires, the
+        # gate applies → skip the HTTP path for this destination.
+        # The services table accumulates the full port map; downstream
+        # consumers of the single DiscoveryResult see the FIRST-fired (in
+        # list order) service as the destination's "dominant" one.
+        fired: list = []  # list of (port, svc)
+        for gate_port in port_list:
+            try:
+                tag, banner = probe_tcp_banner(
+                    host=host, port=gate_port,
+                    timeout=max(1.5, min(timeout, 4.0)),
+                    config=config,
+                )
+            except Exception as gate_exc:
+                # Best-effort: a network error on one port should not abort
+                # the whole port scan or fail the destination probe.
+                logger.warning(
+                    "Gate banner probe failed on %s:%d: %s — continuing scan",
+                    host, gate_port, gate_exc,
+                )
+                continue
             svc = classify_service(banner)
             if svc.is_non_http:
-                # Gate fired. Record the service and return early — skip the
-                # expensive HTTP body fetch and extractor pipeline.
+                # Record this (host, port) in the services table.
                 if db:
-                    # Banner probe outcomes: no bytes = closed/rejected TCP,
-                    # bytes present (and classified) = a live non-HTTP service.
                     status = "closed" if not banner else "ok"
                     db.record_service(
                         host=host,
@@ -2357,34 +2397,46 @@ def probe_destination(
                         banner=banner,
                         status=status,
                     )
-                gated_res = DiscoveryResult(
-                    b32_addr=b32_addr or host,
-                    ident_hash_hex=ident_hash_hex,
-                    reachable=True,
-                    via_method="banner_gate",
-                    probe_mode="banner",
-                    status_code=0,
-                    error="",
-                    service_type=svc.service_type or svc.protocol,
-                    service_protocol=svc.protocol,
-                    gate_applied=True,
-                    gate_confidence=svc.confidence,
-                    gate_hit=True,
-                )
+                fired.append((gate_port, svc))
                 logger.info(
-                    "Gate fired on %s:%d → %s (%s, conf=%.2f) — skipping HTTP path",
+                    "Gate fired on %s:%d → %s (%s, conf=%.2f)",
                     host, gate_port, svc.protocol, svc.service_type, svc.confidence,
                 )
-                return gated_res
             else:
                 logger.debug(
-                    "Gate: %s:%d → %s (conf=%.2f) — proceeding to HTTP path",
+                    "Gate: %s:%d → %s (conf=%.2f) — no fire",
                     host, gate_port, svc.protocol, svc.confidence,
                 )
-        except Exception as gate_exc:
-            # Gate is best-effort: a network error in the banner probe should
-            # not fail the whole destination probe. Fall through to HTTP.
-            logger.warning("Gate banner probe failed for %s: %s", host, gate_exc)
+        # Any confident non-HTTP service on ANY port → gate applies.
+        # Skip the HTTP path and return the first-fired (in list order) service
+        # as the destination's dominant service.
+        if fired:
+            first_svc = fired[0][1]
+            gate_res = DiscoveryResult(
+                b32_addr=b32_addr or host,
+                ident_hash_hex=ident_hash_hex,
+                reachable=True,
+                via_method="banner_gate",
+                probe_mode="banner",
+                status_code=0,
+                error="",
+                service_type=first_svc.service_type or first_svc.protocol,
+                service_protocol=first_svc.protocol,
+                gate_applied=True,
+                gate_confidence=max(svc.confidence for _, svc in fired),
+                gate_ports=port_list,
+                gate_hit=True,
+            )
+            logger.info(
+                "Gate: %d service(s) on %s (ports %s) — skipping HTTP path",
+                len(fired), host, [p for p, _ in fired],
+            )
+            return gate_res
+        # Entire port scan complete with no gate fires — proceed to HTTP.
+        logger.debug(
+            "Gate: %s scanned %s — no confident non-HTTP service, proceeding to HTTP path",
+            host, port_list,
+        )
 
     # ── Attempt 1: Hit the b32 key directly (no DNS resolution needed)
     if b32_addr:
@@ -2853,6 +2905,7 @@ def discover_addresses(
     respect_robots: bool = False,
     service_gate: bool = False,
     gate_port: int = 0,
+    gate_ports: list[int] | tuple[int, ...] | None = None,
 ) -> list[DiscoveryResult]:
     """Probe destinations and record results in persistent DB.
 
@@ -3006,6 +3059,7 @@ def discover_addresses(
                 robots_policy=robots_policy if respect_robots else None,
                 service_gate=service_gate,
                 port=gate_port,
+                gate_ports=gate_ports,
             )
             results.append(res)
 
@@ -3059,6 +3113,7 @@ def auto_crawl(
     db_instance: DiscoveryDB | None = None,
     service_gate: bool = False,
     gate_port: int = 0,
+    gate_ports: list[int] | tuple[int, ...] | None = None,
 ) -> dict:
     """Recursively discover new .i2p destinations by crawling links within depth bounds.
 
@@ -3192,6 +3247,7 @@ def auto_crawl(
                         config=cfg,
                         service_gate=service_gate,
                         port=gate_port,
+                        gate_ports=gate_ports,
                     )
                 except Exception as exc:
                     logger.warning("  ERROR probing %s: %s", target_id, exc)
@@ -3201,12 +3257,24 @@ def auto_crawl(
                 reachable = result.reachable if hasattr(result, "reachable") else False
                 if reachable:
                     n_ok += 1
-                    ctype = getattr(result, "content_type", "") or ""
-                    title = getattr(result, "title", "") or ""
-                    logger.info(
-                        "  ✓ [%s] status=OK type=%s title=%s links_found=%d",
-                        target_id, ctype, title[:40], len(getattr(result, "found_links", []) or []),
-                    )
+                    if getattr(result, "gate_applied", False):
+                        # Gate fired: confident non-HTTP service — correctly
+                        # counted as a handled destination, but NOT as a
+                        # crawled page (there are no links to extract; the
+                        # service is already recorded in the services table).
+                        logger.info(
+                            "  ▪ [%s] GATED svc=%s (conf=%.2f) — no link extraction",
+                            target_id,
+                            getattr(result, "service_type", "?"),
+                            getattr(result, "gate_confidence", 0.0),
+                        )
+                    else:
+                        ctype = getattr(result, "content_type", "") or ""
+                        title = getattr(result, "title", "") or ""
+                        logger.info(
+                            "  ✓ [%s] status=OK type=%s title=%s links_found=%d",
+                            target_id, ctype, title[:40], len(getattr(result, "found_links", []) or []),
+                        )
                 else:
                     n_fail += 1
 
@@ -3243,6 +3311,7 @@ def print_report(results: list[DiscoveryResult], json_out: bool = False):
     """
     reachable = [r for r in results if r.reachable]
     dead = [r for r in results if not r.reachable]
+    gated = [r for r in results if getattr(r, "gate_applied", False)]
 
     # Structured output path
     if json_out:
@@ -3250,25 +3319,36 @@ def print_report(results: list[DiscoveryResult], json_out: bool = False):
         return {
             "total": len(results),
             "by_status": {k: sum(1 for r in results if getattr(r, k))
-                         for k in ("reachable",)},
+                         for k in ("reachable", "gate_applied")},
             "reachable_count": len(reachable),
             "dead_count": len(dead),
+            "gated_count": len(gated),
             "results": [asdict(r) for r in results],
         }
 
     print(f"\n{'='*70}")
     print(f"  I2P DISCOVERY RESULTS")
-    print(f"  Total: {len(results)} | Reachable: {len(reachable)} | Dead: {len(dead)}")
+    g = f" | Gated: {len(gated)}" if gated else ""
+    print(f"  Total: {len(results)} | Reachable: {len(reachable)} | Dead: {len(dead)}{g}")
     print(f"{'='*70}")
 
     for r in results:
-        status = "OK" if r.reachable else "DOWN"
+        # Gate-aware status: a fired gate is NOT a probe failure — it's a
+        # classified non-HTTP service (recorded in the services table).
+        if getattr(r, "gate_applied", False):
+            status = "GATED"
+        else:
+            status = "OK" if r.reachable else "DOWN"
         tag = f"[{r.via_method}]" if r.via_method else "[?]"
         ctype = f"  {r.content_type}" if r.content_type else ""
+        svc_tag = ""
+        if getattr(r, "service_type", None):
+            conf = getattr(r, "gate_confidence", 0.0)
+            svc_tag = f"  svc={r.service_type}(conf={conf:.2f})"
         line = (
-            f"  [{status}] {tag:>7}  {r.b32_addr[:40]:<40}"
+            f"  [{status}] {tag:>9}  {r.b32_addr[:40]:<40}"
             f"  status={r.status_code:<5d}  body={r.body_length:<8d}"
-            f"  time={r.response_time_sec:.1f}s{ctype}"
+            f"  time={r.response_time_sec:.1f}s{ctype}{svc_tag}"
         )
         if r.title:
             line += f'  "{r.title[:50]}"'
@@ -3382,7 +3462,12 @@ def print_address_book(
     print(f"{'='*72}")
 
     for e in entries:
-        status = "OK" if e["reachable"] else "DOWN"
+        # A banner-gate hit (via_method == "banner_gate") is NOT an OK/DOWN
+        # status — it's a classified non-HTTP service. Label it GATED.
+        if (e.get("via_method") or "") == "banner_gate":
+            status = "GATED"
+        else:
+            status = "OK" if e["reachable"] else "DOWN"
         utc = e.get("last_probed_utc", "") or ""
 
         # ── rich synthesized summary (from view, replaces raw content_summary) ──

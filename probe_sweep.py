@@ -475,9 +475,26 @@ def main():
     p.add_argument(
         "--gate-port",
         type=int,
-        default=443,
+        default=0,
         metavar="PORT",
-        help="TCP port for the protocol gate's banner probe (default: 443; only used with --protocol-gate)",
+        help=(
+            "TCP port for the protocol gate's banner probe (default when "
+            "unset: the standard set 443,6667,5222; only used with "
+            "--protocol-gate). Deprecated single-port alias — prefer "
+            "--gate-ports; --gate-ports wins when both are given."
+        ),
+    )
+    p.add_argument(
+        "--gate-ports",
+        type=str,
+        default=None,
+        metavar="PORTS",
+        help=(
+            "Comma-separated list of TCP ports the gate probes, in order "
+            "(default: 443,6667,5222 when --protocol-gate is used without an "
+            "explicit list). Example: --gate-ports 443,6667,5222,25,2525. "
+            "Overrides --gate-port. Only used with --protocol-gate."
+        ),
     )
     p.add_argument(
         "--no-backoff",
@@ -707,6 +724,12 @@ def main():
     if args.respect_robots:
         print("  robots.txt filtering enabled — skipping Disallow paths")
 
+    # Parse comma-separated --gate-ports into a list of ints (empty → None).
+    gate_ports_list: list[int] | None = None
+    if args.gate_ports:
+        parts = [p.strip() for p in args.gate_ports.split(",") if p.strip()]
+        gate_ports_list = [int(p) for p in parts] if parts else None
+
     results = discover_addresses(
         known_addrs=None,
         config=cfg,
@@ -720,6 +743,7 @@ def main():
         respect_robots=args.respect_robots,
         service_gate=args.protocol_gate,
         gate_port=args.gate_port,
+        gate_ports=gate_ports_list,
     )
 
     # Slice to --count if requested

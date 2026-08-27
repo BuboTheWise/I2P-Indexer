@@ -513,6 +513,194 @@ class TestProbeDestinationGate(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Multi-port gate — full scan records every (host, port) that fires
+# ---------------------------------------------------------------------------
+
+class TestMultiPortGate(unittest.TestCase):
+    """The gate scans EVERY port in the list and records each confident
+    non-HTTP hit in the services table.  If any port fires, the HTTP path
+    is skipped and the first-fired (list order) service becomes the
+    dominant result.
+
+    Default port set: (443, 6667, 5222).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mktemp(suffix=".db")
+        self.db = DiscoveryDB(self.tmp)
+        self.hash = "a" * 40  # fake 40-hex ident → b32 addr
+
+    def tearDown(self) -> None:
+        self.db.close()
+        if os.path.exists(self.tmp):
+            os.unlink(self.tmp)
+
+    def _banner_for_port(self, port: int) -> bytes:
+        """Return a banner that will classify as confident non-HTTP."""
+        # IRC welcome banner classifies as irc_gateway @ conf=1.00
+        return b" :Welcome to IRC at irc.i2p\r\n"
+
+    def _http_banner(self) -> bytes:
+        return b"HTTP/1.1 200 OK\r\n"
+
+    def test_default_port_list_is_three_ports(self) -> None:
+        """DEFAULT_GATE_PORTS must be (443, 6667, 5222)."""
+        from src.integration import DEFAULT_GATE_PORTS
+        self.assertEqual(DEFAULT_GATE_PORTS, (443, 6667, 5222))
+
+    def test_multi_port_scan_records_every_fired_port(self) -> None:
+        """Two ports with non-HTTP banners → two rows in services.
+
+        Port 6667 → IRC banner (fires)
+        Port 5222 → IRC banner (also fires — same classification is fine for the test)
+        Port 443  → HTTP banner (no fire)
+        """
+        # side_effect based on the port kwarg
+        def fake_banner(host=None, port=None, timeout=None, config=None):
+            if port == 6667:
+                return ("irc_gateway", b" :Welcome to IRC\r\n")
+            elif port == 5222:
+                return ("irc_gateway", b" :Welcome to IRC (xmpp)\r\n")
+            else:
+                return ("http/web", b"HTTP/1.1 200 OK\r\n")
+
+        mock = MagicMock(side_effect=fake_banner)
+        with patch("src.integration.probe_tcp_banner", mock):
+            res = probe_destination(
+                self.hash, db=self.db, timeout=5,
+                service_gate=True,
+            )
+
+        self.assertTrue(res.gate_applied)
+        self.assertTrue(res.reachable)
+        self.assertEqual(res.via_method, "banner_gate")
+        # Both non-HTTP ports should have been probed and recorded
+        self.assertEqual(mock.call_count, 3)
+        # services table: exactly 2 rows (6667 and 5222, not 443)
+        rows = self.db._conn.execute(
+            "SELECT port, protocol FROM services ORDER BY port"
+        ).fetchall()
+        self.assertEqual(len(rows), 2, f"expected 2 service rows, got {len(rows)}")
+        ports_hit = [r[0] for r in rows]
+        self.assertIn(6667, ports_hit)
+        self.assertIn(5222, ports_hit)
+        self.assertNotIn(443, ports_hit)
+        # gate_ports field reflects the full list
+        self.assertEqual(res.gate_ports, [443, 6667, 5222])
+
+    def test_single_port_fires_among_multi(self) -> None:
+        """Only 6667 fires, 443 and 5222 are HTTP → one row, gate still applies."""
+        def fake_banner(host=None, port=None, timeout=None, config=None):
+            if port == 6667:
+                return ("irc_gateway", b" :Welcome to IRC\r\n")
+            return ("http/web", b"HTTP/1.1 200 OK\r\n")
+
+        mock = MagicMock(side_effect=fake_banner)
+        with patch("src.integration.probe_tcp_banner", mock):
+            res = probe_destination(
+                self.hash, db=self.db, timeout=5,
+                service_gate=True,
+            )
+
+        self.assertTrue(res.gate_applied)
+        rows = self.db._conn.execute("SELECT port FROM services").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], 6667)
+        self.assertEqual(res.service_protocol, "irc_gateway")
+
+    def test_no_port_fires_falls_through_to_http(self) -> None:
+        """All three ports return HTTP → gate does NOT apply, HTTP path runs."""
+        mock = MagicMock(return_value=("http/web", b"HTTP/1.1 200 OK\r\n"))
+        with patch("src.integration.probe_tcp_banner", mock):
+            res = probe_destination(
+                self.hash, db=self.db, timeout=1,
+                service_gate=True,
+            )
+        self.assertFalse(res.gate_applied)
+        # All 3 ports were probed, none recorded
+        self.assertEqual(mock.call_count, 3, "all ports must be scanned")
+        rows = self.db._conn.execute("SELECT * FROM services").fetchall()
+        self.assertEqual(len(rows), 0, "no services rows when no port fires")
+
+    def test_explicit_gate_ports_argument(self) -> None:
+        """gate_ports=[7000] → only port 7000 is probed, not the default set."""
+        mock = MagicMock(return_value=("irc_gateway", b" :Welcome to IRC\r\n"))
+        with patch("src.integration.probe_tcp_banner", mock):
+            res = probe_destination(
+                self.hash, db=self.db, timeout=5,
+                service_gate=True,
+                gate_ports=[7000],
+            )
+        self.assertTrue(res.gate_applied)
+        self.assertEqual(mock.call_count, 1, "only explicitly listed port probed")
+        mock.assert_called_once()
+        called_port = mock.call_args_list[0].kwargs.get("port") or mock.call_args_list[0][1].get("port")
+        self.assertEqual(called_port, 7000)
+        self.assertEqual(res.gate_ports, [7000])
+
+    def test_port_argument_overrides_default_list(self) -> None:
+        """gate_port=5222 (single) → only that port is probed."""
+        mock = MagicMock(return_value=("smtp/nntp", b"+OK ready\r\n"))
+        with patch("src.integration.probe_tcp_banner", mock):
+            res = probe_destination(
+                self.hash, db=self.db, timeout=5,
+                service_gate=True,
+                port=5222,
+            )
+        self.assertTrue(res.gate_applied)
+        self.assertEqual(mock.call_count, 1)
+        called_port = mock.call_args_list[0].kwargs.get("port") or mock.call_args_list[0][1].get("port")
+        self.assertEqual(called_port, 5222)
+        self.assertEqual(res.gate_ports, [5222])
+        # services row recorded at port 5222
+        rows = self.db._conn.execute("SELECT port FROM services WHERE port=5222").fetchall()
+        self.assertEqual(len(rows), 1)
+
+    def test_gate_exception_on_one_port_does_not_abort_scan(self) -> None:
+        """A network error on port 443 should not prevent the 6667 scan."""
+        def fake_banner(host=None, port=None, timeout=None, config=None):
+            if port == 443:
+                raise OSError("connection reset")
+            return ("irc_gateway", b" :Welcome to IRC\r\n")
+
+        mock = MagicMock(side_effect=fake_banner)
+        with patch("src.integration.probe_tcp_banner", mock):
+            res = probe_destination(
+                self.hash, db=self.db, timeout=5,
+                service_gate=True,
+            )
+        # 6667 still fired even though 443 raised
+        self.assertTrue(res.gate_applied)
+        self.assertEqual(res.service_protocol, "irc_gateway")
+
+    def test_multi_port_threaded_through_discover_addresses(self) -> None:
+        """gate_ports kwarg on discover_addresses reaches probe_destination."""
+        from src.integration import discover_addresses
+
+        def fake_banner(host=None, port=None, timeout=None, config=None):
+            if port == 6667:
+                return ("irc_gateway", b" :Welcome to IRC\r\n")
+            return ("http/web", b"HTTP/1.1 200 OK\r\n")
+
+        mock = MagicMock(side_effect=fake_banner)
+        with patch("src.integration.probe_tcp_banner", mock):
+            results = discover_addresses(
+                known_addrs=[("a" * 40, "")],
+                db_instance=self.db,
+                probe_delay=0,
+                timeout=1,
+                service_gate=True,
+                gate_ports=[6667],
+            )
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].gate_applied)
+        # Only port 6667 was probed (not 443 or 5222)
+        self.assertEqual(mock.call_count, 1)
+        row = self.db._conn.execute("SELECT * FROM services WHERE port = 6667").fetchone()
+        self.assertIsNotNone(row)
+
+
+# ---------------------------------------------------------------------------
 # discover_addresses() — production sweep path with the gate wired through
 # ---------------------------------------------------------------------------
 

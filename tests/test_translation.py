@@ -40,8 +40,10 @@ class TestLanguageDetection:
 
     def test_detect_german(self):
         """German content should be detected as German."""
-        title = "Willkommen im Forum"
-        body = "Dies ist eine großartige Community für offene Diskussionen."
+        title = "Willkommen in unserem Forum"
+        body = ("Dies ist eine großartige Online-Community für offene Diskussionen, "
+                "den Austausch von Erfahrungen und das gemeinsame Teilen von Wissen. "
+                "Alle Mitglieder sind hier herzlich willkommen.")
         lang, conf = detect_language(title, body)
         assert lang == "de", f"Expected 'de', got '{lang}'"
 

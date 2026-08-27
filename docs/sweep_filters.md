@@ -170,6 +170,7 @@ Sweep filters work with all existing probe_sweep.py options:
 | `--delay S` | `python3 probe_sweep.py --sweep-filter reachable_only --delay 2` (faster probing of live sites) |
 | `--report PATH` | `python3 probe_sweep.py --sweep-filter reachable_only --report report.md` (probe + generate report) |
 | `--show-book` | `python3 probe_sweep.py --sweep-filter all --show-book` (full sweep + print address book) |
+| `--show-services` | `python3 probe_sweep.py --show-services --protocol irc_gateway` (list detected services; no probing) |
 | `--probe-timeout S` | `python3 probe_sweep.py --sweep-filter reachable_only --probe-timeout 60` (shorter timeout for health checks) |
 | `--crawl-depth N` | `python3 probe_sweep.py --sweep-filter all --crawl-depth 2` (auto-crawl linked sites up to depth 2) |
 | `--max-new-targets N` | `python3 probe_sweep.py --crawl-depth 2 --max-new-targets 25` (limit auto-crawl to 25 new discoveries) |
@@ -188,6 +189,35 @@ Opt-in flag introduced in v0.4.13. When `--protocol-gate` is set, `probe_destina
 - `--gate-port` overrides the banner probe's default TCP port (443). Use it when a destination is known to serve a specific protocol on a non-default port, e.g. IRC on 6667.
 - This is independent of and orthogonal to `--sweep-filter` — combine as needed, e.g. `--sweep-filter stale --protocol-gate --gate-port 6667` to re-probe stale targets for an IRC service.
 
+---
+
+## Service Query (`--show-services`)
+
+Shipped in v0.4.14. A **read-only** lookup mode for the `services` table populated by the protocol gate. It never enters the probe path and makes no network calls — safe to run at any time to inspect what the network looks like today.
+
+```bash
+# Everything detected
+python3 probe_sweep.py --show-services
+
+# Only IRC gateways, freshest first
+python3 probe_sweep.py --show-services --protocol irc_gateway
+
+# Only services detected on a specific TCP port
+python3 probe_sweep.py --show-services --port 6667
+
+# JSON output for piping / importing into other tools
+python3 probe_sweep.py --show-services --protocol smtp --limit 50 --json
+```
+
+| Flag | Effect |
+|---|---|
+| `--show-services` | Enter query mode (skips probing entirely) |
+| `--protocol TAG` | Filter to a single protocol tag (e.g. `irc_gateway`, `smtp`, `xmpp`) |
+| `--port N` | Filter to a single TCP port |
+| `--limit N` | Cap rows returned (default 100) |
+| `--json` | Emit structured JSON instead of the table |
+
+`--protocol` and `--port` are optional and combinable. With no filter and an empty `services` table the mode prints a helpful hint pointing at `--protocol-gate` to populate it.
 
 ---
 

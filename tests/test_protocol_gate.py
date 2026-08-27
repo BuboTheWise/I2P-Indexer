@@ -401,6 +401,9 @@ class TestDiscoveryResultGateFields(unittest.TestCase):
         self.assertEqual(r.gate_confidence, 0.0)
         self.assertEqual(r.service_type, "")
         self.assertEqual(r.service_protocol, "")
+        # gate_hit is the downstream branch-condition flag: default False
+        # (no gate fired, no service record written).
+        self.assertFalse(r.gate_hit)
 
     def test_populated_gate(self) -> None:
         r = DiscoveryResult(
@@ -409,9 +412,20 @@ class TestDiscoveryResultGateFields(unittest.TestCase):
             service_protocol="irc_gateway",
             gate_applied=True,
             gate_confidence=0.95,
+            gate_hit=True,
         )
         self.assertTrue(r.gate_applied)
         self.assertEqual(r.gate_confidence, 0.95)
+        self.assertTrue(r.gate_hit)
+        # The three gate booleans are independent: gate_applied and gate_hit
+        # co-occur on the fire path, but are NOT aliased — a future codepath
+        # could in principle set one without the other (e.g. a re-fire on
+        # cached classification without a fresh service record). The tests
+        # above lock the invariant in practice, but the field surface must
+        # allow independent construction.
+        r2 = DiscoveryResult(gate_applied=True)  # gate_hit unset
+        self.assertTrue(r2.gate_applied)
+        self.assertFalse(r2.gate_hit)
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +467,10 @@ class TestProbeDestinationGate(unittest.TestCase):
             )
         self.assertTrue(res.reachable)
         self.assertTrue(res.gate_applied)
+        # gate_hit is the branch condition: True on gate-fire (service
+        # recorded), which downstream code can use to tell "gated, service
+        # recorded" apart from a bare status_code==0 fall-through/timeout.
+        self.assertTrue(res.gate_hit)
         self.assertEqual(res.service_protocol, "irc_gateway")
         self.assertEqual(res.service_type, "I2P IRC gateway")
         self.assertGreater(res.gate_confidence, 0.85)
@@ -475,6 +493,12 @@ class TestProbeDestinationGate(unittest.TestCase):
         # fail (no real I2P) but the result's gate_applied must be False.
         self.assertFalse(res.gate_applied,
                          f"HTTP banner must not gate; res.via_method={res.via_method}")
+        # gate_hit must ALSO be False on the fall-through path — this is
+        # exactly the downstream distinction this flag exists for: an HTTP
+        # banner's status_code may be 0 (fetch failed) without a service having
+        # been recorded, so gate_hit is the only reliable signal.
+        self.assertFalse(res.gate_hit,
+                         f"fall-through must not set gate_hit; via={res.via_method}")
 
     def test_gate_off_behaves_as_before(self) -> None:
         mock = self._mock_banner(b" :Welcome", "irc_gateway")

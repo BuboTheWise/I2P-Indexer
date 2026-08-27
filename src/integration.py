@@ -568,11 +568,24 @@ class DiscoveryResult:
     # ── protocol-gate fields ───────────────────────────────────────────
     # Populated when the gate fires (i.e. a confident non-HTTP service was
     # detected and the HTTP pipeline was skipped). When the gate did NOT
-    # fire (normal HTTP flow), all three fields stay "".
+    # fire (normal HTTP flow) or the probe fell through to the HTTP path,
+    # the string fields stay "" and the boolean/float gate fields stay at
+    # their defaults.
     service_type: str = ""       # human-friendly label ("I2P IRC gateway")
     service_protocol: str = ""   # machine tag ("irc_gateway")
     gate_applied: bool = False   # True when the gate fired for this destination
     gate_confidence: float = 0.0 # classifier confidence at gate-fire time
+    # gate_hit — the DOWNSTREAM branch-condition flag.
+    # True ONLY when the gate fired AND a service record was actually written
+    # to the services table (a non-HTTP service was positively identified and
+    # the HTTP pipeline was skipped). On the normal HTTP / fall-through path
+    # it stays False. This exists so downstream code can branch on gate_hit
+    # instead of raw status_code: a fired gate returns status_code 0 +
+    # reachable True, which is otherwise indistinguishable from a probe that
+    # timed out or a silent/closed port falling through to HTTP. It is a
+    # distinct field (NOT an alias of gate_applied) — gate_applied keeps its
+    # existing "gate fired for this destination" semantics unchanged.
+    gate_hit: bool = False
 
 
 
@@ -2356,6 +2369,7 @@ def probe_destination(
                     service_protocol=svc.protocol,
                     gate_applied=True,
                     gate_confidence=svc.confidence,
+                    gate_hit=True,
                 )
                 logger.info(
                     "Gate fired on %s:%d → %s (%s, conf=%.2f) — skipping HTTP path",

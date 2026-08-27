@@ -52,6 +52,78 @@ def _truncate(text: str, max_len: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Simhash (meta-characteristic) near-duplicate detection
+# ---------------------------------------------------------------------------
+# Standard 64-bit simhash over word tokens (Manning, Raghavan & Schütze).
+# Two documents with similar content produce 64-bit fingerprints whose Hamming
+# distance is small (typical threshold: ≤2 or ≤3 bits for 64-bit hashes).
+# We keep the discoveries table lean by storing one simhash per ident in a
+# separate ``simhash_index`` table and answering "is this a near-dup of
+# anything else?" with a Hamming-distance scan over that table.
+
+#: Minimum Hamming distance accepted by default (≤3 bits for a 64-bit hash
+#: is a common recall/precision sweet spot; 0 = exact match).
+DEFAULT_SIMHASH_MAX_HAMMING: int = 3
+
+_WORD_TOKEN_RE = re.compile(r"[a-zA-Z0-9]+(?:['\-][a-zA-Z]+)*", re.UNICODE)
+
+
+def _tokenize_simhash(text: str) -> list[str]:
+    """Lowercase word tokens for simhash input.
+
+    Handles English contractions and hyphenated compounds, strips HTML tags
+    first so tag names (``b``, ``p``) do not become tokens and pollute the
+    meta-characteristic, and otherwise splits on any non-alphanumeric
+    (space, punctuation, etc.).
+    """
+    if not text:
+        return []
+    cleaned = re.sub(r"<[^>]+>", " ", text)
+    return _WORD_TOKEN_RE.findall(cleaned.lower())
+
+
+def compute_simhash(content_text: str) -> int:
+    """Compute a 64-bit simhash (meta-characteristic) over word tokens.
+
+    Deterministic: same text → same 64-bit int. Uses Python's standard
+    ``hashlib.md5`` for the per-token 64-bit fingerprint (stable across
+    processes and Python hash randomization, unlike builtin ``hash()``).
+
+    Returns 0 for empty / fully-non-tokenizable input (defensive: the
+    Hamming scan treats 0 as a real hash, but two empty texts trivially
+    match — which is the desired behaviour).
+    """
+    tokens = _tokenize_simhash(content_text)
+    if not tokens:
+        return 0
+
+    # 64 independent accumulators for the sign-bit sum, one per bit position.
+    # v[i] = Σ sign_i(token) for each bit position i.  Then the final hash is
+    # 1 where v[i] > 0, else 0 — i.e. the majority-vote "meta-characteristic".
+    v = [0] * 64
+    for tok in tokens:
+        # 64-bit per-token fingerprint, stable across Python sessions.
+        h = int.from_bytes(hashlib.md5(tok.encode("utf-8")).digest()[:8], "little")
+        for i in range(64):
+            if (h >> i) & 1:
+                v[i] += 1
+            else:
+                v[i] -= 1
+    out = 0
+    for i in range(64):
+        if v[i] > 0:
+            out |= (1 << i)
+    return out
+
+
+def hamming_distance(a: int, b: int) -> int:
+    """Number of differing bits between two 64-bit hashes."""
+    # bin(x ^ y).count("1") is O(bits) and portable — no platform-specific
+    # popcount required.  For a 64-bit scalar this is trivially fast.
+    return bin(a ^ b).count("1")
+
+
+# ---------------------------------------------------------------------------
 # Router cache helpers — fetch destination blobs from Java daemon's internal DNS
 # ---------------------------------------------------------------------------
 
@@ -686,6 +758,7 @@ class DiscoveryDB:
         self._ensure_targets_columns()
         self._ensure_susi_sync_table()
         self._ensure_services_table()
+        self._ensure_simhash_table()
         self._ensure_address_book_view()
 
     # ── context manager (P4 — prevent connection leaks) ────
@@ -1208,6 +1281,143 @@ class DiscoveryDB:
             rows = cur.fetchall()
         return [dict(zip(keys, r)) for r in rows]
 
+    # ── simhash near-duplicate index ────────────────────────────────────
+
+    def _ensure_simhash_table(self) -> None:
+        """Create the simhash_index table if not already present.
+
+        One 64-bit simhash (meta-characteristic) fingerprint per ident so
+        near-duplicate *content* detection does not bloat the discoveries
+        table.  The hash is over the page body/summary text, independent of
+        how the destination was reached (b32 vs dns), so both probe modes of
+        one destination share a fingerprint.
+
+        Idempotent: CREATE TABLE IF NOT EXISTS.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS simhash_index (
+                ident_hash_hex  TEXT    PRIMARY KEY,
+                simhash_64bit   INTEGER NOT NULL,
+                last_computed   REAL    NOT NULL
+            )"""
+        )
+        # Hamming-distance scans read every row; the table is expected to stay
+        # small-to-medium, but an index on the hash lets ORDER BY / range lookups
+        # avoid a full table temp-sort as it grows.
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_simhash_hash "
+            "ON simhash_index (simhash_64bit)"
+        )
+        self._conn.commit()
+
+    def _record_simhash_unlocked(self, ident_hash_hex: str, simhash_64bit: int) -> int:
+        """Upsert one simhash row. Caller MUST already hold ``self._lock``.
+
+        Split out so ``record_discovery()``, which holds the DB lock for its
+        own INSERT, can record a fingerprint without re-acquiring the
+        (non-reentrant) ``threading.Lock`` and self-deadlocking.
+        """
+        cur = self._conn.cursor()
+        # SQLite INTEGER is *signed* 8-byte ([-2**63, 2**63)).
+        # compute_simhash returns unsigned int in [0, 2**64).
+        # Fold to two's-complement signed for storage, restore on read.
+        sh = int(simhash_64bit) & 0xFFFFFFFFFFFFFFFF
+        if sh >> 63:  # top bit set → represent as signed int64
+            sh -= 1 << 64
+        cur.execute(
+            """
+            INSERT INTO simhash_index
+                (ident_hash_hex, simhash_64bit, last_computed)
+            VALUES (?, ?, ?)
+            ON CONFLICT(ident_hash_hex) DO UPDATE SET
+                simhash_64bit = excluded.simhash_64bit,
+                last_computed = excluded.last_computed
+            """,
+            (ident_hash_hex, sh, datetime.now(timezone.utc).timestamp()),
+        )
+        self._conn.commit()
+        row_id = cur.lastrowid
+        return int(row_id) if row_id is not None else 0
+
+    def record_simhash(self, ident_hash_hex: str, simhash_64bit: int) -> int:
+        """Upsert a 64-bit simhash fingerprint for a destination.
+
+        Overwrites any prior fingerprint for ``ident_hash_hex`` (content
+        changes across re-probes) and refreshes the ``last_computed`` stamp.
+
+        Returns the rowid of the affected row (0 if the connection state is
+        odd — mirrors record_discovery() defensive posture).
+        """
+        with self._lock:
+            return self._record_simhash_unlocked(ident_hash_hex, simhash_64bit)
+
+    def get_simhash(self, ident_hash_hex: str) -> int | None:
+        """Read the stored simhash for a destination, or None if absent."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT simhash_64bit FROM simhash_index WHERE ident_hash_hex = ?",
+                (ident_hash_hex,),
+            )
+            row = cur.fetchone()
+        return self._to_unsigned_64(row[0]) if row is not None else None
+
+    @staticmethod
+    def _to_unsigned_64(v: int) -> int:
+        """Restore an unsigned 64-bit int from a signed SQLite INTEGER read.
+
+        SQLite stores signed 8-byte values.  When bit 63 was set at write time
+        we stored v − 2⁶⁴.  ``v & 0xFFFFFFFFFFFFFFFF`` recovers the original.
+        (Works correctly for values that were already signed-positive too,
+        since & with all-ones mask is a no-op.)
+        """
+        return int(v) & 0xFFFFFFFFFFFFFFFF
+
+    def record_simhash_for_text(self, ident_hash_hex: str, content_text: str) -> int:
+        """Compute the simhash for *content_text* and store it for *ident*.
+
+        Convenience wrapper so callers on the probe/analysis path don't have
+        to import the pure helper.  Returns 0 for empty / non-string input
+        without writing a row (nothing meaningful to fingerprint).
+        """
+        if not isinstance(content_text, str) or not content_text.strip():
+            return 0
+        sh = compute_simhash(content_text)
+        return self.record_simhash(ident_hash_hex, sh)
+
+    def find_similar(
+        self,
+        ident_hash_hex: str,
+        max_hamming: int = DEFAULT_SIMHASH_MAX_HAMMING,
+    ) -> list[dict]:
+        """Return stored fingerprints near-duplicate to the target's content.
+
+        ``max_hamming`` is the inclusive Hamming-distance threshold against the
+        target's OWN stored fingerprint (0 = exact hash match).  The target
+        itself is excluded from the result; other destinations whose simhash is
+        within the threshold are returned ordered by distance (closest first),
+        each as ``{"ident_hash_hex", "hamming_distance"}``.
+        """
+        target = self.get_simhash(ident_hash_hex)
+        if target is None:
+            return []
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT ident_hash_hex, simhash_64bit FROM simhash_index"
+            )
+            rows = cur.fetchall()
+        out: list[dict] = []
+        for hh, sh in rows:
+            if hh == ident_hash_hex:
+                continue
+            d = hamming_distance(self._to_unsigned_64(sh), target)
+            if d <= max_hamming:
+                out.append({"ident_hash_hex": hh, "hamming_distance": d})
+        out.sort(key=lambda r: (r["hamming_distance"], r["ident_hash_hex"]))
+        return out
+
     def _recreate_address_book_view(self, cur: sqlite3.Cursor) -> None:
         """DROP then CREATE the address_book view with the current schema.
 
@@ -1525,6 +1735,23 @@ class DiscoveryDB:
                  _json.dumps(flags or []), int(needs_review), error_msg, now),
             )
             self._conn.commit()
+
+            # ── near-dup fingerprint (v0.4.14 #5a) ──────────────────────
+            # Record a simhash for this destination's content so find_similar()
+            # can answer "is this a near-duplicate of anything else?" later.
+            # Only when we actually have meaningful text to fingerprint.
+            # ``content_summary`` may be a MagicMock in tests — guard with
+            # isinstance(str) (same posture as the banner-hash guard).
+            if (
+                isinstance(content_summary, str)
+                and content_summary.strip()
+                and reachable
+            ):
+                self._record_simhash_unlocked(
+                    ident_hash_hex, compute_simhash(content_summary)
+                )
+                self._conn.commit()
+
             row_id = cur.lastrowid
             return int(row_id) if row_id is not None else 0
 

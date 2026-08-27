@@ -1146,6 +1146,47 @@ class DiscoveryDB:
             rows = cur.fetchall()
         return [dict(zip(keys, r)) for r in rows]
 
+    def get_services_by_port(self, port: int, limit: int = 100) -> list[dict]:
+        """Return up to *limit* rows for a given TCP port (e.g. 6667 for IRC).
+
+        Mirrors get_services_by_protocol() but keyed on port instead of
+        protocol tag.  Answers the design-notes question "what's on port 6667?"
+        directly — across every host we've classified, freshest first.
+        """
+        keys = ("host", "port", "protocol", "service_type", "banner_hash",
+                "banner_text", "status", "first_seen", "last_seen", "seen_count")
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT host, port, protocol, service_type, banner_hash, "
+                "banner_text, status, first_seen, last_seen, seen_count "
+                "FROM services WHERE port = ? "
+                "ORDER BY last_seen DESC LIMIT ?",
+                (port, limit),
+            )
+            rows = cur.fetchall()
+        return [dict(zip(keys, r)) for r in rows]
+
+    def get_all_services(self, limit: int = 100) -> list[dict]:
+        """Return up to *limit* service rows across all protocols/ports.
+
+        Ordered by most-recently-seen first.  Used by the services CLI to
+        give the operator a full network inventory.
+        """
+        keys = ("host", "port", "protocol", "service_type", "banner_hash",
+                "banner_text", "status", "first_seen", "last_seen", "seen_count")
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT host, port, protocol, service_type, banner_hash, "
+                "banner_text, status, first_seen, last_seen, seen_count "
+                "FROM services "
+                "ORDER BY last_seen DESC LIMIT ?",
+                (limit,),
+            )
+            rows = cur.fetchall()
+        return [dict(zip(keys, r)) for r in rows]
+
     def _recreate_address_book_view(self, cur: sqlite3.Cursor) -> None:
         """DROP then CREATE the address_book view with the current schema.
 

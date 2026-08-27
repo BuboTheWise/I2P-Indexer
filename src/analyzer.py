@@ -66,6 +66,19 @@ logger = logging.getLogger(__name__)
 _GENERATOR_LLM_URL: str | None = None  # e.g. "http://localhost:11434"
 _GENERATOR_MODEL: str | None = None    # e.g. "qwen2.5-coder:3b"
 _GENERATOR_TIMEOUT: float = 600.0      # LLM code generation needs generous timeout (5 min)
+# v0.4.14 audit: context window for the extractor-generator /api/generate
+# call. Verified correct for 27B target models (prompt embeds a 4KB HTML
+# sample + full template code, so it needs > 8k tokens).
+_GENERATOR_NUM_CTX: int = 16384
+
+# ---------------------------------------------------------------------------
+# Per-call fetch timeouts (v0.4.14)
+# ---------------------------------------------------------------------------
+# Sized so 27B-model generations finish over Tailscale/headscale latency —
+# do NOT revert to the old 15/30/60s literal defaults that truncated
+# in-flight requests. Named constants (not inline magic numbers).
+SHORT_FETCH_TIMEOUT: float = 120.0     # single fetches (inspect-headers, probe paths)
+MEDIUM_FETCH_TIMEOUT: float = 300.0    # generator-adjacent / deep-analysis batch fetches
 
 # ---------------------------------------------------------------------------
 # Common set of paths to try
@@ -94,7 +107,7 @@ COMMON_PATHS = [
 # ---------------------------------------------------------------------------
 
 
-def _fetch_path(url: str, timeout: float = 15.0) -> Dict[str, Any]:
+def _fetch_path(url: str, timeout: float = SHORT_FETCH_TIMEOUT) -> Dict[str, Any]:
     """Fetch a single path and return structured result."""
     t0 = time.monotonic()
     try:
@@ -121,7 +134,7 @@ def _fetch_path(url: str, timeout: float = 15.0) -> Dict[str, Any]:
 def fetch_all_paths(
     host: str,
     paths: List[str] | None = None,
-    timeout: float = 15.0,
+    timeout: float = SHORT_FETCH_TIMEOUT,
 ) -> List[Dict[str, Any]]:
     """Try a set of paths on an I2P host and report which ones respond.
 
@@ -172,7 +185,7 @@ def print_fetch_paths(results: List[Dict[str, Any]]) -> None:
 
 def inspect_headers(
     host: str,
-    timeout: float = 30.0,
+    timeout: float = SHORT_FETCH_TIMEOUT,
 ) -> Response | None:
     """Fetch the root path of an I2P host and return full Response with headers.
 
@@ -429,7 +442,7 @@ Generate the extractor class now. Return ONLY valid Python code wrapped in a ```
             payload = json.dumps({
                 "model": model,
                 "prompt": prompt,
-                "options": {"num_ctx": 16384, "temperature": 0.1},
+                "options": {"num_ctx": _GENERATOR_NUM_CTX, "temperature": 0.1},
             }).encode("utf-8")
 
             req = _urllib_request.Request(
@@ -960,7 +973,7 @@ class PipelineResult(NamedTuple):
 
 def generate_extractors_pipeline(
     limit: int | None = None,
-    timeout: float = 60.0,
+    timeout: float = MEDIUM_FETCH_TIMEOUT,
     dry_run: bool = False,
     force: bool = False,
     generator_url: str | None = None,
@@ -1211,7 +1224,7 @@ def generate_extractors_pipeline(
 
 def inspect_all_flagged(
     limit: int | None = None,
-    timeout: float = 60.0,
+    timeout: float = MEDIUM_FETCH_TIMEOUT,
 ) -> List[Dict[str, Any]]:
     """Iterate every flagged destination and run a basic header inspection.
 
@@ -1323,13 +1336,13 @@ def main() -> None:
     # ── inspect-headers ──
     ih_p = sub.add_parser("inspect-headers", help="Dump all HTTP headers from a target URL")
     ih_p.add_argument("--host", type=str, required=True, help="The .i2p hostname or full URL to inspect")
-    ih_p.add_argument("--timeout", type=float, default=30.0, help="Fetch timeout in seconds (default: 30)")
+    ih_p.add_argument("--timeout", type=float, default=SHORT_FETCH_TIMEOUT, help="Fetch timeout in seconds (default: 120)")
 
     # ── fetch-all-paths ──
     fa_p = sub.add_parser("fetch-all-paths", help="Try common paths on a host and report responses")
     fa_p.add_argument("--host", type=str, required=True, help="The .i2p hostname to probe")
     fa_p.add_argument("--paths", nargs="*", default=None, help="Custom paths to try (default: built-in list)")
-    fa_p.add_argument("--timeout", type=float, default=15.0, help="Per-path timeout in seconds (default: 15)")
+    fa_p.add_argument("--timeout", type=float, default=SHORT_FETCH_TIMEOUT, help="Per-path timeout in seconds (default: 120)")
     fa_p.add_argument("--json", action="store_true", help="Output as JSON instead of pretty table")
 
     # ── generate ──
@@ -1360,7 +1373,7 @@ def main() -> None:
              "(default: dry-run preview; use --confirm to write)",
     )
     af_p.add_argument("--limit", type=int, default=None, help="Max destinations to process (default: all)")
-    af_p.add_argument("--timeout", type=float, default=60.0, help="Per-target timeout in seconds (default: 60)")
+    af_p.add_argument("--timeout", type=float, default=MEDIUM_FETCH_TIMEOUT, help="Per-target timeout in seconds (default: 300)")
     af_p.add_argument("--dry-run", action="store_true", help="(default) Preview without writing files")
     af_p.add_argument("--confirm", action="store_true", help="Write generated extractors to disk and clear flags")
     af_p.add_argument("--force", action="store_true", help="Write even if validation fails")
@@ -1374,7 +1387,7 @@ def main() -> None:
     # ── generate-for-flagged (legacy alias for all-flagged --confirm) ──
     gff_p = sub.add_parser("generate-for-flagged", help="[deprecated] Alias for all-flagged --confirm")
     gff_p.add_argument("--limit", type=int, default=None, help="Max destinations to process (default: all)")
-    gff_p.add_argument("--timeout", type=float, default=60.0, help="Per-target timeout in seconds (default: 60)")
+    gff_p.add_argument("--timeout", type=float, default=MEDIUM_FETCH_TIMEOUT, help="Per-target timeout in seconds (default: 300)")
     gff_p.add_argument("--dry-run", action="store_true", help="Generate but don't write to disk")
     gff_p.add_argument("--force", action="store_true", help="Write even if validation fails")
     gff_p.add_argument("--generator-url", type=str, default=None,

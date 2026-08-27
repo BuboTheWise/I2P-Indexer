@@ -103,6 +103,14 @@ def detect_language(
 
 _OLLAMA_URL: Optional[str] = None
 _OLLAMA_MODEL: str = "RogerBen/HY-MT2-1.8B:latest"
+# v0.4.14: named translation fetch timeout (was inline 30.0). Sized generously
+# so a 27B translation finishes over Tailscale/headscale latency instead of
+# truncating mid-generation.
+TRANSLATE_TIMEOUT: float = 120.0
+# v0.4.14: context window for the /api/generate call. Ollama's default is
+# only 2048 tokens, which truncates longer summary translations. 8192 covers
+# prompt + multi-line source text + full translation reply on 27B models.
+_TRANSLATE_NUM_CTX: int = 8192
 _ollama_error: bool = False
 _ollama_error_time: float = 0.0
 _OLLAMA_COOLDOWN_S: float = 300
@@ -138,7 +146,7 @@ def _try_clear_ollama_error() -> None:
 def translate_to_english(
     text: str,
     source_lang: str,
-    timeout: float = 30.0,
+    timeout: float = TRANSLATE_TIMEOUT,
 ) -> Optional[str]:
     """Translate *text* from *source_lang* to English via local Ollama.
 
@@ -171,6 +179,7 @@ def translate_to_english(
                 "model": _OLLAMA_MODEL,
                 "prompt": f"Translate the following {source_lang} text to English. Output only the translation, nothing else:\n{text}",
                 "stream": False,
+                "options": {"num_ctx": _TRANSLATE_NUM_CTX},
             }).encode("utf-8")
 
             req = urllib.request.Request(

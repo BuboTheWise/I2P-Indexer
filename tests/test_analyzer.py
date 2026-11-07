@@ -21,11 +21,16 @@ Conventions: mock at module level, temp dirs for any file I/O.
 """
 from __future__ import annotations
 
+import os
 import tempfile
 from typing import List, Dict, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# Project root (two levels up from tests/); used as subprocess cwd so the CLI
+# tests run from any checkout instead of a hardcoded home path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---------------------------------------------------------------------------
 # Shared mock helpers
@@ -713,7 +718,7 @@ class TestAnalyzerCli:
         result = subprocess.run(
             ["python", "-m", "src.analyzer", *args],
             capture_output=True, text=True, timeout=30,
-            cwd="/home/stefan/Projects/I2P-Indexer",
+            cwd=_REPO_ROOT,
         )
         return result.stdout, result.stderr, result.returncode
 
@@ -819,12 +824,12 @@ class TestAnalyzerCli:
                 "--out-dir", rel_dir,
             )
             assert code == 0
-            full_path = pathlib.Path("/home/stefan/Projects/I2P-Indexer/src/temp_test_ext")
+            full_path = pathlib.Path(_REPO_ROOT) / "src" / "temp_test_ext"
             mod_file = full_path / "simple_html_extractor.py"
             assert mod_file.exists(), f"Extractor not found at {mod_file}"
         finally:
             shutil.rmtree(
-                "/home/stefan/Projects/I2P-Indexer/src/temp_test_ext",
+                os.path.join(_REPO_ROOT, "src", "temp_test_ext"),
                 ignore_errors=True,
             )
 

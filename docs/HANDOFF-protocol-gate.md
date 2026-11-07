@@ -81,7 +81,7 @@ Full protocol-gate design, ~400 lines across 2 source files + 2 test files:
 
 ### Local files for reference
 
-All changes are on `/home/stefan/Projects/I2P-Indexer` in the `feat/protocol-gate` branch. Full implementation is in:
+All changes are on `~/Projects/I2P-Indexer` in the `feat/protocol-gate` branch. Full implementation is in:
 - `src/i2p_proxy.py` — classification (lines 650–790ish)
 - `src/integration.py` — DB methods + gate wiring (see `grep -n 'def record_service\|def get_service\|service_gate\|GATE_CONFIDENCE' src/integration.py`)
 - `tests/test_protocol_gate.py` — full test file

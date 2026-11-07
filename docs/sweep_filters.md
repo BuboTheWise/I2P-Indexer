@@ -292,5 +292,5 @@ python3 probe_sweep.py --dry-run --crawl-depth 2 --max-new-targets 100
 ## Implementation Notes
 
 - **SQL injection safety:** The `stale` filter uses parameterized queries (`?`) — the `min_age_hours` value is converted to a Unix timestamp cutoff in Python and passed as a bound parameter. No string interpolation of user input into SQL.
-- **File being edited:** `/home/stefan/Projects/I2P-Indexer/probe_sweep.py` (module-level docstring)
+- **File being edited:** `~/Projects/I2P-Indexer/probe_sweep.py` (module-level docstring)
 - **Source truth for filter logic:** `src/integration.py` — `DiscoveryDB.get_targets()` at line ~1315, `discover_addresses()` at line ~1726

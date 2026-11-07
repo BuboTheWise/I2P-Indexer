@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import inspect
+import os
 import pathlib
 import sys
 import tempfile
@@ -828,7 +829,7 @@ class TestAnalyzerCli:
         result = subprocess.run(
             ["python", "-m", "src.analyzer", *args],
             capture_output=True, text=True, timeout=30,
-            cwd="/home/stefan/Projects/I2P-Indexer",
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
         return result.stdout, result.stderr, result.returncode
 

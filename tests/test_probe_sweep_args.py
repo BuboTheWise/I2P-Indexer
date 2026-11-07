@@ -3,6 +3,7 @@
 These tests verify argparse defaults, help text inclusion, and validation errors
 without actually running sweeps or touching I2P network.
 """
+import os
 import subprocess
 import sys
 
@@ -150,7 +151,7 @@ class TestIntegrationHelpOutput:
         import sys
 
         # Find project root from the tests directory
-        project_root = "/home/stefan/Projects/I2P-Indexer"
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         result = subprocess.run(
             [sys.executable, _PROBE_SWEEP, "--help"],
             capture_output=True, text=True, cwd=project_root,
@@ -162,7 +163,7 @@ class TestIntegrationHelpOutput:
         import subprocess
         import sys
 
-        project_root = "/home/stefan/Projects/I2P-Indexer"
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         result = subprocess.run(
             [sys.executable, _PROBE_SWEEP, "--help"],
             capture_output=True, text=True, cwd=project_root,

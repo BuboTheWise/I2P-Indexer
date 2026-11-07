@@ -1,6 +1,7 @@
 """Tests for robots.txt parsing and --respect-robots CLI flag."""
 from __future__ import annotations
 
+import os
 import tempfile
 import pytest
 from unittest.mock import patch, MagicMock
@@ -244,7 +245,7 @@ class TestRespectRobotsCLI:
             ["python", "-m", "probe_sweep", "--help"],
             capture_output=True,
             text=True,
-            cwd="/home/stefan/Projects/I2P-Indexer",
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
         assert "--respect-robots" in result.stdout
 
@@ -255,7 +256,7 @@ class TestRespectRobotsCLI:
             ["python", "-m", "probe_sweep", "sweep", "--count", "1", "--respect-robots"],
             capture_output=True,
             text=True,
-            cwd="/home/stefan/Projects/I2P-Indexer",
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             timeout=5,
         )
         # Should not error with 'unrecognized arguments'
